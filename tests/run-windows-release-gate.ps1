@@ -95,7 +95,8 @@ try {
         '-PythonCommand',
         "`"$PythonCommand`"",
         '-ExpectedIdentitySid',
-        $localUser.SID.Value
+        $localUser.SID.Value,
+        '-OrchestratorVerifiedHostedRunner'
     ) -join ' '
 
     $process = Start-Process `

@@ -65,8 +65,7 @@ class ReleaseTests(unittest.TestCase):
 
         normalized = " ".join(lifecycle.lower().split())
         self.assertIn("#requires -version 5.1", normalized)
-        self.assertIn("$env:github_actions -ne 'true'", normalized)
-        self.assertIn("$env:runner_environment -ne 'github-hosted'", normalized)
+        self.assertIn("orchestratorverifiedhostedrunner", normalized)
         self.assertIn("$psversiontable.psedition -ne 'desktop'", normalized)
         self.assertIn("windowsbuiltinrole]::administrator", normalized)
         self.assertIn("expectedidentitysid", normalized)
@@ -97,11 +96,14 @@ class ReleaseTests(unittest.TestCase):
 
         orchestrator_normalized = " ".join(orchestrator.lower().split())
         self.assertIn("#requires -runasadministrator", orchestrator_normalized)
+        self.assertIn("$env:github_actions -ne 'true'", orchestrator_normalized)
+        self.assertIn("$env:runner_environment -ne 'github-hosted'", orchestrator_normalized)
         self.assertIn("new-localuser", orchestrator_normalized)
         self.assertIn("start-process", orchestrator_normalized)
         self.assertIn("-credential $credential", orchestrator_normalized)
         self.assertIn("-loaduserprofile", orchestrator_normalized)
         self.assertIn("-workingdirectory $gateroot", orchestrator_normalized)
+        self.assertIn("'-orchestratorverifiedhostedrunner'", orchestrator_normalized)
         self.assertIn("remove-localuser", orchestrator_normalized)
         self.assertNotIn("add-localgroupmember", orchestrator_normalized)
 

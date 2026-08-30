@@ -350,7 +350,10 @@ shared session.
   starts the packaged MCP server, and exercises install, replacement install,
   reversible uninstall, reinstall, and final uninstall as a disposable local
   standard user. The hosted runner's administrator identity is used only to create
-  and later remove that account; the lifecycle script verifies its own SID and
+  and later remove that account. The orchestrator verifies the GitHub-hosted runner
+  environment before crossing the alternate-credential process boundary and passes
+  an explicit verification switch because runner-only environment variables are not
+  reliably inherited there. The lifecycle script then verifies its own SID and
   rejects an Administrators token so elevated access cannot hide user-profile ACL
   defects.
   The candidate ZIP is hashed before extraction and again immediately before

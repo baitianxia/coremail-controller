@@ -9,7 +9,9 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$PythonCommand,
     [Parameter(Mandatory = $true)]
-    [string]$ExpectedIdentitySid
+    [string]$ExpectedIdentitySid,
+    [Parameter(Mandatory = $true)]
+    [switch]$OrchestratorVerifiedHostedRunner
 )
 
 Set-StrictMode -Version 2.0
@@ -18,8 +20,8 @@ $ErrorActionPreference = 'Stop'
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw 'The Windows lifecycle gate can run only on Windows.'
 }
-if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
-    throw 'The Windows lifecycle gate requires an ephemeral GitHub-hosted runner.'
+if (-not $OrchestratorVerifiedHostedRunner) {
+    throw 'The Windows lifecycle gate must be launched by the verified hosted-runner orchestrator.'
 }
 if ($PSVersionTable.PSEdition -ne 'Desktop' -or
     $PSVersionTable.PSVersion.Major -ne 5 -or
