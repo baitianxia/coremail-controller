@@ -342,7 +342,8 @@ shared session.
   plugin files.
 - Release archives are built from an explicit file allowlist. Live configuration,
   credentials, caches, VCS data, and arbitrary untracked files are excluded. Each
-  archive has an adjacent SHA-256 file.
+  archive has an adjacent SHA-256 file encoded as ASCII with an LF terminator so
+  standard verification tools behave consistently on Windows, macOS, and Linux.
 - A locally built archive is only a release candidate. The only releasable artifact
   is the candidate uploaded after the packaged lifecycle test succeeds on a clean
   `windows-2022` runner under Windows PowerShell Desktop 5.1. That test parses every

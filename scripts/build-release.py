@@ -122,8 +122,8 @@ def build_release(
                     arcname=(Path(BUNDLE_NAME) / relative).as_posix(),
                 )
         digest = sha256(temporary_archive)
-        temporary_sidecar.write_text(
-            f"{digest}  {ARCHIVE_NAME}\n", encoding="ascii"
+        temporary_sidecar.write_bytes(
+            f"{digest}  {ARCHIVE_NAME}\n".encode("ascii")
         )
         os.replace(temporary_archive, archive)
         os.replace(temporary_sidecar, sidecar)

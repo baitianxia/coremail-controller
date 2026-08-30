@@ -25,8 +25,8 @@ class ReleaseTests(unittest.TestCase):
             archive, sidecar = release.build_release(ROOT, Path(temporary))
             expected_hash = hashlib.sha256(archive.read_bytes()).hexdigest()
             self.assertEqual(
-                f"{expected_hash}  {release.ARCHIVE_NAME}\n",
-                sidecar.read_text(encoding="ascii"),
+                f"{expected_hash}  {release.ARCHIVE_NAME}\n".encode("ascii"),
+                sidecar.read_bytes(),
             )
             with zipfile.ZipFile(archive) as bundle:
                 names = set(bundle.namelist())

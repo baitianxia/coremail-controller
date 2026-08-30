@@ -25,6 +25,8 @@
   runner-only environment variables.
 - Accept Windows CRLF at the embedded C# here-string terminator when the packaged
   PowerShell 5.1 gate extracts and compiles the Credential Manager helper.
+- Write checksum sidecars as deterministic ASCII with an LF terminator instead of
+  allowing Windows text-mode newline translation to break Unix `shasum -c`.
 
 ## 0.5.3 - 2026-08-30
 
