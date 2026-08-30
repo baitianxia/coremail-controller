@@ -3,7 +3,13 @@ name: Windows release gate
 on:
   pull_request:
   push:
+    branches:
+      - main
   workflow_dispatch:
+
+concurrency:
+  group: coremail-windows-release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -76,3 +82,74 @@ jobs:
           name: coremail-controller-windows-gated
           path: ${{ env.COREMAIL_RELEASE_DIR }}
           if-no-files-found: error
+
+  publish-gated-files:
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    needs: windows-powershell-51
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out publication repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download the gated artifact from this run
+        uses: actions/download-artifact@v8
+        with:
+          name: coremail-controller-windows-gated
+          path: ${{ runner.temp }}/coremail-gated-release
+
+      - name: Verify and publish the exact gated files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_dir="${RUNNER_TEMP}/coremail-gated-release"
+          shopt -s nullglob
+          archives=("${release_dir}"/*.zip)
+          sidecars=("${release_dir}"/*.zip.sha256)
+          if [[ ${#archives[@]} -ne 1 || ${#sidecars[@]} -ne 1 ]]; then
+            echo 'Expected exactly one gated ZIP and one checksum sidecar.' >&2
+            exit 1
+          fi
+          archive_name="$(basename "${archives[0]}")"
+          sidecar_name="$(basename "${sidecars[0]}")"
+          if [[ "${sidecar_name}" != "${archive_name}.sha256" ]]; then
+            echo 'The gated ZIP and checksum sidecar names do not match.' >&2
+            exit 1
+          fi
+          if [[ ! "${archive_name}" =~ ^coremail-controller-([0-9]+\.[0-9]+\.[0-9]+)-windows\.zip$ ]]; then
+            echo 'The gated ZIP name does not contain a supported release version.' >&2
+            exit 1
+          fi
+          release_version="${BASH_REMATCH[1]}"
+          (
+            cd "${release_dir}"
+            sha256sum -c "${sidecar_name}"
+          )
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if git fetch origin gated-release:gated-release; then
+            git switch gated-release
+          else
+            git switch --orphan gated-release
+          fi
+
+          release_target="releases/${release_version}"
+          mkdir -p "${release_target}"
+          cp "${archives[0]}" "${release_target}/${archive_name}"
+          cp "${sidecars[0]}" "${release_target}/${sidecar_name}"
+          printf '%s\n' '*.zip binary' '*.sha256 -text' > .gitattributes
+          printf '%s\n' "${GITHUB_SHA}" > "${release_target}/SOURCE_COMMIT"
+          git add .gitattributes "${release_target}"
+          if git diff --cached --quiet; then
+            echo 'The gated release branch already contains these exact files.'
+            exit 0
+          fi
+          git commit -m "release: publish gated ${release_version} from ${GITHUB_SHA}"
+          git push origin gated-release

@@ -27,6 +27,9 @@
   PowerShell 5.1 gate extracts and compiles the Credential Manager helper.
 - Write checksum sidecars as deterministic ASCII with an LF terminator instead of
   allowing Windows text-mode newline translation to break Unix `shasum -c`.
+- Publish the exact post-gate ZIP and sidecar to an auditable private
+  `gated-release` branch from a separate main-only, least-privilege job, allowing
+  delivery without granting a general connector access to the repository.
 
 ## 0.5.3 - 2026-08-30
 

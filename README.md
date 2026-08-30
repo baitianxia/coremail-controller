@@ -2,7 +2,8 @@
 
 > **当前发布线：0.6.0。** 只安装由成功的 Windows PowerShell 5.1 生命周期门禁上传、
 > 且 ZIP 与相邻 `.sha256` 文件匹配的 `coremail-controller-windows-gated` 产物。
-> 0.5.x 已全部撤回，不得继续安装或测试其历史构建。
+> 私有仓库的 `gated-release/releases/0.6.0/` 保存同一对已复核文件。0.5.x 已全部
+> 撤回，不得继续安装或测试其历史构建。
 
 这是一个供 Windows 上 Claude Code 使用的本地插件。它**不会启动、显示或操作
 Coremail 客户端界面**。用户可直接用文字要求 Claude Code 搜索、读取、整理和准备

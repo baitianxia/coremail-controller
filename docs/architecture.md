@@ -358,7 +358,11 @@ shared session.
   rejects an Administrators token so elevated access cannot hide user-profile ACL
   defects.
   The candidate ZIP is hashed before extraction and again immediately before
-  upload, so the artifact uploaded is byte-for-byte the artifact exercised.
+  upload, so the artifact uploaded is byte-for-byte the artifact exercised. For a
+  successful `main` push only, a separate least-privilege publication job downloads
+  that same named artifact, verifies its sidecar again, and commits the original
+  ZIP and sidecar to `gated-release/releases/<version>/`. Pull-request test jobs
+  retain read-only repository permission and cannot publish.
 - The Windows lifecycle test uses a non-secret `windows_simple_mapi` configuration,
   skips the live connection check, hashes the configuration before and after every
   mutation, and is restricted to an ephemeral GitHub Actions profile. It cannot

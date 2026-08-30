@@ -119,12 +119,22 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("python -m unittest discover -s tests -v", normalized)
         lifecycle_position = normalized.index("tests\\run-windows-release-gate.ps1")
         upload_position = normalized.index("actions/upload-artifact@v7")
+        download_position = normalized.index("actions/download-artifact@v8")
+        publish_position = normalized.index("git push origin gated-release")
         self.assertLess(lifecycle_position, upload_position)
+        self.assertLess(upload_position, download_position)
+        self.assertLess(download_position, publish_position)
         self.assertIn("$windowsPowerShell".lower(), normalized)
         self.assertGreaterEqual(normalized.count("get-filehash"), 2)
         self.assertIn("checksum sidecar does not match", normalized)
         self.assertIn("changed after lifecycle testing", normalized)
         self.assertIn("coremail-controller-windows-gated", normalized)
+        self.assertIn("needs: windows-powershell-51", normalized)
+        self.assertIn("github.event_name == 'push'", normalized)
+        self.assertIn("github.ref == 'refs/heads/main'", normalized)
+        self.assertIn("contents: write", normalized)
+        self.assertIn("sha256sum -c", normalized)
+        self.assertIn("'*.sha256 -text'", normalized)
 
     def test_release_refuses_to_overwrite_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
