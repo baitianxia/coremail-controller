@@ -60,7 +60,7 @@ stronger deployments:
    storage. Do not mount the mailbox profile or outgoing attachment directories.
 
 The Coremail MCP must remain under the Windows identity that owns its Generic
-Credential or existing Coremail shared MAPI session. Version 0.5.3 deliberately
+Credential or existing Coremail shared MAPI session. Version 0.6.0 deliberately
 does not accept a password through an environment variable because sibling MCP
 processes can inherit the same environment.
 

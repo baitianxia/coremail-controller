@@ -46,7 +46,7 @@ class ReleaseTests(unittest.TestCase):
                         f"{release.BUNDLE_NAME}/.claude-plugin/plugin.json"
                     ).decode("utf-8")
                 )
-                self.assertEqual("0.5.3", manifest["version"])
+                self.assertEqual("0.6.0", manifest["version"])
 
     def test_release_contains_the_windows_lifecycle_gate(self) -> None:
         self.assertIn("tests/windows-lifecycle.ps1", release.EXACT_FILES)

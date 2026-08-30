@@ -46,7 +46,7 @@ diagnostics and server-configuration discovery. It never grants access by itself
 
 Deleting, recalling, moving, calendar operations, contacts, shared-mailbox
 administration, proprietary Coremail APIs, UI automation, and browser-server
-implementation are not part of version 0.5.3. Simple MAPI does not provide the full
+implementation are not part of version 0.6.0. Simple MAPI does not provide the full
 IMAP feature set: only `INBOX` is addressable, marking unread and saving drafts are
 unsupported, Internet threading headers are unavailable, and searches are bounded
 client-side scans. MAPI subjects are limited to 255 characters to avoid documented
@@ -157,7 +157,7 @@ Local discovery is allowed, but bounded and non-destructive:
   connection or override the explicit account configuration.
 
 The connector may later add a version-specific local-cache reader after its schema
-is observed and documented. Version 0.5.3 does not claim compatibility with an
+is observed and documented. Version 0.6.0 does not claim compatibility with an
 undocumented Coremail cache format.
 
 ## Transport selection and connection configuration

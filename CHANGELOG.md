@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.6.0 - 2026-08-30
+
 - Withdraw all 0.5.x artifacts from delivery until a packaged, clean-runner Windows
   PowerShell 5.1 lifecycle gate passes; local ZIP construction is now explicitly a
   release-candidate build rather than release evidence.

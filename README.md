@@ -1,9 +1,8 @@
 # Claude Code Coremail 接口优先连接器
 
-> **发布状态：0.5.x 已撤回。** `dist` 中现有文件是历史构建，尚未通过新增的完整
-> Windows PowerShell 5.1 生命周期门禁，请勿继续安装或测试。下一份可交付包必须由
-> Windows CI 在无真实邮箱副作用的条件下完成安装、覆盖安装、MCP 启动、卸载和重装后
-> 才能发布。
+> **当前发布线：0.6.0。** 只安装由成功的 Windows PowerShell 5.1 生命周期门禁上传、
+> 且 ZIP 与相邻 `.sha256` 文件匹配的 `coremail-controller-windows-gated` 产物。
+> 0.5.x 已全部撤回，不得继续安装或测试其历史构建。
 
 这是一个供 Windows 上 Claude Code 使用的本地插件。它**不会启动、显示或操作
 Coremail 客户端界面**。用户可直接用文字要求 Claude Code 搜索、读取、整理和准备
@@ -256,7 +255,7 @@ powershell.exe -NoProfile -File .\tests\smoke-mcp.ps1 -CheckConnection -TimeoutM
 python .\scripts\build-release.py --output-dir .\dist --force
 ```
 
-构建结果是 `dist\coremail-controller-0.5.3-windows.zip` 及相邻的 `.sha256` 文件，但
+构建结果是 `dist\coremail-controller-0.6.0-windows.zip` 及相邻的 `.sha256` 文件，但
 它仍不是可交付发布包。`.github/workflows/windows-release-gate.yml` 必须在干净的
 `windows-2022` 环境中，用 Windows PowerShell 5.1 对 ZIP 内实际文件完成脚本解析、
 凭据辅助 C# 编译、安装、覆盖安装、MCP 冒烟、卸载、重装和再次卸载；只有该任务随后

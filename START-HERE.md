@@ -1,8 +1,7 @@
 # Coremail Controller：Windows 三步开始
 
-> **暂勿安装：0.5.x 已撤回。** 现有 ZIP 尚未通过完整的 Windows PowerShell 5.1
-> 自动生命周期门禁。请等待标记为 `coremail-controller-windows-gated` 的后续发布包；
-> 不需要继续替维护者手工试错。
+> **适用于 0.6.0。** 只使用成功的 Windows PowerShell 5.1 自动生命周期门禁所上传的
+> `coremail-controller-windows-gated` 产物，并核对随包 SHA-256。0.5.x 已全部撤回。
 
 本插件先尝试复用已登录 Coremail 的 Windows Simple MAPI 共享会话；接口不可用时再
 安全配置 IMAP/SMTP。两种模式都不启动或操作 Coremail 桌面、网页界面。
@@ -14,8 +13,8 @@
 如果发布包旁有 `.sha256` 文件，可在 PowerShell 中核对：
 
 ```powershell
-Get-FileHash .\coremail-controller-0.5.3-windows.zip -Algorithm SHA256
-Get-Content .\coremail-controller-0.5.3-windows.zip.sha256
+Get-FileHash .\coremail-controller-0.6.0-windows.zip -Algorithm SHA256
+Get-Content .\coremail-controller-0.6.0-windows.zip.sha256
 ```
 
 两处哈希不一致时停止，不要安装。
