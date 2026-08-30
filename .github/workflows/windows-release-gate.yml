@@ -1,0 +1,78 @@
+name: Windows release gate
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-powershell-51:
+    runs-on: windows-2022
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Run offline unit tests
+        shell: powershell
+        run: python -m unittest discover -s tests -v
+
+      - name: Build and exercise the packaged Windows lifecycle
+        shell: powershell
+        run: |
+          $candidateRoot = Join-Path $env:RUNNER_TEMP 'coremail-release-candidate'
+          python .\scripts\build-release.py --output-dir $candidateRoot
+          if ($LASTEXITCODE -ne 0) { throw 'Release candidate build failed.' }
+
+          $archives = @(Get-ChildItem -LiteralPath $candidateRoot -Filter '*.zip' -File)
+          if ($archives.Count -ne 1) {
+            throw "Expected exactly one release candidate ZIP; found $($archives.Count)."
+          }
+          $archive = $archives[0]
+          $testedArchiveHash = (Get-FileHash -LiteralPath $archive.FullName -Algorithm SHA256).Hash
+          $sidecarPath = "$($archive.FullName).sha256"
+          if (-not (Test-Path -LiteralPath $sidecarPath -PathType Leaf)) {
+            throw 'Release candidate checksum sidecar was not created.'
+          }
+          $declaredHash = ((Get-Content -LiteralPath $sidecarPath -Raw).Trim() -split '\s+')[0]
+          if ($declaredHash -ine $testedArchiveHash) {
+            throw 'Release candidate checksum sidecar does not match the ZIP.'
+          }
+
+          $extractRoot = Join-Path $env:RUNNER_TEMP 'coremail-release-extracted'
+          Expand-Archive -LiteralPath $archive.FullName -DestinationPath $extractRoot
+          $pluginRoot = Get-ChildItem -LiteralPath $extractRoot -Directory |
+            Select-Object -First 1
+          if ($null -eq $pluginRoot) { throw 'Release candidate ZIP has no plugin root.' }
+
+          $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+          $pythonCommand = (Get-Command python.exe -ErrorAction Stop).Source
+          $lifecycleScript = Join-Path $pluginRoot.FullName 'tests\run-windows-release-gate.ps1'
+          & $windowsPowerShell -NoLogo -NoProfile -NonInteractive -File `
+            $lifecycleScript `
+            -PluginRoot $pluginRoot.FullName `
+            -PythonCommand $pythonCommand
+          if ($LASTEXITCODE -ne 0) { throw 'Windows PowerShell 5.1 lifecycle gate failed.' }
+
+          $uploadArchiveHash = (Get-FileHash -LiteralPath $archive.FullName -Algorithm SHA256).Hash
+          if ($uploadArchiveHash -ine $testedArchiveHash) {
+            throw 'The release candidate ZIP changed after lifecycle testing.'
+          }
+
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "COREMAIL_RELEASE_DIR=$candidateRoot"
+
+      - name: Upload gated release candidate
+        uses: actions/upload-artifact@v7
+        with:
+          name: coremail-controller-windows-gated
+          path: ${{ env.COREMAIL_RELEASE_DIR }}
+          if-no-files-found: error

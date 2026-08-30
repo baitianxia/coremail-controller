@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "coremail-windows": {
+      "type": "stdio",
+      "command": "powershell.exe",
+      "args": [
+        "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                "${CLAUDE_PLUGIN_ROOT}/mcp/run-server.ps1"
+      ]
+    }
+  }
+}

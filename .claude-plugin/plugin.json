@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "coremail-controller",
+  "description": "Interface-first Coremail mailbox access with a secure IMAP/SMTP fallback.",
+  "version": "0.5.3",
+  "author": {
+    "name": "Local Claude Code integration"
+  },
+  "license": "MIT"
+}
