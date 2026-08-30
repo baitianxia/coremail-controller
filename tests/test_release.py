@@ -71,6 +71,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("expectedidentitysid", normalized)
         self.assertIn("parser]::parsefile", normalized)
         self.assertIn("add-type -typedefinition", normalized)
+        self.assertIn(r"''@[ \t]*\r?$", lifecycle)
         self.assertIn("-skipconnectioncheck", normalized)
         self.assertIn("tests\\smoke-mcp.ps1", normalized)
         self.assertIn("get-filehash", normalized)

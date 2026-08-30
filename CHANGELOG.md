@@ -21,6 +21,8 @@
 - Carry the hosted-runner verification explicitly into the disposable user's
   process because alternate-credential launches do not reliably inherit GitHub's
   runner-only environment variables.
+- Accept Windows CRLF at the embedded C# here-string terminator when the packaged
+  PowerShell 5.1 gate extracts and compiles the Credential Manager helper.
 
 ## 0.5.3 - 2026-08-30
 

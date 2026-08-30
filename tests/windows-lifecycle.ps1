@@ -133,7 +133,7 @@ if ($parseFailures.Count -gt 0) {
 
 Write-Host '[gate 2/7] Compiling the packaged Windows Credential Manager helper'
 $setupText = Get-Content -LiteralPath (Join-Path $PluginRoot 'scripts\setup-account.ps1') -Raw
-$credentialPattern = '(?ms)^[ \t]*\$credentialSource[ \t]*=[ \t]*@''\r?\n(?<source>.*?)\r?\n''@[ \t]*$'
+$credentialPattern = '(?ms)^[ \t]*\$credentialSource[ \t]*=[ \t]*@''\r?\n(?<source>.*?)\r?\n''@[ \t]*\r?$'
 $credentialMatch = [regex]::Match($setupText, $credentialPattern)
 if (-not $credentialMatch.Success) {
     throw 'Unable to extract the credential helper C# source from setup-account.ps1.'
