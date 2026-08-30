@@ -83,6 +83,7 @@ class ProtocolTests(unittest.TestCase):
             [sys.executable, "-I", str(SERVER)],
             input=payload,
             text=True,
+            encoding="utf-8",
             capture_output=True,
             timeout=10,
             check=True,

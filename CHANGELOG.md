@@ -16,6 +16,8 @@
   final rename so the installed tree does not preserve an unsuitable `%TEMP%` ACL.
 - Make uninstall lock and ACL failures fail closed with the current Windows
   identity and actionable diagnostics instead of emitting a raw `Move-Item` error.
+- Decode the UTF-8 MCP smoke-test stream explicitly so Windows legacy console code
+  pages cannot drop responses containing the Chinese send-confirmation phrase.
 
 ## 0.5.3 - 2026-08-30
 
