@@ -240,6 +240,13 @@ try {
         -RedirectStandardError $stderrPath `
         -PassThru
 
+    # Windows PowerShell 5.1 can return a null ExitCode for a Start-Process
+    # object with redirected streams unless its native handle is cached before
+    # waiting. Keep the handle alive through the exit-code read below.
+    $processHandle = $process.Handle
+    if ($processHandle -eq [IntPtr]::Zero) {
+        throw 'The standard-user lifecycle process did not expose a usable handle.'
+    }
     $processDeadline = [DateTime]::UtcNow.AddMinutes(30)
     while (-not $process.HasExited) {
         if (-not $permissionRepairHandled -and
@@ -262,6 +269,7 @@ try {
         Start-Sleep -Milliseconds 100
     }
     $process.WaitForExit()
+    $processExitCode = $process.ExitCode
 
     if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) {
         Get-Content -LiteralPath $stdoutPath | ForEach-Object { Write-Host $_ }
@@ -269,8 +277,11 @@ try {
     if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
         Get-Content -LiteralPath $stderrPath | ForEach-Object { Write-Host $_ -ForegroundColor Red }
     }
-    if ($process.ExitCode -ne 0) {
-        throw "The $ScenarioName standard-user lifecycle gate failed with exit code $($process.ExitCode)."
+    if ($null -eq $processExitCode) {
+        throw "The $ScenarioName standard-user lifecycle process returned no exit code."
+    }
+    if ($processExitCode -ne 0) {
+        throw "The $ScenarioName standard-user lifecycle gate failed with exit code $processExitCode."
     }
     if (-not $permissionRepairHandled -or
         -not (Test-Path -LiteralPath $permissionRepairComplete -PathType Leaf)) {

@@ -53,9 +53,9 @@
   initialization diagnostics instead of an opaque response-mismatch error; do not
   rely on the unavailable `ProcessStartInfo.StandardInputEncoding` property.
 - Stop treating the nullable/stale native-process `$LASTEXITCODE` as the result of
-  an in-process PowerShell MCP smoke script in both installation and release gating;
-  invoke both release-gate orchestrator scenarios in-process for the same reason,
-  with failures propagated as PowerShell exceptions.
+  an in-process PowerShell MCP smoke script in both installation and release gating.
+  Invoke both release-gate orchestrator scenarios in-process so failures retain their
+  original PowerShell exception context.
 - Make the negative corruption gate capture expected Python stderr without letting
   Windows PowerShell 5.1 promote it to an early terminating error, and require the
   rejection to identify the injected `README.md` size mismatch.
@@ -66,6 +66,9 @@
   runner orchestrator after exact SID, target, reparse, and plugin-identity checks;
   the ordinary-user uninstall process now only requests repair, waits, revalidates,
   and continues, matching the production UAC privilege boundary.
+- Cache the redirected standard-user process handle before waiting, working around
+  Windows PowerShell 5.1's nullable `Start-Process -PassThru` exit-code behavior;
+  distinguish a missing exit code from a genuine nonzero lifecycle result.
 
 ## 0.6.0 - 2026-08-30
 

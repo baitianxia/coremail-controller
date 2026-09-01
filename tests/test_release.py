@@ -351,6 +351,12 @@ class ReleaseTests(unittest.TestCase):
             orchestrator_normalized,
         )
         self.assertIn("$permissionrepairhandled = $true", orchestrator_normalized)
+        self.assertIn("$processhandle = $process.handle", orchestrator_normalized)
+        self.assertIn("$null -eq $processexitcode", orchestrator_normalized)
+        self.assertLess(
+            orchestrator.index("$processHandle = $process.Handle"),
+            orchestrator.index("while (-not $process.HasExited)"),
+        )
         self.assertNotRegex(orchestrator_normalized, r"(?:^|\s)move-item(?:\s|$)")
         self.assertNotIn("'/t'", orchestrator_normalized)
         self.assertNotIn("/reset", orchestrator_normalized)

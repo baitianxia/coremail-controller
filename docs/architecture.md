@@ -507,7 +507,11 @@ shared session.
   In-process PowerShell verification scripts report failure by throwing and are not
   judged through the nullable/stale `$LASTEXITCODE` value. This applies to both MCP
   smoke scripts and the standard-user lifecycle orchestrator called by the Windows
-  PowerShell 5.1 workflow. Expected-failure native probes capture stderr separately
+  PowerShell 5.1 workflow. The orchestrator must use `Start-Process -Credential` to
+  cross into the disposable account and redirects that process's streams to files.
+  On Windows PowerShell 5.1 it caches the returned process handle before waiting so
+  `.ExitCode` remains available, then rejects a missing value separately from a
+  genuine nonzero exit. Expected-failure native probes capture stderr separately
   under a temporary gate directory and assert the exact rejection reason before
   continuing.
 - Windows PowerShell 5.1 launch paths execute the packaged no-output version probe
