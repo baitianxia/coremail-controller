@@ -366,7 +366,10 @@ shared session.
   the MCP through that descriptor. Normal MCP and MAPI-probe startup must use the
   pinned executable and must not rediscover Python from a later Claude Code `PATH`
   or honor an inherited `COREMAIL_PYTHON` override. Installed Python launches use
-  `-B -I`, preventing runtime bytecode caches from changing the verified plugin tree.
+  `-B -I`, and the direct release-gate MCP smoke launch uses the same flags,
+  preventing runtime bytecode caches from changing the verified plugin tree. An
+  environment-only bytecode switch is insufficient because isolated mode ignores
+  `PYTHON*` variables.
 - Before mutation, the installer validates every allowlisted release file against
   the package's internal file manifest and requires Windows-native release metadata.
   A locally built unverified candidate has a visibly different filename and metadata
@@ -489,7 +492,9 @@ shared session.
   from captured stdout so warnings cannot corrupt Claude inventory or MAPI-probe JSON.
 - Native-process exit codes are captured immediately after the native invocation.
   In-process PowerShell verification scripts report failure by throwing and are not
-  judged through the nullable/stale `$LASTEXITCODE` value.
+  judged through the nullable/stale `$LASTEXITCODE` value. Expected-failure native
+  probes capture stderr separately under a temporary gate directory and assert the
+  exact rejection reason before continuing.
 - Windows PowerShell 5.1 launch paths execute the packaged no-output version probe
   and use only its exit code; they neither parse redirected native-process output
   nor pass quote-sensitive inline Python through `-c`.

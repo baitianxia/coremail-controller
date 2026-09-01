@@ -144,7 +144,7 @@ function Assert-ExactClaudePlugin {
         'inventory-' + $State + '-' + [guid]::NewGuid().ToString('N') + '.json'
     )
     Invoke-ExactClaude -Arguments @('plugin', 'list', '--json') -CapturePath $inventory
-    & $PythonCommand -I (Join-Path $targetRoot 'scripts\verify-claude-plugin-list.py') `
+    & $PythonCommand -B -I (Join-Path $targetRoot 'scripts\verify-claude-plugin-list.py') `
         $inventory `
         --plugin-id 'coremail-controller@skills-dir' `
         --version '0.7.0' `
@@ -175,7 +175,7 @@ if (-not $credentialMatch.Success) { throw 'Unable to extract the credential hel
 Add-Type -TypeDefinition $credentialMatch.Groups['source'].Value -Language CSharp | Out-Null
 
 Write-Host "[gate 2/11][$ScenarioName] Verifying package integrity, metadata, direct MCP, and real Claude validation"
-& $PythonCommand -I (Join-Path $PluginRoot 'scripts\verify-release.py') `
+& $PythonCommand -B -I (Join-Path $PluginRoot 'scripts\verify-release.py') `
     $PluginRoot --require-windows-gate
 if ($LASTEXITCODE -ne 0) { throw 'Packaged internal integrity verification failed.' }
 & (Join-Path $PluginRoot 'tests\smoke-mcp.ps1') `
@@ -228,9 +228,27 @@ if ($ScenarioName -eq 'npm') {
 $corruptRoot = Join-Path $RunnerTemp 'corrupt-package'
 Copy-Item -LiteralPath $PluginRoot -Destination $corruptRoot -Recurse
 [IO.File]::AppendAllText((Join-Path $corruptRoot 'README.md'), "`ncorruption")
-& $PythonCommand -I (Join-Path $corruptRoot 'scripts\verify-release.py') `
-    $corruptRoot --require-windows-gate 2>$null
-if ($LASTEXITCODE -eq 0) { throw 'The internal verifier accepted a corrupted package.' }
+$corruptVerifierError = Join-Path $RunnerTemp 'corrupt-verifier-stderr.txt'
+$previousPreference = $ErrorActionPreference
+try {
+    $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = $null
+    & $PythonCommand -B -I (Join-Path $corruptRoot 'scripts\verify-release.py') `
+        $corruptRoot --require-windows-gate 2> $corruptVerifierError
+    $corruptVerifierExitCode = $global:LASTEXITCODE
+}
+finally { $ErrorActionPreference = $previousPreference }
+if ($corruptVerifierExitCode -eq 0) {
+    throw 'The internal verifier accepted a corrupted package.'
+}
+if ($corruptVerifierExitCode -ne 2) {
+    throw "The corrupt-package verifier returned unexpected exit code $corruptVerifierExitCode."
+}
+$corruptVerifierText = (Get-Content -LiteralPath $corruptVerifierError -Raw).Trim()
+if ($corruptVerifierText -notmatch 'size mismatch: README\.md') {
+    throw "The corrupt-package verifier failed for an unexpected reason: $corruptVerifierText"
+}
+Write-Host 'Corrupted package was rejected for the injected README.md size mismatch.'
 
 Write-Host "[gate 3/11][$ScenarioName] Creating non-secret config and a previously-disabled Claude state"
 New-Item -ItemType Directory -Path $configDirectory -Force | Out-Null

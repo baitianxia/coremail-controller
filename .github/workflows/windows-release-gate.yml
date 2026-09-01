@@ -39,7 +39,7 @@ jobs:
 
       - name: Run offline unit tests
         shell: powershell
-        run: python -m unittest discover -s tests -v
+        run: python -B -m unittest discover -s tests -v
 
       - name: Parse source PowerShell with Windows PowerShell 5.1
         shell: powershell
@@ -122,7 +122,7 @@ jobs:
         shell: powershell
         run: |
           $candidateRoot = Join-Path $env:RUNNER_TEMP 'coremail-release-gated'
-          python .\scripts\build-release.py `
+          python -B .\scripts\build-release.py `
             --output-dir $candidateRoot `
             --windows-gate `
             --source-commit $env:GITHUB_SHA
@@ -146,7 +146,7 @@ jobs:
           $pluginRoots = @(Get-ChildItem -LiteralPath $extractRoot -Directory)
           if ($pluginRoots.Count -ne 1) { throw 'The release ZIP must contain exactly one plugin root.' }
           $pluginRoot = $pluginRoots[0].FullName
-          python (Join-Path $pluginRoot 'scripts\verify-release.py') `
+          python -B (Join-Path $pluginRoot 'scripts\verify-release.py') `
             $pluginRoot --require-windows-gate
           if ($LASTEXITCODE -ne 0) { throw 'Extracted internal integrity verification failed.' }
 
@@ -226,9 +226,9 @@ jobs:
           (cd "${release_dir}" && sha256sum -c "${sidecar_name}")
 
           extract_dir="${RUNNER_TEMP}/coremail-publish-verify"
-          python -m zipfile -e "${archives[0]}" "${extract_dir}"
+          python -B -m zipfile -e "${archives[0]}" "${extract_dir}"
           plugin_root="$(find "${extract_dir}" -mindepth 1 -maxdepth 1 -type d -print -quit)"
-          python "${plugin_root}/scripts/verify-release.py" "${plugin_root}" --require-windows-gate
+          python -B "${plugin_root}/scripts/verify-release.py" "${plugin_root}" --require-windows-gate
 
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'

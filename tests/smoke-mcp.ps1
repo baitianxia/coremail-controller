@@ -76,7 +76,7 @@ if ([string]::IsNullOrWhiteSpace($PythonExecutable)) {
 else {
     $startInfo.FileName = $PythonExecutable
     $escapedServerPath = $serverPath.Replace('"', '\"')
-    $startInfo.Arguments = "-I `"$escapedServerPath`""
+    $startInfo.Arguments = "-B -I `"$escapedServerPath`""
 }
 $startInfo.UseShellExecute = $false
 $startInfo.CreateNoWindow = $true
@@ -85,7 +85,6 @@ $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
 $startInfo.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $startInfo.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
-$startInfo.EnvironmentVariables['PYTHONDONTWRITEBYTECODE'] = '1'
 if ($IgnoreAccountConfiguration) {
     $startInfo.EnvironmentVariables['APPDATA'] = Join-Path (
         [IO.Path]::GetTempPath()

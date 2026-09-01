@@ -46,13 +46,17 @@
 - Suppress Claude Code auto-updating only around lifecycle validation and restore
   the caller environment, keeping install/uninstall deterministic without invoking
   a package manager or updater.
-- Run installed Python with `-B -I` so normal MCP/account use cannot add bytecode
-  caches that later make the verified plugin tree appear corrupted.
+- Run installed Python and the direct release-gate MCP smoke process with `-B -I`
+  so normal use and verification cannot add bytecode caches that later make the
+  verified plugin tree appear corrupted; isolated mode ignores `PYTHON*` variables.
 - Accept one Windows PowerShell 5.1/.NET BOM only at MCP stream start, with safe
   initialization diagnostics instead of an opaque response-mismatch error; do not
   rely on the unavailable `ProcessStartInfo.StandardInputEncoding` property.
 - Stop treating the nullable/stale native-process `$LASTEXITCODE` as the result of
   an in-process PowerShell MCP smoke script in both installation and release gating.
+- Make the negative corruption gate capture expected Python stderr without letting
+  Windows PowerShell 5.1 promote it to an early terminating error, and require the
+  rejection to identify the injected `README.md` size mismatch.
 
 ## 0.6.0 - 2026-08-30
 

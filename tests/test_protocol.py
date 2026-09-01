@@ -81,7 +81,7 @@ class ProtocolTests(unittest.TestCase):
         ]
         payload = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in requests)
         completed = subprocess.run(
-            [sys.executable, "-I", str(SERVER)],
+            [sys.executable, "-B", "-I", str(SERVER)],
             input=payload,
             text=True,
             encoding="utf-8",
@@ -122,7 +122,7 @@ class ProtocolTests(unittest.TestCase):
             "params": {},
         }
         completed = subprocess.run(
-            [sys.executable, "-I", str(SERVER)],
+            [sys.executable, "-B", "-I", str(SERVER)],
             input=(
                 "\ufeff"
                 + json.dumps(initialize)
@@ -210,7 +210,7 @@ class ProtocolTests(unittest.TestCase):
     def test_python_version_probe_avoids_native_output_and_quote_loss(self) -> None:
         probe = ROOT / "mcp" / "check-python.py"
         completed = subprocess.run(
-            [sys.executable, "-I", str(probe)],
+            [sys.executable, "-B", "-I", str(probe)],
             text=True,
             capture_output=True,
             timeout=10,
@@ -237,6 +237,8 @@ class ProtocolTests(unittest.TestCase):
 
         smoke = (ROOT / "tests" / "smoke-mcp.ps1").read_text(encoding="utf-8")
         self.assertNotIn("StandardInputEncoding", smoke)
+        self.assertNotIn("PYTHONDONTWRITEBYTECODE", smoke)
+        self.assertIn('$startInfo.Arguments = "-B -I', smoke)
 
 
 if __name__ == "__main__":

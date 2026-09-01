@@ -304,6 +304,10 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("legacy-stderr-is-separated", lifecycle_normalized)
         self.assertIn("intentionally-absent-claude.exe", lifecycle_normalized)
         self.assertIn("$installeduninstaller", lifecycle_normalized)
+        self.assertNotIn("$pythoncommand -i ", lifecycle_normalized)
+        self.assertIn("$pythoncommand -b -i ", lifecycle_normalized)
+        self.assertIn("size mismatch: readme\\.md", lifecycle_normalized)
+        self.assertIn("corrupt-verifier-stderr.txt", lifecycle_normalized)
         self.assertNotIn("-checkconnection", lifecycle_normalized)
 
         orchestrator_normalized = " ".join(orchestrator.lower().split())
