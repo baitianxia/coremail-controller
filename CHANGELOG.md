@@ -53,7 +53,9 @@
   initialization diagnostics instead of an opaque response-mismatch error; do not
   rely on the unavailable `ProcessStartInfo.StandardInputEncoding` property.
 - Stop treating the nullable/stale native-process `$LASTEXITCODE` as the result of
-  an in-process PowerShell MCP smoke script in both installation and release gating.
+  an in-process PowerShell MCP smoke script in both installation and release gating;
+  invoke both release-gate orchestrator scenarios in-process for the same reason,
+  with failures propagated as PowerShell exceptions.
 - Make the negative corruption gate capture expected Python stderr without letting
   Windows PowerShell 5.1 promote it to an early terminating error, and require the
   rejection to identify the injected `README.md` size mismatch.

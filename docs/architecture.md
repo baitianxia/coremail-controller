@@ -505,9 +505,11 @@ shared session.
   from captured stdout so warnings cannot corrupt Claude inventory or MAPI-probe JSON.
 - Native-process exit codes are captured immediately after the native invocation.
   In-process PowerShell verification scripts report failure by throwing and are not
-  judged through the nullable/stale `$LASTEXITCODE` value. Expected-failure native
-  probes capture stderr separately under a temporary gate directory and assert the
-  exact rejection reason before continuing.
+  judged through the nullable/stale `$LASTEXITCODE` value. This applies to both MCP
+  smoke scripts and the standard-user lifecycle orchestrator called by the Windows
+  PowerShell 5.1 workflow. Expected-failure native probes capture stderr separately
+  under a temporary gate directory and assert the exact rejection reason before
+  continuing.
 - Windows PowerShell 5.1 launch paths execute the packaged no-output version probe
   and use only its exit code; they neither parse redirected native-process output
   nor pass quote-sensitive inline Python through `-c`.

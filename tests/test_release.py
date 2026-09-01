@@ -272,6 +272,9 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("--source-commit $env:github_sha", normalized)
         self.assertIn("-scenarioname native", normalized)
         self.assertIn("-scenarioname npm", normalized)
+        self.assertEqual(2, normalized.count("& $orchestrator"))
+        self.assertNotIn("native claude lifecycle gate failed", normalized)
+        self.assertNotIn("npm claude lifecycle gate failed", normalized)
         self.assertLess(
             normalized.index("tests\\smoke-mcp.ps1"),
             normalized.index("scripts\\build-release.py"),
@@ -324,6 +327,8 @@ class ReleaseTests(unittest.TestCase):
 
         orchestrator_normalized = " ".join(orchestrator.lower().split())
         self.assertIn("#requires -runasadministrator", orchestrator_normalized)
+        self.assertIn("$psversiontable.psedition -ne 'desktop'", orchestrator_normalized)
+        self.assertIn("$psversiontable.psversion.major -ne 5", orchestrator_normalized)
         self.assertIn("new-localuser", orchestrator_normalized)
         self.assertIn("-credential $credential", orchestrator_normalized)
         self.assertIn("-loaduserprofile", orchestrator_normalized)

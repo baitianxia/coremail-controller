@@ -150,22 +150,19 @@ jobs:
             $pluginRoot --require-windows-gate
           if ($LASTEXITCODE -ne 0) { throw 'Extracted internal integrity verification failed.' }
 
-          $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
           $pythonCommand = (Get-Command python.exe -ErrorAction Stop).Source
           $orchestrator = Join-Path $pluginRoot 'tests\run-windows-release-gate.ps1'
-          & $windowsPowerShell -NoLogo -NoProfile -NonInteractive -File $orchestrator `
+          & $orchestrator `
             -PluginRoot $pluginRoot `
             -PythonCommand $pythonCommand `
             -ClaudeCommand $env:NATIVE_CLAUDE `
             -ScenarioName native
-          if ($LASTEXITCODE -ne 0) { throw 'Native Claude lifecycle gate failed.' }
-          & $windowsPowerShell -NoLogo -NoProfile -NonInteractive -File $orchestrator `
+          & $orchestrator `
             -PluginRoot $pluginRoot `
             -PythonCommand $pythonCommand `
             -ClaudeCommand $env:NPM_CLAUDE `
             -NodeCommand $env:NPM_NODE `
             -ScenarioName npm
-          if ($LASTEXITCODE -ne 0) { throw 'npm Claude lifecycle gate failed.' }
 
           $uploadArchiveHash = (Get-FileHash -LiteralPath $archive.FullName -Algorithm SHA256).Hash
           if ($uploadArchiveHash -ine $testedArchiveHash) {
