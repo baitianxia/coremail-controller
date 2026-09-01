@@ -39,6 +39,17 @@ function ConvertTo-RequestJson {
     return ($Value | ConvertTo-Json -Depth 24 -Compress)
 }
 
+function Get-OptionalJsonProperty {
+    param(
+        [object]$Value,
+        [string]$Name
+    )
+    if ($null -eq $Value) { return $null }
+    $property = $Value.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
 function Read-ServerResponse {
     param(
         [System.Diagnostics.Process]$Process,
@@ -72,6 +83,7 @@ $startInfo.CreateNoWindow = $true
 $startInfo.RedirectStandardInput = $true
 $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
+$startInfo.StandardInputEncoding = New-Object System.Text.UTF8Encoding($false)
 $startInfo.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $startInfo.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
 $startInfo.EnvironmentVariables['PYTHONDONTWRITEBYTECODE'] = '1'
@@ -99,8 +111,19 @@ try {
     })))
     $process.StandardInput.Flush()
     $initialize = Read-ServerResponse -Process $process -Timeout $TimeoutMilliseconds
-    if ($initialize.id -ne 1 -or $initialize.result.serverInfo.name -ne 'coremail-headless') {
-        throw 'Unexpected initialize response.'
+    $initializeId = Get-OptionalJsonProperty -Value $initialize -Name 'id'
+    $initializeResult = Get-OptionalJsonProperty -Value $initialize -Name 'result'
+    $serverInfo = Get-OptionalJsonProperty -Value $initializeResult -Name 'serverInfo'
+    $initializeServerName = Get-OptionalJsonProperty -Value $serverInfo -Name 'name'
+    if ($initializeId -ne 1 -or $initializeServerName -ne 'coremail-headless') {
+        $responseId = if ($null -ne $initializeId) { [string]$initializeId } else { '<missing>' }
+        $serverName = if ($null -ne $initializeServerName) { [string]$initializeServerName } else { '<missing>' }
+        $initializeError = Get-OptionalJsonProperty -Value $initialize -Name 'error'
+        $initializeErrorCode = Get-OptionalJsonProperty -Value $initializeError -Name 'code'
+        $initializeErrorMessage = Get-OptionalJsonProperty -Value $initializeError -Name 'message'
+        $errorCode = if ($null -ne $initializeErrorCode) { [string]$initializeErrorCode } else { '<none>' }
+        $errorMessage = if ($null -ne $initializeErrorMessage) { [string]$initializeErrorMessage } else { '<none>' }
+        throw "Unexpected initialize response: id=$responseId server=$serverName error=$errorCode message=$errorMessage"
     }
 
     $process.StandardInput.WriteLine((ConvertTo-RequestJson ([ordered]@{

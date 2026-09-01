@@ -409,6 +409,11 @@ shared session.
   account configuration exists, but a session, network, or authentication failure
   is reported as incomplete connection verification rather than rolling back valid
   plugin files.
+- MCP stdio is newline-delimited UTF-8 JSON. Windows verification explicitly writes
+  redirected stdin as UTF-8 without a BOM; the server also accepts one leading BOM
+  at stream start for interoperability with legacy .NET wrappers, while later BOMs
+  remain invalid requests. Initialization failures report only protocol metadata,
+  never mailbox configuration or message content.
 - Release archives are built from an explicit file allowlist. Live configuration,
   credentials, caches, VCS data, and arbitrary untracked files are excluded. Each
   archive has an adjacent SHA-256 file encoded as ASCII with an LF terminator so

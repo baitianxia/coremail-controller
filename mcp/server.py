@@ -373,9 +373,16 @@ def main() -> int:
         sys.stderr.reconfigure(encoding="utf-8")
     server = McpServer()
     try:
+        first_request = True
         for line in sys.stdin:
+            # Windows/.NET stdio wrappers have historically emitted a UTF-8 BOM
+            # before their first redirected write. RFC 8259 permits parsers to
+            # ignore it for interoperability, so accept it only at stream start.
+            if first_request:
+                line = line.removeprefix("\ufeff")
             if not line.strip():
                 continue
+            first_request = False
             if len(line) > MAX_REQUEST_CHARS:
                 _write(_error_response(None, -32600, "MCP request exceeds the size limit"))
                 continue

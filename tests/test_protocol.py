@@ -104,6 +104,46 @@ class ProtocolTests(unittest.TestCase):
         self.assertFalse(status["coremail_ui_automation_used"])
         self.assertIn("client_interface", status)
 
+    def test_windows_stdio_bom_is_tolerated_only_at_stream_start(self) -> None:
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "bom-test", "version": "1"},
+            },
+        }
+        later_bom_request = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "ping",
+            "params": {},
+        }
+        completed = subprocess.run(
+            [sys.executable, "-I", str(SERVER)],
+            input=(
+                "\ufeff"
+                + json.dumps(initialize)
+                + "\n\ufeff"
+                + json.dumps(later_bom_request)
+                + "\n"
+            ),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            timeout=10,
+            check=True,
+        )
+        responses = [json.loads(line) for line in completed.stdout.splitlines()]
+        self.assertEqual(1, responses[0]["id"])
+        self.assertEqual(
+            "coremail-headless", responses[0]["result"]["serverInfo"]["name"]
+        )
+        self.assertIsNone(responses[1]["id"])
+        self.assertEqual(-32700, responses[1]["error"]["code"])
+
     def test_implementation_has_no_desktop_automation_primitives(self) -> None:
         sources = "\n".join(
             path.read_text(encoding="utf-8")
@@ -194,6 +234,12 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn("python-runtime.json", launcher)
         self.assertIn("executable_sha256", launcher)
         self.assertNotIn("coremail_python", launcher)
+
+        smoke = (ROOT / "tests" / "smoke-mcp.ps1").read_text(encoding="utf-8")
+        self.assertIn(
+            "$startInfo.StandardInputEncoding = New-Object System.Text.UTF8Encoding($false)",
+            smoke,
+        )
 
 
 if __name__ == "__main__":
