@@ -487,6 +487,9 @@ shared session.
   secrets and full protocol transcripts out of that log. Capturing diagnostics must
   never cause the original operation to fail. Native stderr is logged separately
   from captured stdout so warnings cannot corrupt Claude inventory or MAPI-probe JSON.
+- Native-process exit codes are captured immediately after the native invocation.
+  In-process PowerShell verification scripts report failure by throwing and are not
+  judged through the nullable/stale `$LASTEXITCODE` value.
 - Windows PowerShell 5.1 launch paths execute the packaged no-output version probe
   and use only its exit code; they neither parse redirected native-process output
   nor pass quote-sensitive inline Python through `-c`.

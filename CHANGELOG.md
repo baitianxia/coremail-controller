@@ -51,6 +51,8 @@
 - Accept one Windows PowerShell 5.1/.NET BOM only at MCP stream start, with safe
   initialization diagnostics instead of an opaque response-mismatch error; do not
   rely on the unavailable `ProcessStartInfo.StandardInputEncoding` property.
+- Stop treating the nullable/stale native-process `$LASTEXITCODE` as the result of
+  an in-process PowerShell MCP smoke script in both installation and release gating.
 
 ## 0.6.0 - 2026-08-30
 

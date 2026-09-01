@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -210,6 +211,14 @@ class ReleaseTests(unittest.TestCase):
         self.assertNotIn("COREMAIL_PYTHON", launcher)
         self.assertNotIn("COREMAIL_PYTHON", setup)
         self.assertNotIn("COREMAIL_PYTHON", installer)
+        stale_exit_code_check = re.compile(
+            r"(?im)smoke-mcp\.ps1[^\r\n]*\r?\n[ \t]*if\s*\(\$LASTEXITCODE"
+        )
+        self.assertIsNone(stale_exit_code_check.search(installer))
+        workflow = (ROOT / ".github" / "workflows" / "windows-release-gate.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIsNone(stale_exit_code_check.search(workflow))
         for lifecycle_directory in (
             "$activationStagingDirectory",
             "$backupDirectory",
