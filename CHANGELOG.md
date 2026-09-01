@@ -48,9 +48,9 @@
   a package manager or updater.
 - Run installed Python with `-B -I` so normal MCP/account use cannot add bytecode
   caches that later make the verified plugin tree appear corrupted.
-- Write Windows smoke-test stdin as BOM-free UTF-8 and accept one legacy .NET BOM
-  only at MCP stream start, with safe initialization diagnostics instead of an
-  opaque response-mismatch error.
+- Accept one Windows PowerShell 5.1/.NET BOM only at MCP stream start, with safe
+  initialization diagnostics instead of an opaque response-mismatch error; do not
+  rely on the unavailable `ProcessStartInfo.StandardInputEncoding` property.
 
 ## 0.6.0 - 2026-08-30
 

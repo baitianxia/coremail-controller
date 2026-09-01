@@ -236,10 +236,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertNotIn("coremail_python", launcher)
 
         smoke = (ROOT / "tests" / "smoke-mcp.ps1").read_text(encoding="utf-8")
-        self.assertIn(
-            "$startInfo.StandardInputEncoding = New-Object System.Text.UTF8Encoding($false)",
-            smoke,
-        )
+        self.assertNotIn("StandardInputEncoding", smoke)
 
 
 if __name__ == "__main__":

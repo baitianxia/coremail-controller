@@ -83,7 +83,6 @@ $startInfo.CreateNoWindow = $true
 $startInfo.RedirectStandardInput = $true
 $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
-$startInfo.StandardInputEncoding = New-Object System.Text.UTF8Encoding($false)
 $startInfo.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $startInfo.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
 $startInfo.EnvironmentVariables['PYTHONDONTWRITEBYTECODE'] = '1'
