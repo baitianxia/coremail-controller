@@ -456,6 +456,11 @@ shared session.
   installation shapes. The pinned npm fixture uses its package-declared native PE,
   while source assertions retain compatibility with older Node-backed npm bins. The
   target installer never downloads, installs, upgrades, or repairs Claude Code.
+- The real Claude plugin inventory is authoritative for enabled/disabled state.
+  Current Claude releases may represent enablement by removing an explicit `false`
+  settings override rather than writing `true`; the gate accepts that documented
+  serialization shape only when the inventory simultaneously reports the exact
+  plugin enabled. Expected pre-mutation failures compare settings bytes by hash.
 - The gate injects a real, reversible NTFS delete denial into a staged directory and
   its parent, observes one atomic-move retry, restores both ACLs, and proves the same
   installer process completes. It also tests lifecycle-lock contention, account

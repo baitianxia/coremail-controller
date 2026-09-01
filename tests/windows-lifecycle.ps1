@@ -153,6 +153,24 @@ function Assert-ExactClaudePlugin {
     if ($LASTEXITCODE -ne 0) { throw "Claude plugin state verification failed: $State" }
 }
 
+function Get-ClaudePluginSettingsOverride {
+    $settingsPayload = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+    $enabledPluginsProperty = $settingsPayload.PSObject.Properties['enabledPlugins']
+    if ($null -eq $enabledPluginsProperty -or $null -eq $enabledPluginsProperty.Value) {
+        return [pscustomobject]@{ Present = $false; Value = $null }
+    }
+    $pluginProperty = $enabledPluginsProperty.Value.PSObject.Properties[
+        'coremail-controller@skills-dir'
+    ]
+    if ($null -eq $pluginProperty) {
+        return [pscustomobject]@{ Present = $false; Value = $null }
+    }
+    if ($pluginProperty.Value -isnot [bool]) {
+        throw 'Claude settings contain a non-boolean Coremail plugin override.'
+    }
+    return [pscustomobject]@{ Present = $true; Value = [bool]$pluginProperty.Value }
+}
+
 Write-Host "[gate 1/11][$ScenarioName] Parsing all packaged PowerShell and compiling Credential Manager helper"
 $parseFailures = @()
 foreach ($scriptFile in (Get-ChildItem -LiteralPath $PluginRoot -Filter '*.ps1' -File -Recurse)) {
@@ -301,8 +319,8 @@ if ([string]$runtime.executable_sha256 -ine
     (Get-FileHash -LiteralPath $PythonCommand -Algorithm SHA256).Hash) {
     throw 'Installed Python runtime is not pinned to the selected executable hash.'
 }
-$settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
-if ($settings.enabledPlugins.'coremail-controller@skills-dir' -ne $true) {
+$pluginOverride = Get-ClaudePluginSettingsOverride
+if ($pluginOverride.Present -and -not $pluginOverride.Value) {
     throw 'Installer did not reverse the persisted disabled state.'
 }
 Assert-ExactClaudePlugin -State enabled
@@ -523,6 +541,7 @@ $encoding = New-Object System.Text.UTF8Encoding($false)
 [IO.File]::WriteAllText($legacyRestoreScript, $legacyRestoreSource, $utf8)
 
 $legacyRestoreProcess = $null
+$settingsHashBeforeLegacyDenial = (Get-FileHash -LiteralPath $settingsPath -Algorithm SHA256).Hash
 try {
     Set-Acl -LiteralPath $targetRoot -AclObject $restrictedTargetAcl
     $legacyReadDenied = $false
@@ -546,8 +565,8 @@ try {
     if (-not (Test-Path -LiteralPath $targetRoot -PathType Container)) {
         throw 'Disabled legacy ACL repair moved the active plugin.'
     }
-    $settingsBeforeRepair = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
-    if ($settingsBeforeRepair.enabledPlugins.'coremail-controller@skills-dir' -ne $true) {
+    if ((Get-FileHash -LiteralPath $settingsPath -Algorithm SHA256).Hash -ne
+        $settingsHashBeforeLegacyDenial) {
         throw 'Disabled legacy ACL repair changed Claude plugin state.'
     }
 
@@ -582,8 +601,8 @@ finally {
 }
 if (Test-Path -LiteralPath $targetRoot) { throw 'Uninstaller left the active plugin directory in place.' }
 Assert-ConfigUnchanged -ExpectedHash $fixtureHash
-$settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
-if ($settings.enabledPlugins.'coremail-controller@skills-dir' -ne $false) {
+$pluginOverride = Get-ClaudePluginSettingsOverride
+if (-not $pluginOverride.Present -or $pluginOverride.Value -ne $false) {
     throw 'Uninstaller did not persist the disabled plugin state.'
 }
 if ((Get-Content -LiteralPath $uninstallLog -Raw) -notmatch 'UNINSTALL COMMITTED') {

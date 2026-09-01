@@ -57,6 +57,9 @@
 - Make the negative corruption gate capture expected Python stderr without letting
   Windows PowerShell 5.1 promote it to an early terminating error, and require the
   rejection to identify the injected `README.md` size mismatch.
+- Treat the real Claude inventory as the enabled-state authority when Claude 2.1.246
+  removes a persisted `false` override instead of serializing an explicit `true`;
+  retain exact settings-hash checks for fail-before-mutation paths.
 
 ## 0.6.0 - 2026-08-30
 
