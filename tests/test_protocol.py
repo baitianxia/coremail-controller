@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import unittest
@@ -15,7 +16,7 @@ class ProtocolTests(unittest.TestCase):
     def test_claude_plugin_layout_and_mcp_path_are_portable(self) -> None:
         manifest = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["name"], "coremail-controller")
-        self.assertEqual(manifest["version"], "0.6.0")
+        self.assertEqual(manifest["version"], "0.7.0")
 
         coremail_skill = (ROOT / "skills" / "coremail" / "SKILL.md").read_text(encoding="utf-8")
         browser_skill = (ROOT / "skills" / "web-to-coremail" / "SKILL.md").read_text(encoding="utf-8")
@@ -91,7 +92,7 @@ class ProtocolTests(unittest.TestCase):
         responses = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
         self.assertEqual([response["id"] for response in responses], [1, 2, 3])
         self.assertEqual(responses[0]["result"]["serverInfo"]["name"], "coremail-headless")
-        self.assertEqual(responses[0]["result"]["serverInfo"]["version"], "0.6.0")
+        self.assertEqual(responses[0]["result"]["serverInfo"]["version"], "0.7.0")
         names = {tool["name"] for tool in responses[1]["result"]["tools"]}
         self.assertEqual(len(names), 10)
         self.assertIn("coremail_discover_local", names)
@@ -118,7 +119,8 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn("mapilogon", mapi)
         self.assertIn("null profile/password and zero flags", mapi)
         self.assertIn("self._logon(0, none, none, 0, 0", " ".join(mapi.split()))
-        self.assertIn("-i $probescript --probe-json", setup)
+        self.assertIn("'--probe-json'", setup)
+        self.assertIn("get-pinnedpythonruntime", setup)
         self.assertIn("windows_simple_mapi", setup)
         self.assertIn("imap_smtp", setup)
         self.assertIn("-assecurestring", setup)
@@ -126,7 +128,9 @@ class ProtocolTests(unittest.TestCase):
         self.assertNotIn("mapi_dialog", setup)
 
     def test_credential_writer_uses_unambiguous_filetime_type(self) -> None:
-        setup = (ROOT / "scripts" / "setup-account.ps1").read_text(encoding="utf-8").lower()
+        setup = (ROOT / "scripts" / "windows-credential.ps1").read_text(
+            encoding="utf-8"
+        ).lower()
         self.assertIn(
             "public system.runtime.interopservices.comtypes.filetime lastwritten;",
             setup,
@@ -138,26 +142,28 @@ class ProtocolTests(unittest.TestCase):
         normalized = " ".join(installer.split())
         self.assertIn("plugin-staging", normalized)
         self.assertIn(
-            "copy-plugintree -source $stageplugin -destination $activationplugin",
+            "copy-coremailplugintree -source $sourceroot -destination $activationplugin",
             normalized,
         )
         self.assertIn(
-            "move-item -literalpath $activationplugin -destination $targetroot",
+            "move-coremaildirectoryatomically ` -source $activationplugin ` -destination $targetroot",
             normalized,
         )
-        self.assertNotIn(
-            "move-item -literalpath $stageplugin -destination $targetroot",
-            normalized,
-        )
+        self.assertIsNone(re.search(r"(?<![a-z])move-item\b", normalized))
 
     def test_uninstall_fails_closed_on_lock_or_acl_denial(self) -> None:
         uninstaller = (ROOT / "scripts" / "uninstall.ps1").read_text(encoding="utf-8").lower()
-        self.assertIn("system.unauthorizedaccessexception", uninstaller)
-        self.assertIn("system.io.ioexception", uninstaller)
-        self.assertIn("windowsidentity", uninstaller)
-        self.assertIn("acl", uninstaller)
+        common = (ROOT / "scripts" / "windows-lifecycle-common.ps1").read_text(
+            encoding="utf-8"
+        ).lower()
+        lifecycle = uninstaller + common
+        self.assertIn("unauthorizedaccessexception", lifecycle)
+        self.assertIn("io.ioexception", lifecycle)
+        self.assertIn("ambiguous state", common)
         self.assertIn("guid", uninstaller)
-        self.assertNotIn("remove-item", uninstaller)
+        self.assertIn("fileshare]::none", common)
+        self.assertIn("move-coremaildirectoryatomically", uninstaller)
+        self.assertIsNone(re.search(r"(?<![a-z])move-item\b", lifecycle))
         self.assertNotIn("takeown", uninstaller)
         self.assertNotIn("icacls", uninstaller)
 
@@ -180,10 +186,14 @@ class ProtocolTests(unittest.TestCase):
         ]
         for source in sources:
             normalized = " ".join(source.lower().split())
-            self.assertIn("@pythonprefix -i $versionprobepath", normalized)
-            self.assertNotIn("@pythonprefix --version", normalized)
             self.assertNotIn("-c 'import sys", normalized)
             self.assertNotIn('print("%d.%d"', normalized)
+        installer = " ".join(sources[0].lower().split())
+        launcher = " ".join(sources[1].lower().split())
+        self.assertIn("describe-python.py", installer)
+        self.assertIn("python-runtime.json", launcher)
+        self.assertIn("executable_sha256", launcher)
+        self.assertNotIn("coremail_python", launcher)
 
 
 if __name__ == "__main__":

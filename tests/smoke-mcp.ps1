@@ -1,7 +1,8 @@
 param(
     [int]$TimeoutMilliseconds = 15000,
     [switch]$CheckConnection,
-    [switch]$IgnoreAccountConfiguration
+    [switch]$IgnoreAccountConfiguration,
+    [string]$PythonExecutable = ''
 )
 
 Set-StrictMode -Version 2.0
@@ -15,9 +16,22 @@ if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw 'The launcher smoke test must run on Windows.'
 }
 
-$runnerPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\mcp\run-server.ps1'))
-if (-not (Test-Path -LiteralPath $runnerPath -PathType Leaf)) {
-    throw "MCP launcher not found: $runnerPath"
+$mcpRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\mcp'))
+$runnerPath = Join-Path $mcpRoot 'run-server.ps1'
+$serverPath = Join-Path $mcpRoot 'server.py'
+if ([string]::IsNullOrWhiteSpace($PythonExecutable)) {
+    if (-not (Test-Path -LiteralPath $runnerPath -PathType Leaf)) {
+        throw "MCP launcher not found: $runnerPath"
+    }
+}
+else {
+    $PythonExecutable = [IO.Path]::GetFullPath($PythonExecutable)
+    if (-not (Test-Path -LiteralPath $PythonExecutable -PathType Leaf)) {
+        throw "Explicit smoke-test Python executable not found: $PythonExecutable"
+    }
+    if (-not (Test-Path -LiteralPath $serverPath -PathType Leaf)) {
+        throw "MCP server not found: $serverPath"
+    }
 }
 
 function ConvertTo-RequestJson {
@@ -43,9 +57,16 @@ function Read-ServerResponse {
 }
 
 $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-$startInfo.FileName = 'powershell.exe'
-$escapedRunnerPath = $runnerPath.Replace('"', '\"')
-$startInfo.Arguments = "-NoLogo -NoProfile -NonInteractive -File `"$escapedRunnerPath`""
+if ([string]::IsNullOrWhiteSpace($PythonExecutable)) {
+    $startInfo.FileName = 'powershell.exe'
+    $escapedRunnerPath = $runnerPath.Replace('"', '\"')
+    $startInfo.Arguments = "-NoLogo -NoProfile -NonInteractive -File `"$escapedRunnerPath`""
+}
+else {
+    $startInfo.FileName = $PythonExecutable
+    $escapedServerPath = $serverPath.Replace('"', '\"')
+    $startInfo.Arguments = "-I `"$escapedServerPath`""
+}
 $startInfo.UseShellExecute = $false
 $startInfo.CreateNoWindow = $true
 $startInfo.RedirectStandardInput = $true
@@ -53,6 +74,7 @@ $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
 $startInfo.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $startInfo.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
+$startInfo.EnvironmentVariables['PYTHONDONTWRITEBYTECODE'] = '1'
 if ($IgnoreAccountConfiguration) {
     $startInfo.EnvironmentVariables['APPDATA'] = Join-Path (
         [IO.Path]::GetTempPath()
@@ -72,7 +94,7 @@ try {
         params = [ordered]@{
             protocolVersion = '2024-11-05'
             capabilities = [ordered]@{}
-            clientInfo = [ordered]@{ name = 'coremail-smoke-test'; version = '0.6.0' }
+            clientInfo = [ordered]@{ name = 'coremail-smoke-test'; version = '0.7.0' }
         }
     })))
     $process.StandardInput.Flush()

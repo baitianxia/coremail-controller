@@ -5,10 +5,10 @@
       "command": "powershell.exe",
       "args": [
         "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-File",
-                "${CLAUDE_PLUGIN_ROOT}/mcp/run-server.ps1"
+        "-NoProfile",
+        "-NonInteractive",
+        "-File",
+        "${CLAUDE_PLUGIN_ROOT}/mcp/run-server.ps1"
       ]
     }
   }

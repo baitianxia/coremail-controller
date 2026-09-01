@@ -1,67 +1,56 @@
+#requires -Version 5.1
+
+[CmdletBinding()]
 param()
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$serverPath = Join-Path $PSScriptRoot 'server.py'
-if (-not (Test-Path -LiteralPath $serverPath -PathType Leaf)) {
-    [Console]::Error.WriteLine("Coremail MCP server not found: $serverPath")
-    exit 1
-}
-$versionProbePath = Join-Path $PSScriptRoot 'check-python.py'
-if (-not (Test-Path -LiteralPath $versionProbePath -PathType Leaf)) {
-    [Console]::Error.WriteLine("Coremail Python version probe not found: $versionProbePath")
-    exit 1
-}
-
-$pythonCommand = $null
-$pythonPrefix = @()
-
-if (-not [string]::IsNullOrWhiteSpace($env:COREMAIL_PYTHON)) {
-    try {
-        $pythonCommand = (Get-Command $env:COREMAIL_PYTHON -ErrorAction Stop).Source
-    }
-    catch {
-        [Console]::Error.WriteLine("COREMAIL_PYTHON cannot be resolved: $($env:COREMAIL_PYTHON)")
-        exit 1
-    }
-}
-else {
-    $launcher = Get-Command 'py.exe' -ErrorAction SilentlyContinue
-    if ($null -ne $launcher) {
-        $pythonCommand = $launcher.Source
-        $pythonPrefix = @('-3')
-    }
-    else {
-        foreach ($name in @('python.exe', 'python3.exe', 'python', 'python3')) {
-            $candidate = Get-Command $name -ErrorAction SilentlyContinue
-            if ($null -ne $candidate) {
-                $pythonCommand = $candidate.Source
-                break
-            }
+try {
+    $serverPath = Join-Path $PSScriptRoot 'server.py'
+    $probePath = Join-Path $PSScriptRoot 'check-python.py'
+    $runtimePath = Join-Path $PSScriptRoot 'python-runtime.json'
+    foreach ($required in @($serverPath, $probePath, $runtimePath)) {
+        if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+            throw "Coremail MCP runtime file not found: $required"
         }
     }
-}
 
-if ([string]::IsNullOrWhiteSpace($pythonCommand)) {
-    [Console]::Error.WriteLine(
-        'Python 3.10 or newer was not found. Install Python for the current user or set COREMAIL_PYTHON to python.exe.'
-    )
+    try {
+        $runtime = Get-Content -LiteralPath $runtimePath -Raw -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw "Coremail Python runtime descriptor is invalid: $($_.Exception.Message)"
+    }
+    if ([int]$runtime.schema_version -ne 1) {
+        throw 'Unsupported Coremail Python runtime descriptor schema.'
+    }
+    $pythonExecutable = [IO.Path]::GetFullPath([string]$runtime.executable)
+    if (-not (Test-Path -LiteralPath $pythonExecutable -PathType Leaf)) {
+        throw "The Python executable selected during installation is no longer available: $pythonExecutable"
+    }
+    $expectedHash = [string]$runtime.executable_sha256
+    if ($expectedHash -notmatch '^[0-9a-fA-F]{64}$') {
+        throw 'The Coremail Python runtime descriptor has an invalid executable hash.'
+    }
+    $actualHash = (Get-FileHash -LiteralPath $pythonExecutable -Algorithm SHA256).Hash
+    if ($actualHash -ine $expectedHash) {
+        throw 'The Python executable selected during installation changed. Run INSTALL.cmd again to revalidate and pin the runtime.'
+    }
+    & $pythonExecutable -B -I $probePath
+    $probeExitCode = $LASTEXITCODE
+    if ($probeExitCode -eq 10) {
+        throw 'Python 3.10 or newer is required by the pinned interpreter.'
+    }
+    if ($probeExitCode -ne 0) {
+        throw "Unable to validate the pinned Python interpreter (exit code $probeExitCode)."
+    }
+
+    & $pythonExecutable -B -I $serverPath
+    exit $LASTEXITCODE
+}
+catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
     exit 1
 }
-
-& $pythonCommand @pythonPrefix -I $versionProbePath
-$versionProbeExitCode = $LASTEXITCODE
-if ($versionProbeExitCode -eq 10) {
-    [Console]::Error.WriteLine('Python 3.10 or newer is required by the selected interpreter.')
-    exit 1
-}
-if ($versionProbeExitCode -ne 0) {
-    [Console]::Error.WriteLine(
-        "Unable to validate the selected Python interpreter (probe exit code $versionProbeExitCode): $pythonCommand"
-    )
-    exit 1
-}
-
-& $pythonCommand @pythonPrefix -I $serverPath
-exit $LASTEXITCODE

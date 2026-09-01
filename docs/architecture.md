@@ -1,7 +1,7 @@
 # Coremail Interface-First Connector Architecture
 
 Status: current normative design
-Last updated: 2026-08-30
+Last updated: 2026-09-01
 
 ## Purpose
 
@@ -46,7 +46,7 @@ diagnostics and server-configuration discovery. It never grants access by itself
 
 Deleting, recalling, moving, calendar operations, contacts, shared-mailbox
 administration, proprietary Coremail APIs, UI automation, and browser-server
-implementation are not part of version 0.6.0. Simple MAPI does not provide the full
+implementation are not part of version 0.7.0. Simple MAPI does not provide the full
 IMAP feature set: only `INBOX` is addressable, marking unread and saving drafts are
 unsupported, Internet threading headers are unavailable, and searches are bounded
 client-side scans. MAPI subjects are limited to 255 characters to avoid documented
@@ -61,9 +61,14 @@ provider truncation.
 - `.mcp.json`: starts the local stdio MCP server through Windows PowerShell.
 - `INSTALL.cmd`, `CONFIGURE-ACCOUNT.cmd`, and `UNINSTALL.cmd`: double-click user
   entry points that do not bypass the machine's PowerShell execution policy.
-- `mcp/run-server.ps1`: locates Python 3 without writing to the system.
+- `mcp/run-server.ps1`: verifies and launches the exact Python executable pinned at
+  installation, including its executable SHA-256.
 - `mcp/check-python.py`: validates the minimum Python version through a stable exit
   code without relying on redirected native-process output.
+- `mcp/describe-python.py`: records the selected interpreter identity, version,
+  pointer width, and executable hash without quote-sensitive inline Python.
+- `mcp/validate-config.py`: validates a staged non-secret mailbox configuration
+  before credential or active-config mutation.
 - `mcp/server.py`: MCP framing and tool schemas.
 - `mcp/coremail_backend.py`: transport routing, IMAP/SMTP, MIME, attachment, and
   prepared-message logic.
@@ -78,6 +83,9 @@ provider truncation.
 - `scripts/install.ps1`: validates and stages the package, moves a recognized prior
   plugin outside skill discovery, activates the replacement transactionally, runs
   first-use account setup, and verifies the MCP server.
+- `scripts/windows-tool-discovery.ps1`, `scripts/windows-lifecycle-common.ps1`, and
+  `scripts/windows-credential.ps1`: validated Claude/Python resolution, shared
+  atomic lifecycle and diagnostics, and fully qualified Credential Manager interop.
 - `scripts/configure-account.ps1`, `scripts/setup-account.ps1`, and
   `scripts/uninstall.ps1`: account reconfiguration and reversible personal plugin
   removal.
@@ -157,7 +165,7 @@ Local discovery is allowed, but bounded and non-destructive:
   connection or override the explicit account configuration.
 
 The connector may later add a version-specific local-cache reader after its schema
-is observed and documented. Version 0.6.0 does not claim compatibility with an
+is observed and documented. Version 0.7.0 does not claim compatibility with an
 undocumented Coremail cache format.
 
 ## Transport selection and connection configuration
@@ -301,7 +309,7 @@ label message content as untrusted.
 ## Runtime requirements
 
 - Windows 10 or 11
-- A current Claude Code release with skills-directory plugin and plugin MCP support
+- Claude Code 2.1.157 or newer with skills-directory plugin and plugin MCP support
 - Python 3.10 or newer (standard library only)
 - For interface mode: Coremail registered as the default Windows mail client, a
   provider matching the Python process bitness, and an existing shared Simple MAPI
@@ -319,22 +327,83 @@ shared session.
 
 - The distributable has a top-level `INSTALL.cmd`; normal installation is one
   double-click after the ZIP is fully extracted.
-- Installation is user-scoped and does not request administrator elevation.
-- The installer validates required files, plugin identity, the single-server MCP
-  declaration, Python 3.10+, and an offline MCP launch before replacing an existing
-  plugin.
+- New installation and every normal lifecycle operation are user-scoped and do not
+  request administrator elevation. A narrowly scoped exception exists only for a
+  legacy active plugin directory whose ACL denies the current user because an older
+  package was moved from an unsuitable source location. After package/prerequisite
+  verification and acquisition of the per-user lifecycle lock, install or uninstall
+  may ask for one UAC approval to run the Microsoft system `icacls.exe` against
+  exactly `%USERPROFILE%\.claude\skills\coremail-controller`. The command grants
+  the current account SID inheritable `Modify`, operates on the final link itself
+  (`/L`), preserves all existing ACEs and ownership, and does not recurse, reset,
+  delete, or grant any group. The parent path must already pass local-profile and
+  reparse checks. The ordinary user process then repeats the reparse and plugin-
+  identity checks before any move. Cancellation, an unexpected path, a non-account
+  SID, a remaining denial, or an unrecognized manifest fails closed without moving,
+  replacing, or deleting directory contents. If `icacls` already succeeded, its
+  added current-user ACE remains even when later identity validation fails; existing
+  ACEs and ownership still remain unchanged. `-NoLegacyPermissionRepair` disables
+  this compatibility path.
+- The installer requires an already usable Claude Code installation. It resolves
+  native `claude.exe` and standard npm `claude.cmd` installations without running a
+  package manager. For an npm installation it validates the package name and declared
+  bin path inside that package: current native-backed npm releases execute the
+  declared, non-reparse PE directly; older `.js`/`.cjs`/`.mjs` bins execute through
+  that installation's existing `node.exe`. It never evaluates the `.cmd` text or
+  passes user arguments through `cmd.exe`. The installer validates the plugin with
+  the real Claude CLI, explicitly enables `coremail-controller@skills-dir`, and
+  verifies the installed enabled entry. A missing, unsupported, incomplete,
+  policy-blocked, or uninspectable Claude installation stops before replacing an
+  existing plugin. Lifecycle probes temporarily disable Claude auto-updating and
+  restore the caller's environment, so the connector neither upgrades Claude nor
+  invokes a package manager as part of validation.
+- V1 owns only the default per-user `%USERPROFILE%\.claude` configuration root.
+  Install and uninstall reject a non-default `CLAUDE_CONFIG_DIR` before lifecycle
+  mutation, because mixing a custom Claude inventory/settings root with the fixed
+  skills path would make verification and rollback refer to different states.
+- The installer resolves Python 3.10+ once, records the resolved `sys.executable`,
+  version, pointer width, and executable SHA-256 in the staged plugin, and validates
+  the MCP through that descriptor. Normal MCP and MAPI-probe startup must use the
+  pinned executable and must not rediscover Python from a later Claude Code `PATH`
+  or honor an inherited `COREMAIL_PYTHON` override. Installed Python launches use
+  `-B -I`, preventing runtime bytecode caches from changing the verified plugin tree.
+- Before mutation, the installer validates every allowlisted release file against
+  the package's internal file manifest and requires Windows-native release metadata.
+  A locally built unverified candidate has a visibly different filename and metadata
+  and is rejected by the target installer.
 - The validated temporary tree is copied into a current-user staging directory
   under `%USERPROFILE%\.claude` before activation. The active plugin is never moved
   directly from `%TEMP%`, because an NTFS move can preserve an unsuitable source
   ACL instead of inheriting the user's Claude directory permissions.
+- Legacy ACL repair is not a general permission-repair facility and is not used for
+  `.claude`, `skills`, backup, disabled, staging, configuration, or arbitrary paths.
+  It exists only to recover the exact active directory left by withdrawn releases;
+  permanent denial anywhere else remains an administrator or policy issue.
 - A recognized previous plugin is moved to
   `%USERPROFILE%\.claude\plugin-backups`, outside the auto-discovered `skills`
   directory. An unrecognized target directory is never overwritten.
-- New files are copied to a unique temporary stage and validated before activation.
-  If activation fails after backup, the prior plugin is restored.
-- Existing non-secret account configuration and the Windows Generic Credential are
-  preserved on upgrade. First installation probes the client interface, selects it
-  without requesting a password only after a successful shared-session check, and
+- Installer and uninstaller share a current-user exclusive lifecycle lock outside the
+  active plugin directory. New files are copied to a unique temporary stage and
+  validated before activation. Every whole-directory publish, backup, disable, and
+  rollback uses the same-volume Win32 rename exposed by `[IO.Directory]::Move`, not
+  PowerShell FileSystem-provider `Move-Item`. Retryable access-denied and sharing
+  failures caused by Defender, EDR, indexing, or a recently stopped process are
+  retried with bounded backoff only while the source exists and destination does not.
+  Ambiguous state fails closed without recursive cleanup. If activation fails after
+  backup, the new directory is quarantined and the prior plugin is restored.
+- All lifecycle target paths under `%USERPROFILE%\.claude` are checked before writes;
+  V1 rejects a user profile, `.claude` root, or target ancestor that traverses a
+  symlink, junction, or other Windows reparse point.
+- Account configuration and installation summaries are constrained to the
+  system-resolved `%APPDATA%` root (including a normal enterprise-redirected root)
+  and reject reparse traversal below that boundary before publication.
+- Existing non-secret account configuration and Windows Generic Credentials are
+  preserved on upgrade. Account setup validates a same-directory staged configuration
+  before credential mutation, backs up the previous configuration byte-for-byte, uses
+  a new credential target by default, and atomically publishes the configuration.
+  Failure before publication removes the newly created credential and leaves the old
+  configuration untouched. First installation probes the client interface, selects
+  it without requesting a password only after a successful shared-session check, and
   otherwise starts interactive protocol setup. Reconfiguration remains explicit.
 - Offline MCP verification is mandatory. A live active-transport check runs when
   account configuration exists, but a session, network, or authentication failure
@@ -344,13 +413,18 @@ shared session.
   credentials, caches, VCS data, and arbitrary untracked files are excluded. Each
   archive has an adjacent SHA-256 file encoded as ASCII with an LF terminator so
   standard verification tools behave consistently on Windows, macOS, and Linux.
+- Each package also contains Windows build/source metadata and an internal
+  size/SHA-256 manifest for every distributed file. These detect accidental use of a
+  cross-built/local candidate and post-extraction corruption; organization signing or
+  a trusted gated distribution channel remains the authenticity boundary.
 - A locally built archive is only a release candidate. The only releasable artifact
   is the candidate uploaded after the packaged lifecycle test succeeds on a clean
   `windows-2022` runner under Windows PowerShell Desktop 5.1. That test parses every
   packaged PowerShell script, compiles the embedded Credential Manager C# helper,
   starts the packaged MCP server, and exercises install, replacement install,
-  reversible uninstall, reinstall, and final uninstall as a disposable local
-  standard user. The hosted runner's administrator identity is used only to create
+  reversible uninstall, reinstall, and a final uninstall launched from the installed
+  script itself as a disposable local standard user. The hosted runner's
+  administrator identity is used only to create
   and later remove that account. The orchestrator verifies the GitHub-hosted runner
   environment before crossing the alternate-credential process boundary and passes
   an explicit verification switch because runner-only environment variables are not
@@ -367,12 +441,47 @@ shared session.
   skips the live connection check, hashes the configuration before and after every
   mutation, and is restricted to an ephemeral GitHub Actions profile. It cannot
   read, authenticate to, or send through a real mailbox.
+- The Windows release gate uses fixed native and npm Claude Code fixtures only on the
+  disposable online runner. Under disposable standard-user profiles it validates the
+  plugin with the real CLI, proves a previously disabled skills-directory plugin is
+  enabled, verifies the pinned Python launch, and exercises both supported Claude
+  installation shapes. The pinned npm fixture uses its package-declared native PE,
+  while source assertions retain compatibility with older Node-backed npm bins. The
+  target installer never downloads, installs, upgrades, or repairs Claude Code.
+- The gate injects a real, reversible NTFS delete denial into a staged directory and
+  its parent, observes one atomic-move retry, restores both ACLs, and proves the same
+  installer process completes. It also tests lifecycle-lock contention, account
+  configuration rollback after a post-credential fault, and rejection of a corrupted
+  extracted file and unverified release metadata.
+- The gate proves a non-default `CLAUDE_CONFIG_DIR` is rejected before plugin or
+  settings mutation and that `-NoLegacyPermissionRepair` leaves the inaccessible
+  active plugin and its enabled state untouched.
+- The gate also changes the recognized active plugin ACL to the observed legacy
+  `SYSTEM`/`Administrators`-only shape, uses a release-gate-only handshake to restore
+  access while the same standard-user uninstall process waits, and requires the
+  legacy-repair requested/recovered log markers. Hosted CI cannot click a secure-
+  desktop UAC prompt; source assertions therefore bind production elevation to the
+  fixed System32 `icacls.exe`, exact target, current account SID, inheritable
+  `Modify`, and `/L`, while forbidding recursion, reset, ownership change, or delete.
 - Launchers do not pass `-ExecutionPolicy Bypass`; enterprise script policy must be
   satisfied through normal approval or signing.
-- Uninstall moves only a recognized plugin to `plugins-disabled`. A lock or ACL
-  failure leaves the active directory unchanged and reports the current Windows
-  identity and a specific recovery action; it never recursively deletes the plugin,
-  account configuration, or credentials.
+- Uninstall moves only a recognized plugin to `plugins-disabled`. A lock or
+  unrepaired ACL failure is handled by the same atomic state checks and bounded retry
+  policy. A permanent or ambiguous failure reports the current Windows identity and
+  a specific recovery action; it never recursively deletes the plugin, account
+  configuration, or credentials. The exact legacy-ACL compatibility path above may
+  run before manifest verification or during the final move, but the ordinary user
+  process must still recognize the plugin before committing removal. The uninstaller
+  disables the real skills-directory plugin first and restores the previous Claude
+  settings if the directory move fails.
+  When the exact active directory is absent, uninstall is idempotently successful
+  without requiring Claude Code; an inaccessible existing directory still requires
+  the real CLI before permission repair or plugin-state mutation.
+- Install, reconfiguration, and uninstall launchers create a timestamped UTF-8 log in
+  `%TEMP%\CoremailController`, display its path on both success and failure, and keep
+  secrets and full protocol transcripts out of that log. Capturing diagnostics must
+  never cause the original operation to fail. Native stderr is logged separately
+  from captured stdout so warnings cannot corrupt Claude inventory or MAPI-probe JSON.
 - Windows PowerShell 5.1 launch paths execute the packaged no-output version probe
   and use only its exit code; they neither parse redirected native-process output
   nor pass quote-sensitive inline Python through `-c`.
@@ -411,3 +520,19 @@ shared session.
 15. No Windows archive is released until its packaged tree passes the clean-runner
     Windows PowerShell 5.1 lifecycle gate; local unit tests or a local ZIP build do
     not satisfy this release criterion.
+16. Directory mutation is serialized, atomic, retryable only from an unambiguous
+    source-present/destination-absent state, and covered by real ACL fault injection;
+    packaged lifecycle scripts contain no `Move-Item` directory transition.
+17. The installed MCP uses the Python executable pinned during installation, and the
+    Windows gate validates and enables the installed plugin through real native and
+    npm Claude Code entry points before accepting the artifact.
+18. Account configuration publication and new credential creation form a recoverable
+    transaction, including a test fault after credential creation but before config
+    publication.
+19. Every target lifecycle produces a persistent secret-free diagnostic log, and the
+    installer rejects non-Windows-gate metadata or any distributed file that differs
+    from the internal integrity manifest.
+20. A withdrawn-release `SYSTEM`/`Administrators`-only ACL can be repaired only at
+    the exact active plugin path through the constrained UAC flow; normal installs do
+    not elevate, and no compatibility path may reset ACLs, take ownership, recurse,
+    delete data, or touch another location.

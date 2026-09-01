@@ -1,9 +1,9 @@
 # Claude Code Coremail 接口优先连接器
 
-> **当前发布线：0.6.0。** 只安装由成功的 Windows PowerShell 5.1 生命周期门禁上传、
+> **当前发布线：0.7.0。** 只安装由成功的 Windows PowerShell 5.1 生命周期门禁上传、
 > 且 ZIP 与相邻 `.sha256` 文件匹配的 `coremail-controller-windows-gated` 产物。
-> 私有仓库的 `gated-release/releases/0.6.0/` 保存同一对已复核文件。0.5.x 已全部
-> 撤回，不得继续安装或测试其历史构建。
+> 私有仓库的 `gated-release/releases/0.7.0/` 保存同一对已复核文件。0.6.0 及更早
+> 构建已撤回，不得继续安装或测试。
 
 这是一个供 Windows 上 Claude Code 使用的本地插件。它**不会启动、显示或操作
 Coremail 客户端界面**。用户可直接用文字要求 Claude Code 搜索、读取、整理和准备
@@ -60,8 +60,13 @@ coremail-controller/
 ## 环境要求
 
 - Windows 10/11；
-- 当前版本的 Claude Code；
-- Python 3.10 或更高版本，且 `py.exe` 或 `python.exe` 在 `PATH` 中；
+- Claude Code 2.1.157 或更高版本（支持 skills-directory 插件；原生 `claude.exe` 或标准 npm
+  `claude.cmd` 安装均可）。npm 安装会按其官方包清单解析：新版包内原生 PE 直接执行，
+  旧版 JS 入口使用该安装已有的 Node；不会通过 `cmd.exe` 拼接命令；
+- 当前版本只管理默认的 `%USERPROFILE%\.claude` 用户配置目录；启动安装或卸载进程时，
+  `CLAUDE_CONFIG_DIR` 必须未设置，或明确指向这个默认目录。其他配置根不会被猜测或改写；
+- Python 3.10 或更高版本，安装时可由 `py.exe` 或 `python.exe` 找到；安装器会固定并
+  校验实际 `python.exe`，以后不再随 `PATH` 漂移；
 - 接口模式：Coremail 是 Windows 默认邮件客户端，并暴露与 Python 位数匹配的 Simple
   MAPI 提供程序，且当前已有共享登录会话；或
 - 协议模式：邮箱账号、准确的 IMAP/SMTP 主机名、组织允许的域密码或客户端专用密码，
@@ -81,8 +86,9 @@ Windows 上完整解压发布 ZIP，进入解压目录，双击：
 INSTALL.cmd
 ```
 
-向导会检查包结构、Python 3.10+ 和 Claude Code，先在临时目录验证 MCP 能启动，再把
-插件安装到：
+向导会先逐文件核对包内清单和 Windows 门禁元数据，固定 Python 运行时，并通过真实
+Claude Code 执行严格插件验证；随后在当前用户的 `.claude` 目录暂存、验证 MCP、原子
+替换插件，显式启用并再次从 `claude plugin list --json` 核对准确版本和路径。插件安装到：
 
 ```text
 %USERPROFILE%\.claude\skills\coremail-controller
@@ -96,8 +102,19 @@ IMAP/SMTP 配置。升级默认保留已有账号配置及 Windows 凭据。
 %USERPROFILE%\.claude\plugin-backups
 ```
 
-备份刻意放在 `skills` 目录之外，避免 Claude Code 把旧版本再次加载为插件。安装使用
-当前用户范围，不请求管理员权限，也不绕过机器的 PowerShell 执行策略。
+备份刻意放在 `skills` 目录之外，避免 Claude Code 把旧版本再次加载为插件。正常流程
+只在当前用户范围运行，不请求管理员权限，也不绕过机器的 PowerShell 执行策略。若
+检测到已撤回旧版本留下的
+`%USERPROFILE%\.claude\skills\coremail-controller` 只有 `SYSTEM/Administrators`
+可访问，安装器会仅针对这个固定目录请求一次 UAC：调用 Windows 自带的
+`icacls.exe` 给当前用户 SID 增加可继承的 `Modify`，保留原 ACL 和所有权，不递归、
+不重置、不接管所有权、不删除内容；随后仍由普通用户进程复核路径、插件身份并完成
+原子迁移。取消授权或复核失败不会移动、覆盖或删除目录内容；若系统授权已经成功，
+新增的当前用户 ACE 会保留，原有 ACE 和所有权不变。企业策略禁止此兼容处理时，可用
+`-NoLegacyPermissionRepair` 让流程直接安全停止。
+
+安装、配置和卸载都会把不含密码的诊断日志写入 `%TEMP%\CoremailController`；窗口关闭
+后仍可排错。
 
 如果习惯命令行，可使用等价命令：
 
@@ -138,6 +155,10 @@ Windows 域 UPN，不能得到
 不要把密码粘贴到 Claude 对话、命令参数或 JSON 配置中。当前环境如果就是用 Windows
 域用户名和密码登录 Coremail，可在安全密码提示框中输入该密码；若组织启用了双重认证
 或协议策略，则按管理员要求使用客户端专用密码。
+
+重新配置采用可恢复事务：先在同目录生成并验证新 JSON，再备份旧 JSON，然后写入一个
+新的凭据目标，最后原子发布配置。发布前失败会删除新凭据并保持旧配置不变；脚本不会
+覆盖或删除旧配置仍可能引用的密码。
 
 也可显式选择模式：
 
@@ -256,15 +277,19 @@ powershell.exe -NoProfile -File .\tests\smoke-mcp.ps1 -CheckConnection -TimeoutM
 python .\scripts\build-release.py --output-dir .\dist --force
 ```
 
-构建结果是 `dist\coremail-controller-0.6.0-windows.zip` 及相邻的 `.sha256` 文件，但
-它仍不是可交付发布包。`.github/workflows/windows-release-gate.yml` 必须在干净的
-`windows-2022` 环境中，用 Windows PowerShell 5.1 对 ZIP 内实际文件完成脚本解析、
-凭据辅助 C# 编译、安装、覆盖安装、MCP 冒烟、卸载、重装和再次卸载；只有该任务随后
-上传的 `coremail-controller-windows-gated` 构件可以进入发布流程。ZIP 在解压测试前和
-上传前会再次核对 SHA-256，确保交付内容就是被测内容。门禁使用无密码的离线配置并
-跳过真实连接，不读取或发送邮件。由于 GitHub 托管的 Windows runner 默认具有管理员
-权限，门禁会创建一次性本地标准用户，所有安装和卸载动作都在该用户下执行，并主动
-拒绝管理员令牌，避免管理员权限掩盖用户目录 ACL 问题。
+本地构建结果会明确命名为
+`dist\coremail-controller-0.7.0-windows-UNVERIFIED.zip`，目标安装器会拒绝它。正式
+`coremail-controller-0.7.0-windows.zip` 只能由 `.github/workflows/windows-release-gate.yml`
+在干净的 `windows-2022` 环境中生成。门禁使用 Windows PowerShell 5.1、一次性标准
+用户和真实的原生/npm Claude Code 两种入口，验证包内清单、脚本解析、凭据 C# 编译、
+Python 固定启动、Claude 启用状态、安装/覆盖安装/卸载/重装，还会注入临时目录移动
+拒绝和旧版本 `SYSTEM/Administrators`-only ACL、生命周期锁冲突及“凭据已写但配置未
+发布”故障并证明同进程恢复。安全桌面的 UAC 点击不能由托管 CI 代替；门禁改用专用
+握手验证标准用户的等待/恢复状态机，并静态约束正式路径只能调用 System32
+`icacls.exe`、固定插件目录、当前用户 SID、`Modify` 和 `/L`，禁止 `/T`、ACL reset、
+接管所有权或删除。它使用无密码的
+离线邮箱配置且跳过真实连接，不读取或发送邮件。ZIP 在测试前后和发布任务中都会再次
+核对 SHA-256；只有上传的 `coremail-controller-windows-gated` 构件可交付。
 
 常见问题：
 
@@ -291,12 +316,12 @@ powershell.exe -NoProfile -File .\scripts\uninstall.ps1
 Windows 凭据，因而可以恢复。若要删除凭据，请在确认目标名后通过 Windows“凭据
 管理器”手动完成。
 
-若卸载报告 `Move-Item` 访问被拒绝，先执行
-`claude plugin disable coremail-controller@skills-dir`，再 `/reload-plugins` 或退出所有
-Claude Code 会话。随后确认 `icacls` 输出中当前 Windows 身份对插件目录具有修改权限；
-卸载器不会自行接管所有权或放宽 ACL。早期安装包若从临时目录移动插件，可能把不合适
-的临时目录 ACL 一并带入；这种情况只应定点修复
-`%USERPROFILE%\.claude\skills\coremail-controller`，不要修改整个用户目录。
+卸载器会先通过真实 Claude Code 核对准确的 `coremail-controller@skills-dir`，再禁用并
+使用同卷原子移动；若 Defender、EDR、索引或刚结束的进程短暂占用目录，会在同一进程
+中自动有界重试。若旧版本目录明确拒绝当前用户访问，则可能出现一次上述受限 UAC
+修复；它只增加当前用户对固定插件目录的 `Modify`，不会接管所有权、重置 ACL、递归
+处理或删除内容。若最终仍失败，插件和 Claude 设置会保持或恢复到原状态；根据窗口给出
+的 `%TEMP%\CoremailController\UNINSTALL-*.log` 定点排查即可。
 
 ## 官方参考
 

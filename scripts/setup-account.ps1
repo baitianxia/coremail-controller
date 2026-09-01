@@ -1,25 +1,28 @@
+#requires -Version 5.1
+
+[CmdletBinding()]
 param(
     [ValidateSet('auto', 'windows_simple_mapi', 'imap_smtp')]
     [string]$Transport = 'auto',
     [string]$Username,
     [string]$ImapHost,
-    [ValidateRange(1, 65535)]
-    [int]$ImapPort = 993,
-    [ValidateSet('ssl', 'starttls')]
-    [string]$ImapSecurity = 'ssl',
+    [ValidateRange(1, 65535)][int]$ImapPort = 993,
+    [ValidateSet('ssl', 'starttls')][string]$ImapSecurity = 'ssl',
     [string]$SmtpHost,
-    [ValidateRange(1, 65535)]
-    [int]$SmtpPort = 465,
-    [ValidateSet('ssl', 'starttls')]
-    [string]$SmtpSecurity = 'ssl',
+    [ValidateRange(1, 65535)][int]$SmtpPort = 465,
+    [ValidateSet('ssl', 'starttls')][string]$SmtpSecurity = 'ssl',
     [string[]]$AllowedFrom,
     [string]$DraftsFolder,
     [string]$SentFolder,
-    [ValidateSet('none', 'append')]
-    [string]$SentCopyMode = 'none',
+    [ValidateSet('none', 'append')][string]$SentCopyMode = 'none',
     [string[]]$AttachmentRoots,
     [string]$CaFile,
-    [string]$CredentialTarget
+    [string]$CredentialTarget,
+    [Security.SecureString]$Password,
+    [switch]$NonInteractive,
+    [ValidateSet('none', 'after_credential_write', 'before_config_publish')]
+    [string]$TestFailurePoint = 'none',
+    [string]$LogPath = ''
 )
 
 Set-StrictMode -Version 2.0
@@ -29,19 +32,76 @@ if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw 'Coremail account setup is intended for Windows.'
 }
 
-function Read-RequiredValue {
-    param(
-        [string]$Current,
-        [string]$Prompt
+$pluginRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+$commonScript = Join-Path $PSScriptRoot 'windows-lifecycle-common.ps1'
+$credentialScript = Join-Path $PSScriptRoot 'windows-credential.ps1'
+if (-not (Test-Path -LiteralPath $commonScript -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $credentialScript -PathType Leaf)) {
+    throw 'Coremail account transaction support is missing.'
+}
+. $commonScript
+. $credentialScript
+
+if ([string]::IsNullOrWhiteSpace($LogPath)) {
+    $logDirectory = Join-Path ([IO.Path]::GetTempPath()) 'CoremailController'
+    $LogPath = Join-Path $logDirectory (
+        'CONFIGURE-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' +
+        [guid]::NewGuid().ToString('N').Substring(0, 8) + '.log'
     )
+}
+Initialize-CoremailLifecycleLog -Path $LogPath
+
+$stagedConfigPath = $null
+$newCredentialWritten = $false
+$configCommitted = $false
+$ownsPassword = $false
+
+function Read-RequiredValue {
+    param([string]$Current, [string]$Prompt)
     $value = $Current
     while ([string]::IsNullOrWhiteSpace($value)) {
+        if ($NonInteractive) { throw "$Prompt is required in non-interactive mode." }
         $value = Read-Host $Prompt
     }
     if ($value.Contains("`r") -or $value.Contains("`n")) {
         throw "$Prompt must not contain newlines."
     }
     return $value.Trim()
+}
+
+function Get-PinnedPythonRuntime {
+    $descriptorPath = Join-Path $pluginRoot 'mcp\python-runtime.json'
+    if (-not (Test-Path -LiteralPath $descriptorPath -PathType Leaf)) {
+        throw 'The pinned Python runtime descriptor is missing. Run INSTALL.cmd before configuring an account.'
+    }
+    try { $runtime = Get-Content -LiteralPath $descriptorPath -Raw | ConvertFrom-Json }
+    catch { throw "The pinned Python runtime descriptor is invalid: $($_.Exception.Message)" }
+    if ([int]$runtime.schema_version -ne 1) {
+        throw 'The pinned Python runtime descriptor schema is unsupported.'
+    }
+    $executable = [IO.Path]::GetFullPath([string]$runtime.executable)
+    if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
+        throw "The pinned Python executable is unavailable: $executable"
+    }
+    $expectedHash = [string]$runtime.executable_sha256
+    $actualHash = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash
+    if ($expectedHash -notmatch '^[0-9a-fA-F]{64}$' -or $actualHash -ine $expectedHash) {
+        throw 'The pinned Python executable changed. Run INSTALL.cmd again before changing account settings.'
+    }
+    return [pscustomobject]@{ Executable = $executable; PointerBits = [int]$runtime.pointer_bits }
+}
+
+function Invoke-PinnedPython {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [string]$CapturePath = '',
+        [string]$Label = 'Python helper'
+    )
+    Invoke-CoremailExternalChecked `
+        -Executable ([string]$script:PinnedPython.Executable) `
+        -Arguments $Arguments `
+        -CapturePath $CapturePath `
+        -Label $Label
 }
 
 function Test-CoremailClientName {
@@ -57,20 +117,18 @@ function Get-CoremailMapiRegistration {
         [pscustomobject]@{ Path = 'Registry::HKEY_CURRENT_USER\Software\WOW6432Node\Clients\Mail'; Scope = 'current_user_32bit' },
         [pscustomobject]@{ Path = 'Registry::HKEY_LOCAL_MACHINE\Software\WOW6432Node\Clients\Mail'; Scope = 'local_machine_32bit' }
     )
-
     $defaultClient = $null
     $defaultScope = $null
     foreach ($root in $mailRoots) {
         if (-not (Test-Path -LiteralPath $root.Path -PathType Container)) { continue }
-        $item = Get-Item -LiteralPath $root.Path
-        $candidate = [string]$item.GetValue('')
+        $mailRootItem = Get-Item -LiteralPath $root.Path
+        $candidate = [string]($mailRootItem.GetValue(''))
         if (-not [string]::IsNullOrWhiteSpace($candidate)) {
             $defaultClient = $candidate.Trim()
             $defaultScope = $root.Scope
             break
         }
     }
-
     $recognized = Test-CoremailClientName -Name $defaultClient
     $providerRegistered = $false
     if ($recognized) {
@@ -79,8 +137,7 @@ function Get-CoremailMapiRegistration {
             if (-not (Test-Path -LiteralPath $clientKey -PathType Container)) { continue }
             $item = Get-Item -LiteralPath $clientKey
             foreach ($valueName in @('DLLPathEx', 'DLLPath', 'MSIComponentID')) {
-                $value = [string]$item.GetValue($valueName)
-                if (-not [string]::IsNullOrWhiteSpace($value)) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$item.GetValue($valueName))) {
                     $providerRegistered = $true
                     break
                 }
@@ -88,7 +145,6 @@ function Get-CoremailMapiRegistration {
             if ($providerRegistered) { break }
         }
     }
-
     return [pscustomobject]@{
         Client = $defaultClient
         Scope = $defaultScope
@@ -98,56 +154,29 @@ function Get-CoremailMapiRegistration {
     }
 }
 
-function Resolve-CoremailPythonRuntime {
-    $command = $null
-    $prefix = @()
-    if (-not [string]::IsNullOrWhiteSpace($env:COREMAIL_PYTHON)) {
-        $candidate = Get-Command $env:COREMAIL_PYTHON -ErrorAction Stop
-        $command = $candidate.Source
-    }
-    else {
-        $launcher = Get-Command 'py.exe' -ErrorAction SilentlyContinue
-        if ($null -ne $launcher) {
-            $command = $launcher.Source
-            $prefix = @('-3')
-        }
-        else {
-            foreach ($name in @('python.exe', 'python3.exe', 'python', 'python3')) {
-                $candidate = Get-Command $name -ErrorAction SilentlyContinue
-                if ($null -ne $candidate) {
-                    $command = $candidate.Source
-                    break
-                }
-            }
-        }
-    }
-    if ([string]::IsNullOrWhiteSpace($command)) {
-        throw 'Python 3.10 or newer was not found for the Coremail MAPI probe.'
-    }
-    return [pscustomobject]@{ Command = $command; Prefix = @($prefix) }
-}
-
 function Test-CoremailSharedMapiSession {
-    $runtime = Resolve-CoremailPythonRuntime
-    $pluginRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
     $probeScript = Join-Path $pluginRoot 'mcp\windows_mapi.py'
-    if (-not (Test-Path -LiteralPath $probeScript -PathType Leaf)) {
-        throw "Coremail MAPI probe not found: $probeScript"
+    $probeOutput = Join-Path ([IO.Path]::GetTempPath()) (
+        'coremail-mapi-probe-' + [guid]::NewGuid().ToString('N') + '.json'
+    )
+    try {
+        Invoke-PinnedPython `
+            -Arguments @('-B', '-I', $probeScript, '--probe-json') `
+            -CapturePath $probeOutput `
+            -Label 'Coremail Simple MAPI probe'
+        $result = Get-Content -LiteralPath $probeOutput -Raw | ConvertFrom-Json
     }
-    $prefix = @($runtime.Prefix)
-    $output = & $runtime.Command @prefix -I $probeScript --probe-json
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($output)) {
-        throw 'The Coremail MAPI probe process did not return a result.'
+    finally {
+        if (Test-Path -LiteralPath $probeOutput -PathType Leaf) {
+            Remove-Item -LiteralPath $probeOutput -Force -ErrorAction SilentlyContinue
+        }
     }
-    $result = $output | ConvertFrom-Json
     $unicodeSend = $false
-    if ($result.PSObject.Properties.Name -contains 'unicode_send_available') {
+    if ($null -ne $result.PSObject.Properties['unicode_send_available']) {
         $unicodeSend = [bool]$result.unicode_send_available
     }
     $reason = 'unusable interface'
-    if ($result.PSObject.Properties.Name -contains 'reason') {
-        $reason = [string]$result.reason
-    }
+    if ($null -ne $result.PSObject.Properties['reason']) { $reason = [string]$result.reason }
     return [pscustomobject]@{
         Code = if ($result.usable) { 0 } else { $reason }
         SharedSession = [bool]$result.shared_session_available
@@ -157,252 +186,229 @@ function Test-CoremailSharedMapiSession {
     }
 }
 
-$registration = $null
-$mapiProbe = $null
-$mapiProbeFailure = $null
-if ($Transport -ne 'imap_smtp') {
-    $registration = Get-CoremailMapiRegistration
-    if ($registration.Candidate) {
-        Write-Host "Recognized default Windows mail client: $($registration.Client)"
-        try {
-            $mapiProbe = Test-CoremailSharedMapiSession
-        }
-        catch {
-            $mapiProbeFailure = $_.Exception.Message
-        }
+try {
+    if ($TestFailurePoint -ne 'none' -and $env:COREMAIL_RELEASE_GATE_TESTING -ne 'true') {
+        throw 'Account failure injection is restricted to the Windows release gate.'
     }
-}
+    $script:PinnedPython = Get-PinnedPythonRuntime
+    Write-CoremailLifecycleLog "ACCOUNT TRANSACTION started transport=$Transport"
 
-if ($Transport -eq 'auto') {
-    if ($null -ne $mapiProbe -and $mapiProbe.Usable) {
-        $Transport = 'windows_simple_mapi'
-        Write-Host "Using the existing Coremail shared Simple MAPI session through $($mapiProbe.PythonPointerBits)-bit Python. No password will be requested."
+    $registration = $null
+    $mapiProbe = $null
+    $mapiProbeFailure = $null
+    if ($Transport -ne 'imap_smtp') {
+        $registration = Get-CoremailMapiRegistration
+        if ($registration.Candidate) {
+            Write-Host "Recognized default Windows mail client: $($registration.Client)"
+            try { $mapiProbe = Test-CoremailSharedMapiSession }
+            catch { $mapiProbeFailure = $_.Exception.Message }
+        }
     }
-    else {
-        $Transport = 'imap_smtp'
-        if ($null -eq $registration -or -not $registration.Recognized) {
-            Write-Host 'No registered Coremail Simple MAPI client was found; using secure IMAP/SMTP setup.'
-        }
-        elseif (-not $registration.ProviderRegistered) {
-            Write-Host 'Coremail is registered but has no Simple MAPI provider; using secure IMAP/SMTP setup.'
-        }
-        elseif ($null -ne $mapiProbe -and -not $mapiProbe.SharedSession) {
-            Write-Host "Coremail has no reusable shared MAPI session (code $($mapiProbe.Code)); using secure IMAP/SMTP setup."
-        }
-        elseif (-not [string]::IsNullOrWhiteSpace($mapiProbeFailure)) {
-            Write-Host 'The Coremail MAPI probe could not run in this process; using secure IMAP/SMTP setup.'
+
+    if ($Transport -eq 'auto') {
+        if ($null -ne $mapiProbe -and $mapiProbe.Usable) {
+            $Transport = 'windows_simple_mapi'
+            Write-Host "Using the existing Coremail shared Simple MAPI session through $($mapiProbe.PythonPointerBits)-bit Python. No password will be requested."
         }
         else {
-            Write-Host 'The Coremail MAPI provider cannot perform no-UI Unicode sending; using secure IMAP/SMTP setup.'
-        }
-    }
-}
-elseif ($Transport -eq 'windows_simple_mapi') {
-    if ($null -eq $registration -or -not $registration.Candidate) {
-        throw 'windows_simple_mapi was requested, but the default Windows mail client is not a registered Coremail MAPI provider.'
-    }
-    if ($null -eq $mapiProbe -or -not $mapiProbe.Usable) {
-        $code = if ($null -eq $mapiProbe) {
-            if ([string]::IsNullOrWhiteSpace($mapiProbeFailure)) { 'not probed' } else { $mapiProbeFailure }
-        }
-        else { [string]$mapiProbe.Code }
-        throw "windows_simple_mapi was requested, but no usable shared session is available (code $code)."
-    }
-}
-
-if ($Transport -eq 'windows_simple_mapi' -and [string]::IsNullOrWhiteSpace($Username)) {
-    $whoAmI = Join-Path $env:SystemRoot 'System32\whoami.exe'
-    if (Test-Path -LiteralPath $whoAmI -PathType Leaf) {
-        try {
-            $upn = (& $whoAmI /upn 2>$null | Select-Object -First 1)
-            if ($null -ne $upn -and ([string]$upn).Contains('@')) {
-                $Username = ([string]$upn).Trim()
-                Write-Host "Using Windows domain UPN as mailbox identity: $Username"
+            $Transport = 'imap_smtp'
+            if ($null -eq $registration -or -not $registration.Recognized) {
+                Write-Host 'No registered Coremail Simple MAPI client was found; using secure IMAP/SMTP setup.'
+            }
+            elseif (-not $registration.ProviderRegistered) {
+                Write-Host 'Coremail is registered but has no Simple MAPI provider; using secure IMAP/SMTP setup.'
+            }
+            elseif ($null -ne $mapiProbe -and -not $mapiProbe.SharedSession) {
+                Write-Host "Coremail has no reusable shared MAPI session (code $($mapiProbe.Code)); using secure IMAP/SMTP setup."
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($mapiProbeFailure)) {
+                Write-Host 'The Coremail MAPI probe could not run; using secure IMAP/SMTP setup.'
+            }
+            else {
+                Write-Host 'The Coremail MAPI provider cannot perform no-UI Unicode sending; using secure IMAP/SMTP setup.'
             }
         }
+    }
+    elseif ($Transport -eq 'windows_simple_mapi') {
+        if ($null -eq $registration -or -not $registration.Candidate) {
+            throw 'windows_simple_mapi was requested, but the default Windows mail client is not a registered Coremail MAPI provider.'
+        }
+        if ($null -eq $mapiProbe -or -not $mapiProbe.Usable) {
+            $code = if ($null -eq $mapiProbe) {
+                if ([string]::IsNullOrWhiteSpace($mapiProbeFailure)) { 'not probed' } else { $mapiProbeFailure }
+            }
+            else { [string]$mapiProbe.Code }
+            throw "windows_simple_mapi was requested, but no usable shared session is available (code $code)."
+        }
+    }
+
+    if ($Transport -eq 'windows_simple_mapi' -and [string]::IsNullOrWhiteSpace($Username)) {
+        $whoAmI = Join-Path $env:SystemRoot 'System32\whoami.exe'
+        if (Test-Path -LiteralPath $whoAmI -PathType Leaf) {
+            try {
+                $upn = (& $whoAmI /upn 2>$null | Select-Object -First 1)
+                if ($null -ne $upn -and ([string]$upn).Contains('@')) {
+                    $Username = ([string]$upn).Trim()
+                    Write-Host "Using Windows domain UPN as mailbox identity: $Username"
+                }
+            }
+            catch { $Username = $null }
+        }
+    }
+
+    $Username = Read-RequiredValue -Current $Username -Prompt 'Full mailbox username (for example user@example.com)'
+    if (-not $Username.Contains('@')) { throw 'The mailbox username must be a full email address.' }
+    if ($null -eq $AllowedFrom -or $AllowedFrom.Count -eq 0) { $AllowedFrom = @($Username) }
+    if ($Transport -eq 'windows_simple_mapi') {
+        if ($AllowedFrom.Count -ne 1 -or $AllowedFrom[0] -ine $Username) {
+            throw 'windows_simple_mapi requires allowed_from to contain only the active mailbox username.'
+        }
+        if (-not [string]::IsNullOrWhiteSpace($CaFile) -or
+            -not [string]::IsNullOrWhiteSpace($DraftsFolder) -or
+            -not [string]::IsNullOrWhiteSpace($SentFolder) -or
+            $SentCopyMode -ne 'none') {
+            throw 'CA, Drafts/Sent folder, and sent-copy settings apply only to imap_smtp.'
+        }
+    }
+
+    $resolvedRoots = @()
+    foreach ($root in @($AttachmentRoots)) {
+        if ([string]::IsNullOrWhiteSpace($root)) { continue }
+        $resolved = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($root))
+        if (-not (Test-Path -LiteralPath $resolved -PathType Container)) {
+            throw "Attachment root does not exist: $resolved"
+        }
+        $resolvedRoots += $resolved
+    }
+    $resolvedCaFile = $null
+    if (-not [string]::IsNullOrWhiteSpace($CaFile)) {
+        $resolvedCaFile = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($CaFile))
+        if (-not (Test-Path -LiteralPath $resolvedCaFile -PathType Leaf)) {
+            throw "CA file does not exist: $resolvedCaFile"
+        }
+    }
+
+    if ($Transport -eq 'imap_smtp') {
+        $ImapHost = Read-RequiredValue -Current $ImapHost -Prompt 'IMAP server hostname'
+        $SmtpHost = Read-RequiredValue -Current $SmtpHost -Prompt 'SMTP server hostname'
+        if ([string]::IsNullOrWhiteSpace($CredentialTarget)) {
+            $CredentialTarget = 'ClaudeCode.Coremail:' + $Username + ':' + [guid]::NewGuid().ToString('N')
+        }
+        if ($CredentialTarget.Contains("`r") -or $CredentialTarget.Contains("`n") -or
+            $CredentialTarget.Length -gt 1024) {
+            throw 'Credential target must be a single line no longer than 1024 characters.'
+        }
+        if (Test-CoremailCredential -Target $CredentialTarget) {
+            throw "Credential target '$CredentialTarget' already exists. Omit -CredentialTarget to create a new transactional credential."
+        }
+    }
+
+    $appData = [Environment]::GetFolderPath('ApplicationData')
+    $userProfile = [Environment]::GetFolderPath('UserProfile')
+    if ([string]::IsNullOrWhiteSpace($appData)) { $appData = Join-Path $userProfile 'AppData\Roaming' }
+    $configDirectory = Join-Path $appData 'ClaudeCode\Coremail'
+    $configPath = Join-Path $configDirectory 'config.json'
+    [void](Assert-CoremailSafeDescendantPath `
+        -Root $appData `
+        -Path $configPath `
+        -Label 'Coremail account configuration')
+    New-Item -ItemType Directory -Path $configDirectory -Force | Out-Null
+
+    $config = [ordered]@{
+        transport = $Transport
+        username = $Username
+        allowed_from = @($AllowedFrom)
+        sent_copy_mode = $SentCopyMode
+        attachment_roots = @($resolvedRoots)
+        max_message_bytes = 10485760
+        max_body_chars = 50000
+        max_attachment_bytes = 26214400
+        max_recipients = 100
+        timeout_seconds = 20
+    }
+    if ($Transport -eq 'imap_smtp') {
+        $config['credential_target'] = $CredentialTarget
+        $config['imap'] = [ordered]@{ host = $ImapHost; port = $ImapPort; security = $ImapSecurity }
+        $config['smtp'] = [ordered]@{ host = $SmtpHost; port = $SmtpPort; security = $SmtpSecurity }
+        $config['drafts_folder'] = if ([string]::IsNullOrWhiteSpace($DraftsFolder)) { $null } else { $DraftsFolder }
+        $config['sent_folder'] = if ([string]::IsNullOrWhiteSpace($SentFolder)) { $null } else { $SentFolder }
+        $config['ca_file'] = $resolvedCaFile
+    }
+
+    $stagedConfigPath = Join-Path $configDirectory (
+        '.config-' + [guid]::NewGuid().ToString('N') + '.json'
+    )
+    $json = $config | ConvertTo-Json -Depth 10
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText($stagedConfigPath, $json, $utf8)
+    Invoke-PinnedPython `
+        -Arguments @('-B', '-I', (Join-Path $pluginRoot 'mcp\validate-config.py'), $stagedConfigPath) `
+        -Label 'Staged account configuration validation'
+
+    if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+        $backupPath = $configPath + '.backup-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' +
+            [guid]::NewGuid().ToString('N').Substring(0, 8)
+        [IO.File]::Copy($configPath, $backupPath, $false)
+        Write-Host "Previous non-secret configuration backed up to: $backupPath"
+        Write-CoremailLifecycleLog "ACCOUNT CONFIG BACKUP path=$backupPath"
+    }
+
+    if ($Transport -eq 'imap_smtp') {
+        if ($null -eq $Password) {
+            if ($NonInteractive) { throw 'Password is required in non-interactive IMAP/SMTP setup.' }
+            $Password = Read-Host 'Windows domain/Coremail or client-specific password (stored in Windows Credential Manager)' -AsSecureString
+            $ownsPassword = $true
+        }
+        if ($Password.Length -eq 0) { throw 'The password must not be empty.' }
+        Write-CoremailCredential -Target $CredentialTarget -Username $Username -Password $Password
+        $newCredentialWritten = $true
+        Write-CoremailLifecycleLog "ACCOUNT CREDENTIAL WRITTEN target=$CredentialTarget"
+        if ($TestFailurePoint -eq 'after_credential_write') {
+            throw 'Injected release-gate failure after credential write.'
+        }
+    }
+    if ($TestFailurePoint -eq 'before_config_publish') {
+        throw 'Injected release-gate failure before configuration publication.'
+    }
+
+    Publish-CoremailFileAtomically -Source $stagedConfigPath -Destination $configPath
+    $stagedConfigPath = $null
+    $configCommitted = $true
+    Write-CoremailLifecycleLog 'ACCOUNT CONFIGURATION COMMITTED'
+
+    Write-Host ''
+    Write-Host 'Coremail account configuration saved.' -ForegroundColor Green
+    Write-Host "Transport: $Transport"
+    Write-Host "Non-secret settings: $configPath"
+    if ($Transport -eq 'windows_simple_mapi') {
+        Write-Host 'Authentication: existing Coremail shared Simple MAPI session (no password copied or stored).'
+    }
+    else {
+        Write-Host "Password location: Windows Credential Manager target '$CredentialTarget'"
+    }
+    Write-Host "Diagnostic log: $LogPath"
+    Write-Host 'Restart Claude Code or run /reload-plugins, then call coremail_check_connection.'
+    Write-Host 'The connector never starts, clicks, captures, or types into the Coremail interface.'
+}
+catch {
+    $accountError = $_
+    Write-CoremailLifecycleFailure -ErrorRecord $accountError -Context 'account configuration'
+    if ($newCredentialWritten -and -not $configCommitted) {
+        try {
+            Remove-CoremailCredential -Target $CredentialTarget
+            $newCredentialWritten = $false
+            Write-CoremailLifecycleLog "ROLLBACK removed unpublished credential target=$CredentialTarget"
+        }
         catch {
-            $Username = $null
+            Write-CoremailLifecycleFailure -ErrorRecord $_ -Context 'credential rollback'
+            throw "Account setup failed before publication, and the newly created credential '$CredentialTarget' could not be removed. The previous config remains active. Original error: $($accountError.Exception.Message)"
         }
     }
+    throw
 }
-
-$Username = Read-RequiredValue -Current $Username -Prompt 'Full mailbox username (for example user@example.com)'
-if (-not $Username.Contains('@')) {
-    throw 'The mailbox username must be a full email address.'
-}
-
-if ($null -eq $AllowedFrom -or $AllowedFrom.Count -eq 0) {
-    $AllowedFrom = @($Username)
-}
-if ($Transport -eq 'windows_simple_mapi') {
-    if ($AllowedFrom.Count -ne 1 -or $AllowedFrom[0] -ine $Username) {
-        throw 'windows_simple_mapi requires allowed_from to contain only the active mailbox username.'
+finally {
+    if ($stagedConfigPath -and (Test-Path -LiteralPath $stagedConfigPath -PathType Leaf)) {
+        Remove-Item -LiteralPath $stagedConfigPath -Force -ErrorAction SilentlyContinue
     }
-    if (-not [string]::IsNullOrWhiteSpace($CaFile) -or
-        -not [string]::IsNullOrWhiteSpace($DraftsFolder) -or
-        -not [string]::IsNullOrWhiteSpace($SentFolder) -or
-        $SentCopyMode -ne 'none') {
-        throw 'CA, Drafts/Sent folder, and sent-copy settings apply only to imap_smtp.'
-    }
+    if ($ownsPassword -and $null -ne $Password) { $Password.Dispose() }
 }
-
-$resolvedRoots = @()
-foreach ($root in @($AttachmentRoots)) {
-    if ([string]::IsNullOrWhiteSpace($root)) { continue }
-    $expanded = [Environment]::ExpandEnvironmentVariables($root)
-    $resolved = [IO.Path]::GetFullPath($expanded)
-    if (-not (Test-Path -LiteralPath $resolved -PathType Container)) {
-        throw "Attachment root does not exist: $resolved"
-    }
-    $resolvedRoots += $resolved
-}
-
-$resolvedCaFile = $null
-if (-not [string]::IsNullOrWhiteSpace($CaFile)) {
-    $resolvedCaFile = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($CaFile))
-    if (-not (Test-Path -LiteralPath $resolvedCaFile -PathType Leaf)) {
-        throw "CA file does not exist: $resolvedCaFile"
-    }
-}
-
-if ($Transport -eq 'imap_smtp') {
-    $ImapHost = Read-RequiredValue -Current $ImapHost -Prompt 'IMAP server hostname'
-    $SmtpHost = Read-RequiredValue -Current $SmtpHost -Prompt 'SMTP server hostname'
-    if ([string]::IsNullOrWhiteSpace($CredentialTarget)) {
-        $CredentialTarget = "ClaudeCode.Coremail:$Username"
-    }
-
-    $credentialSource = @'
-using System;
-using System.ComponentModel;
-using System.Runtime.InteropServices;
-using System.Text;
-
-public static class CoremailCredentialWriter
-{
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct CREDENTIAL
-    {
-        public UInt32 Flags;
-        public UInt32 Type;
-        public string TargetName;
-        public string Comment;
-        public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
-        public UInt32 CredentialBlobSize;
-        public IntPtr CredentialBlob;
-        public UInt32 Persist;
-        public UInt32 AttributeCount;
-        public IntPtr Attributes;
-        public string TargetAlias;
-        public string UserName;
-    }
-
-    [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
-    [DllImport("Advapi32.dll", EntryPoint = "CredWriteW", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool CredWrite(ref CREDENTIAL credential, UInt32 flags);
-
-    public static void Write(string target, string username, string password)
-    {
-        byte[] bytes = Encoding.Unicode.GetBytes(password);
-        IntPtr blob = Marshal.AllocCoTaskMem(bytes.Length);
-        try
-        {
-            Marshal.Copy(bytes, 0, blob, bytes.Length);
-            CREDENTIAL credential = new CREDENTIAL();
-            credential.Type = 1;
-            credential.TargetName = target;
-            credential.CredentialBlobSize = checked((UInt32)bytes.Length);
-            credential.CredentialBlob = blob;
-            credential.Persist = 2;
-            credential.UserName = username;
-            if (!CredWrite(ref credential, 0))
-                throw new Win32Exception(Marshal.GetLastWin32Error());
-        }
-        finally
-        {
-            for (int index = 0; index < bytes.Length; index++) bytes[index] = 0;
-            for (int index = 0; index < bytes.Length; index++) Marshal.WriteByte(blob, index, 0);
-            Marshal.FreeCoTaskMem(blob);
-        }
-    }
-}
-'@
-
-    if ($null -eq ('CoremailCredentialWriter' -as [type])) {
-        Add-Type -TypeDefinition $credentialSource -Language CSharp | Out-Null
-    }
-    $securePassword = Read-Host 'Windows domain/Coremail or client-specific password (stored in Windows Credential Manager)' -AsSecureString
-    if ($securePassword.Length -eq 0) { throw 'The password must not be empty.' }
-    $passwordPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePassword)
-    try {
-        $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointer)
-        [CoremailCredentialWriter]::Write($CredentialTarget, $Username, $plainPassword)
-        $plainPassword = $null
-    }
-    finally {
-        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordPointer)
-        $securePassword.Dispose()
-    }
-}
-
-$appData = [Environment]::GetFolderPath('ApplicationData')
-if ([string]::IsNullOrWhiteSpace($appData)) {
-    $appData = Join-Path ([Environment]::GetFolderPath('UserProfile')) 'AppData\Roaming'
-}
-$configDirectory = Join-Path $appData 'ClaudeCode\Coremail'
-$configPath = Join-Path $configDirectory 'config.json'
-New-Item -ItemType Directory -Path $configDirectory -Force | Out-Null
-
-if (Test-Path -LiteralPath $configPath -PathType Leaf) {
-    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $backupPath = "$configPath.backup-$timestamp"
-    Copy-Item -LiteralPath $configPath -Destination $backupPath
-    Write-Host "Previous non-secret configuration backed up to: $backupPath"
-}
-
-$config = [ordered]@{
-    transport = $Transport
-    username = $Username
-    allowed_from = @($AllowedFrom)
-    sent_copy_mode = $SentCopyMode
-    attachment_roots = @($resolvedRoots)
-    max_message_bytes = 10485760
-    max_body_chars = 50000
-    max_attachment_bytes = 26214400
-    max_recipients = 100
-    timeout_seconds = 20
-}
-
-if ($Transport -eq 'imap_smtp') {
-    $config['credential_target'] = $CredentialTarget
-    $config['imap'] = [ordered]@{
-        host = $ImapHost
-        port = $ImapPort
-        security = $ImapSecurity
-    }
-    $config['smtp'] = [ordered]@{
-        host = $SmtpHost
-        port = $SmtpPort
-        security = $SmtpSecurity
-    }
-    $config['drafts_folder'] = if ([string]::IsNullOrWhiteSpace($DraftsFolder)) { $null } else { $DraftsFolder }
-    $config['sent_folder'] = if ([string]::IsNullOrWhiteSpace($SentFolder)) { $null } else { $SentFolder }
-    $config['ca_file'] = $resolvedCaFile
-}
-
-$json = $config | ConvertTo-Json -Depth 10
-$utf8 = New-Object System.Text.UTF8Encoding($false)
-[IO.File]::WriteAllText($configPath, $json, $utf8)
-
-Write-Host ''
-Write-Host 'Coremail account configuration saved.'
-Write-Host "Transport: $Transport"
-Write-Host "Non-secret settings: $configPath"
-if ($Transport -eq 'windows_simple_mapi') {
-    Write-Host 'Authentication: existing Coremail shared Simple MAPI session (no password copied or stored).'
-}
-else {
-    Write-Host "Password location: Windows Credential Manager target '$CredentialTarget'"
-}
-Write-Host 'Restart Claude Code or run /reload-plugins, then call coremail_check_connection.'
-Write-Host 'The connector never starts, clicks, captures, or types into the Coremail interface.'
