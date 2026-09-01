@@ -306,6 +306,13 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("$installeduninstaller", lifecycle_normalized)
         self.assertIn("get-claudepluginsettingsoverride", lifecycle_normalized)
         self.assertIn("settingshashbeforelegacydenial", lifecycle_normalized)
+        self.assertIn("permissionrepairrequestpath", lifecycle_normalized)
+        self.assertIn("permissionrepaircompletepath", lifecycle_normalized)
+        self.assertIn(
+            "administrator permission-repair handshake markers are incomplete",
+            lifecycle_normalized,
+        )
+        self.assertNotIn("restore-legacy-acl", lifecycle_normalized)
         self.assertNotIn(
             ".enabledplugins.'coremail-controller@skills-dir'", lifecycle_normalized
         )
@@ -323,6 +330,26 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("remove-localuser", orchestrator_normalized)
         self.assertNotIn("add-localgroupmember", orchestrator_normalized)
         self.assertIn("sourcepackageroot", orchestrator_normalized)
+        self.assertIn("complete-coremailgatepermissionrepair", orchestrator_normalized)
+        self.assertIn("[environment]::systemdirectory", orchestrator_normalized)
+        self.assertIn("'icacls.exe'", orchestrator_normalized)
+        self.assertIn("'/grant'", orchestrator_normalized)
+        self.assertIn("'/l'", orchestrator_normalized)
+        self.assertIn("'/q'", orchestrator_normalized)
+        self.assertIn("$expectedsid.isaccountsid()", orchestrator_normalized)
+        self.assertIn(
+            "the inaccessible gate target has an unexpected plugin identity",
+            orchestrator_normalized,
+        )
+        self.assertIn(
+            "the gate permission repair path traverses a reparse point",
+            orchestrator_normalized,
+        )
+        self.assertIn("$permissionrepairhandled = $true", orchestrator_normalized)
+        self.assertNotRegex(orchestrator_normalized, r"(?:^|\s)move-item(?:\s|$)")
+        self.assertNotIn("'/t'", orchestrator_normalized)
+        self.assertNotIn("/reset", orchestrator_normalized)
+        self.assertNotIn("takeown", orchestrator_normalized)
         self.assertNotIn(
             "copy-item -literalpath $claudesourceroot -destination $claudefixtureroot -recurse",
             orchestrator_normalized,

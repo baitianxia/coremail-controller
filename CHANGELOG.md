@@ -60,6 +60,10 @@
 - Treat the real Claude inventory as the enabled-state authority when Claude 2.1.246
   removes a persisted `false` override instead of serializing an explicit `true`;
   retain exact settings-hash checks for fail-before-mutation paths.
+- Run the legacy-ACL gate's fixed `icacls` grant from the already-elevated hosted-
+  runner orchestrator after exact SID, target, reparse, and plugin-identity checks;
+  the ordinary-user uninstall process now only requests repair, waits, revalidates,
+  and continues, matching the production UAC privilege boundary.
 
 ## 0.6.0 - 2026-08-30
 

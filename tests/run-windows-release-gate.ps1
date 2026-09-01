@@ -22,7 +22,7 @@ if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hoste
 $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $currentPrincipal = New-Object System.Security.Principal.WindowsPrincipal($currentIdentity)
 if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw 'The orchestrator needs the hosted runner administrator token to create a disposable standard user.'
+    throw 'The orchestrator needs the hosted runner administrator token for the disposable-user gate.'
 }
 
 $PluginRoot = [IO.Path]::GetFullPath($PluginRoot)
@@ -45,6 +45,13 @@ if ($ScenarioName -eq 'npm') {
 if (-not (Test-Path -LiteralPath (Join-Path $PluginRoot '.claude-plugin\plugin.json') -PathType Leaf)) {
     throw "Packaged plugin root is invalid: $PluginRoot"
 }
+$sourceManifest = Get-Content -LiteralPath (Join-Path $PluginRoot '.claude-plugin\plugin.json') -Raw |
+    ConvertFrom-Json
+if ([string]$sourceManifest.name -ne 'coremail-controller' -or
+    [string]::IsNullOrWhiteSpace([string]$sourceManifest.version)) {
+    throw 'The packaged plugin manifest has an unexpected identity.'
+}
+$expectedPluginVersion = [string]$sourceManifest.version
 
 $suffix = [guid]::NewGuid().ToString('N')
 $userName = 'cmgate' + $suffix.Substring(0, 10)
@@ -60,8 +67,83 @@ $stagedPlugin = Join-Path $gateRoot 'plugin'
 $standardTemp = Join-Path $gateRoot 'temp'
 $stdoutPath = Join-Path $gateRoot 'stdout.log'
 $stderrPath = Join-Path $gateRoot 'stderr.log'
+$permissionRepairRequest = Join-Path $standardTemp 'legacy-permission-request.marker'
+$permissionRepairComplete = Join-Path $standardTemp 'legacy-permission-complete.marker'
+$expectedUserProfile = Join-Path (Join-Path $env:SystemDrive 'Users') $userName
+$expectedPluginTarget = Join-Path $expectedUserProfile '.claude\skills\coremail-controller'
 $stagedClaudeCommand = $null
 $userCreated = $false
+$process = $null
+$permissionRepairHandled = $false
+
+function Complete-CoremailGatePermissionRepair {
+    param(
+        [Parameter(Mandatory = $true)][string]$RequestPath,
+        [Parameter(Mandatory = $true)][string]$CompletePath,
+        [Parameter(Mandatory = $true)][string]$ExpectedTarget,
+        [Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$ExpectedSid,
+        [Parameter(Mandatory = $true)][string]$ExpectedVersion,
+        [Parameter(Mandatory = $true)][string]$DiagnosticRoot
+    )
+
+    $requestedTarget = ([IO.File]::ReadAllText($RequestPath)).Trim()
+    if (-not [string]::Equals(
+        [IO.Path]::GetFullPath($requestedTarget).TrimEnd('\'),
+        [IO.Path]::GetFullPath($ExpectedTarget).TrimEnd('\'),
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "The standard-user gate requested permission repair for an unexpected path: $requestedTarget"
+    }
+    if (-not $ExpectedSid.IsAccountSid()) {
+        throw 'The gate permission repair SID is not a normal Windows account SID.'
+    }
+    $profileRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $ExpectedTarget))
+    $claudeRoot = Join-Path $profileRoot '.claude'
+    $skillsRoot = Join-Path $claudeRoot 'skills'
+    foreach ($path in @($profileRoot, $claudeRoot, $skillsRoot, $ExpectedTarget)) {
+        $entry = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "The gate permission repair path traverses a reparse point: $path"
+        }
+    }
+    $manifest = Get-Content -LiteralPath (Join-Path $ExpectedTarget '.claude-plugin\plugin.json') -Raw |
+        ConvertFrom-Json
+    if ([string]$manifest.name -ne 'coremail-controller' -or
+        [string]$manifest.version -ne $ExpectedVersion) {
+        throw 'The inaccessible gate target has an unexpected plugin identity.'
+    }
+    if (Test-Path -LiteralPath $CompletePath) {
+        throw 'The gate permission repair completion marker already exists.'
+    }
+
+    $icacls = Join-Path ([Environment]::SystemDirectory) 'icacls.exe'
+    if (-not (Test-Path -LiteralPath $icacls -PathType Leaf)) {
+        throw 'The protected Windows icacls.exe utility is unavailable to the gate orchestrator.'
+    }
+    $repairStdout = Join-Path $DiagnosticRoot 'legacy-icacls-stdout.txt'
+    $repairStderr = Join-Path $DiagnosticRoot 'legacy-icacls-stderr.txt'
+    $grant = '*{0}:(OI)(CI)M' -f $ExpectedSid.Value
+    $repairProcess = Start-Process `
+        -FilePath $icacls `
+        -ArgumentList @("`"$ExpectedTarget`"", '/grant', $grant, '/L', '/Q') `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $repairStdout `
+        -RedirectStandardError $repairStderr `
+        -Wait `
+        -PassThru
+    try { $repairExitCode = $repairProcess.ExitCode }
+    finally { $repairProcess.Dispose() }
+    if ($repairExitCode -ne 0) {
+        $repairError = if (Test-Path -LiteralPath $repairStderr -PathType Leaf) {
+            (Get-Content -LiteralPath $repairStderr -Raw).Trim()
+        }
+        else { '<no stderr>' }
+        throw "The gate icacls permission repair failed with exit code $repairExitCode`: $repairError"
+    }
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText($CompletePath, 'repaired', $encoding)
+    Write-Host "Gate administrator granted exact Modify permission to $($ExpectedSid.Value) on $ExpectedTarget"
+}
 
 try {
     $localUser = New-LocalUser `
@@ -135,6 +217,10 @@ try {
         $localUser.SID.Value,
         '-ScenarioName',
         $ScenarioName,
+        '-PermissionRepairRequestPath',
+        "`"$permissionRepairRequest`"",
+        '-PermissionRepairCompletePath',
+        "`"$permissionRepairComplete`"",
         '-OrchestratorVerifiedHostedRunner'
     ) -join ' '
 
@@ -147,8 +233,30 @@ try {
         -WindowStyle Hidden `
         -RedirectStandardOutput $stdoutPath `
         -RedirectStandardError $stderrPath `
-        -Wait `
         -PassThru
+
+    $processDeadline = [DateTime]::UtcNow.AddMinutes(30)
+    while (-not $process.HasExited) {
+        if (-not $permissionRepairHandled -and
+            (Test-Path -LiteralPath $permissionRepairRequest -PathType Leaf)) {
+            $requestText = [IO.File]::ReadAllText($permissionRepairRequest)
+            if (-not [string]::IsNullOrWhiteSpace($requestText)) {
+                Complete-CoremailGatePermissionRepair `
+                    -RequestPath $permissionRepairRequest `
+                    -CompletePath $permissionRepairComplete `
+                    -ExpectedTarget $expectedPluginTarget `
+                    -ExpectedSid $localUser.SID `
+                    -ExpectedVersion $expectedPluginVersion `
+                    -DiagnosticRoot $standardTemp
+                $permissionRepairHandled = $true
+            }
+        }
+        if ([DateTime]::UtcNow -gt $processDeadline) {
+            throw "The $ScenarioName standard-user lifecycle gate exceeded 30 minutes."
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    $process.WaitForExit()
 
     if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) {
         Get-Content -LiteralPath $stdoutPath | ForEach-Object { Write-Host $_ }
@@ -159,9 +267,20 @@ try {
     if ($process.ExitCode -ne 0) {
         throw "The $ScenarioName standard-user lifecycle gate failed with exit code $($process.ExitCode)."
     }
+    if (-not $permissionRepairHandled -or
+        -not (Test-Path -LiteralPath $permissionRepairComplete -PathType Leaf)) {
+        throw 'The lifecycle gate did not complete the constrained legacy permission repair handshake.'
+    }
     Write-Host "Disposable standard-user Windows lifecycle gate passed: $ScenarioName" -ForegroundColor Green
 }
 finally {
+    if ($null -ne $process) {
+        if (-not $process.HasExited) {
+            $process.Kill()
+            $process.WaitForExit()
+        }
+        $process.Dispose()
+    }
     if ($userCreated) {
         try { Remove-LocalUser -Name $userName -ErrorAction Stop }
         catch { Write-Warning "Unable to remove disposable local user '$userName': $($_.Exception.Message)" }
@@ -169,4 +288,5 @@ finally {
     if (Test-Path -LiteralPath $gateRoot -PathType Container) {
         Remove-Item -LiteralPath $gateRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
+    $securePassword.Dispose()
 }

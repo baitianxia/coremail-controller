@@ -432,13 +432,17 @@ shared session.
   starts the packaged MCP server, and exercises install, replacement install,
   reversible uninstall, reinstall, and a final uninstall launched from the installed
   script itself as a disposable local standard user. The hosted runner's
-  administrator identity is used only to create
-  and later remove that account. The orchestrator verifies the GitHub-hosted runner
-  environment before crossing the alternate-credential process boundary and passes
-  an explicit verification switch because runner-only environment variables are not
-  reliably inherited there. The lifecycle script then verifies its own SID and
-  rejects an Administrators token so elevated access cannot hide user-profile ACL
-  defects.
+  administrator identity creates and removes that account and services one
+  constrained legacy-ACL test handshake: it accepts only the precomputed plugin
+  target for that disposable profile, verifies the account SID, every relevant path
+  component, and the packaged plugin identity/version, then uses the protected
+  System32 `icacls.exe` to add that SID's inheritable `Modify` permission. All
+  lifecycle operations remain in the same ordinary-user process. The orchestrator
+  verifies the GitHub-hosted runner environment before crossing the alternate-
+  credential process boundary and passes an explicit verification switch because
+  runner-only environment variables are not reliably inherited there. The lifecycle
+  script then verifies its own SID and rejects an Administrators token so elevated
+  access cannot hide user-profile ACL defects.
   The candidate ZIP is hashed before extraction and again immediately before
   upload, so the artifact uploaded is byte-for-byte the artifact exercised. For a
   successful `main` push only, a separate least-privilege publication job downloads
@@ -470,12 +474,16 @@ shared session.
   settings mutation and that `-NoLegacyPermissionRepair` leaves the inaccessible
   active plugin and its enabled state untouched.
 - The gate also changes the recognized active plugin ACL to the observed legacy
-  `SYSTEM`/`Administrators`-only shape, uses a release-gate-only handshake to restore
-  access while the same standard-user uninstall process waits, and requires the
-  legacy-repair requested/recovered log markers. Hosted CI cannot click a secure-
-  desktop UAC prompt; source assertions therefore bind production elevation to the
-  fixed System32 `icacls.exe`, exact target, current account SID, inheritable
-  `Modify`, and `/L`, while forbidding recursion, reset, ownership change, or delete.
+  `SYSTEM`/`Administrators`-only shape, then makes the same standard-user uninstall
+  process request and wait for repair. Because hosted CI cannot click a secure-
+  desktop UAC prompt, the already-elevated outer orchestrator performs the otherwise
+  identical fixed System32 `icacls.exe` grant only after independently checking the
+  exact disposable-profile target, account SID, non-reparse path, and plugin
+  identity/version. The gate requires both request/completion markers, the actual
+  uninstall result, and the legacy-repair requested/recovered log markers. Source
+  assertions bind production elevation to the exact target, current account SID,
+  inheritable `Modify`, and `/L`, while forbidding recursion, reset, ownership
+  change, or delete.
 - Launchers do not pass `-ExecutionPolicy Bypass`; enterprise script policy must be
   satisfied through normal approval or signing.
 - Uninstall moves only a recognized plugin to `plugins-disabled`. A lock or

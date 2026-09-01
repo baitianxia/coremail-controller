@@ -8,6 +8,8 @@ param(
     [Parameter(Mandatory = $true)][string]$ClaudeCommand,
     [Parameter(Mandatory = $true)][string]$ExpectedIdentitySid,
     [ValidateSet('native', 'npm')][string]$ScenarioName,
+    [Parameter(Mandatory = $true)][string]$PermissionRepairRequestPath,
+    [Parameter(Mandatory = $true)][string]$PermissionRepairCompletePath,
     [Parameter(Mandatory = $true)][switch]$OrchestratorVerifiedHostedRunner
 )
 
@@ -37,8 +39,16 @@ if ($currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administ
 $RunnerTemp = [IO.Path]::GetFullPath($RunnerTemp)
 $PythonCommand = [IO.Path]::GetFullPath($PythonCommand)
 $ClaudeCommand = [IO.Path]::GetFullPath($ClaudeCommand)
+$PermissionRepairRequestPath = [IO.Path]::GetFullPath($PermissionRepairRequestPath)
+$PermissionRepairCompletePath = [IO.Path]::GetFullPath($PermissionRepairCompletePath)
 foreach ($required in @($RunnerTemp, $PythonCommand, $ClaudeCommand)) {
     if (-not (Test-Path -LiteralPath $required)) { throw "Gate prerequisite is unavailable: $required" }
+}
+$runnerPrefix = $RunnerTemp.TrimEnd('\') + '\'
+foreach ($markerPath in @($PermissionRepairRequestPath, $PermissionRepairCompletePath)) {
+    if (-not $markerPath.StartsWith($runnerPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'A permission-repair marker is outside the disposable runner directory.'
+    }
 }
 $env:RUNNER_TEMP = $RunnerTemp
 $env:TEMP = $RunnerTemp
@@ -506,41 +516,6 @@ foreach ($principalSid in @(
     [void]$restrictedTargetAcl.AddAccessRule($fullControlRule)
 }
 
-$legacyRequestPath = Join-Path $RunnerTemp "LEGACY-ACL-REQUEST-$ScenarioName.marker"
-$legacyCompletePath = Join-Path $RunnerTemp "LEGACY-ACL-COMPLETE-$ScenarioName.marker"
-$legacyRestoreScript = Join-Path $RunnerTemp "restore-legacy-acl-$ScenarioName.ps1"
-$legacyRestoreFixture = Join-Path $RunnerTemp "restore-legacy-acl-$ScenarioName.json"
-$legacyRestorePayload = [ordered]@{
-    target = $targetRoot
-    sddl = $originalTargetSddl
-    request = $legacyRequestPath
-    complete = $legacyCompletePath
-}
-[IO.File]::WriteAllText(
-    $legacyRestoreFixture,
-    ($legacyRestorePayload | ConvertTo-Json -Depth 4),
-    $utf8
-)
-$legacyRestoreSource = @'
-param([string]$Fixture)
-$ErrorActionPreference = 'Stop'
-$data = Get-Content -LiteralPath $Fixture -Raw | ConvertFrom-Json
-for ($attempt = 1; $attempt -le 300; $attempt++) {
-    if (Test-Path -LiteralPath ([string]$data.request) -PathType Leaf) { break }
-    Start-Sleep -Milliseconds 100
-}
-if (-not (Test-Path -LiteralPath ([string]$data.request) -PathType Leaf)) {
-    throw 'Legacy ACL repair request marker was not created.'
-}
-$restoredAcl = New-Object System.Security.AccessControl.DirectorySecurity
-$restoredAcl.SetSecurityDescriptorSddlForm([string]$data.sddl)
-Set-Acl -LiteralPath ([string]$data.target) -AclObject $restoredAcl
-$encoding = New-Object System.Text.UTF8Encoding($false)
-[IO.File]::WriteAllText([string]$data.complete, 'restored', $encoding)
-'@
-[IO.File]::WriteAllText($legacyRestoreScript, $legacyRestoreSource, $utf8)
-
-$legacyRestoreProcess = $null
 $settingsHashBeforeLegacyDenial = (Get-FileHash -LiteralPath $settingsPath -Algorithm SHA256).Hash
 try {
     Set-Acl -LiteralPath $targetRoot -AclObject $restrictedTargetAcl
@@ -570,29 +545,17 @@ try {
         throw 'Disabled legacy ACL repair changed Claude plugin state.'
     }
 
-    $env:COREMAIL_GATE_PERMISSION_REPAIR_REQUEST = $legacyRequestPath
-    $env:COREMAIL_GATE_PERMISSION_REPAIR_COMPLETE = $legacyCompletePath
-    $legacyRestoreProcess = Start-Process -FilePath $windowsPowerShell -ArgumentList @(
-        '-NoLogo', '-NoProfile', '-NonInteractive', '-File', "`"$legacyRestoreScript`"",
-        '-Fixture', "`"$legacyRestoreFixture`""
-    ) -WindowStyle Hidden -PassThru
+    $env:COREMAIL_GATE_PERMISSION_REPAIR_REQUEST = $PermissionRepairRequestPath
+    $env:COREMAIL_GATE_PERMISSION_REPAIR_COMPLETE = $PermissionRepairCompletePath
 
     Invoke-WindowsPowerShellScript -ScriptPath $uninstaller -ScriptArguments @(
         '-ClaudeCommand', $ClaudeCommand,
         '-LogPath', $uninstallLog
     )
-    if (-not $legacyRestoreProcess.WaitForExit(10000) -or
-        $legacyRestoreProcess.ExitCode -ne 0) {
-        throw 'The legacy ACL restoration helper did not complete successfully.'
-    }
 }
 finally {
     Remove-Item Env:COREMAIL_GATE_PERMISSION_REPAIR_REQUEST -ErrorAction SilentlyContinue
     Remove-Item Env:COREMAIL_GATE_PERMISSION_REPAIR_COMPLETE -ErrorAction SilentlyContinue
-    if ($null -ne $legacyRestoreProcess) {
-        if (-not $legacyRestoreProcess.HasExited) { $legacyRestoreProcess.Kill() }
-        $legacyRestoreProcess.Dispose()
-    }
     if (Test-Path -LiteralPath $targetRoot -PathType Container) {
         $restoreTargetAcl = New-Object System.Security.AccessControl.DirectorySecurity
         $restoreTargetAcl.SetSecurityDescriptorSddlForm($originalTargetSddl)
@@ -600,6 +563,10 @@ finally {
     }
 }
 if (Test-Path -LiteralPath $targetRoot) { throw 'Uninstaller left the active plugin directory in place.' }
+if (-not (Test-Path -LiteralPath $PermissionRepairRequestPath -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $PermissionRepairCompletePath -PathType Leaf)) {
+    throw 'The administrator permission-repair handshake markers are incomplete.'
+}
 Assert-ConfigUnchanged -ExpectedHash $fixtureHash
 $pluginOverride = Get-ClaudePluginSettingsOverride
 if (-not $pluginOverride.Present -or $pluginOverride.Value -ne $false) {

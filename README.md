@@ -284,10 +284,11 @@ python .\scripts\build-release.py --output-dir .\dist --force
 用户和真实的原生/npm Claude Code 两种入口，验证包内清单、脚本解析、凭据 C# 编译、
 Python 固定启动、Claude 启用状态、安装/覆盖安装/卸载/重装，还会注入临时目录移动
 拒绝和旧版本 `SYSTEM/Administrators`-only ACL、生命周期锁冲突及“凭据已写但配置未
-发布”故障并证明同进程恢复。安全桌面的 UAC 点击不能由托管 CI 代替；门禁改用专用
-握手验证标准用户的等待/恢复状态机，并静态约束正式路径只能调用 System32
-`icacls.exe`、固定插件目录、当前用户 SID、`Modify` 和 `/L`，禁止 `/T`、ACL reset、
-接管所有权或删除。它使用无密码的
+发布”故障并证明同进程恢复。安全桌面的 UAC 点击不能由托管 CI 代替；门禁中的普通
+用户进程通过专用握手请求恢复，已提升的外层编排器独立核对一次性账号 SID、固定插件
+目录、无重解析路径及插件身份/版本后，实际调用 System32 `icacls.exe` 完成同等授权，
+普通用户进程再复核并继续卸载。源码约束同时保证正式路径只能使用当前用户 SID、
+`Modify` 和 `/L`，禁止 `/T`、ACL reset、接管所有权或删除。它使用无密码的
 离线邮箱配置且跳过真实连接，不读取或发送邮件。ZIP 在测试前后和发布任务中都会再次
 核对 SHA-256；只有上传的 `coremail-controller-windows-gated` 构件可交付。
 
