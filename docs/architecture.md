@@ -1,7 +1,7 @@
 # Coremail Interface-First Connector Architecture
 
 Status: current normative design
-Last updated: 2026-09-01
+Last updated: 2026-09-05
 
 ## Purpose
 
@@ -46,7 +46,7 @@ diagnostics and server-configuration discovery. It never grants access by itself
 
 Deleting, recalling, moving, calendar operations, contacts, shared-mailbox
 administration, proprietary Coremail APIs, UI automation, and browser-server
-implementation are not part of version 0.7.0. Simple MAPI does not provide the full
+implementation are not part of version 0.7.1. Simple MAPI does not provide the full
 IMAP feature set: only `INBOX` is addressable, marking unread and saving drafts are
 unsupported, Internet threading headers are unavailable, and searches are bounded
 client-side scans. MAPI subjects are limited to 255 characters to avoid documented
@@ -165,7 +165,7 @@ Local discovery is allowed, but bounded and non-destructive:
   connection or override the explicit account configuration.
 
 The connector may later add a version-specific local-cache reader after its schema
-is observed and documented. Version 0.7.0 does not claim compatibility with an
+is observed and documented. Version 0.7.1 does not claim compatibility with an
 undocumented Coremail cache format.
 
 ## Transport selection and connection configuration
@@ -357,6 +357,11 @@ shared session.
   existing plugin. Lifecycle probes temporarily disable Claude auto-updating and
   restore the caller's environment, so the connector neither upgrades Claude nor
   invokes a package manager as part of validation.
+  The installer probes and parses the Claude Code version before any plugin
+  validation or filesystem replacement. Versions before 2.1.157 are rejected with
+  an upgrade instruction because they do not provide the skills-directory inventory
+  required by this plugin; this avoids confusing failures such as 2.1.84's
+  `unknown option '--strict'` and prevents a partial installation.
 - V1 owns only the default per-user `%USERPROFILE%\.claude` configuration root.
   Install and uninstall reject a non-default `CLAUDE_CONFIG_DIR` before lifecycle
   mutation, because mixing a custom Claude inventory/settings root with the fixed
@@ -453,13 +458,18 @@ shared session.
   skips the live connection check, hashes the configuration before and after every
   mutation, and is restricted to an ephemeral GitHub Actions profile. It cannot
   read, authenticate to, or send through a real mailbox.
-- The Windows release gate uses fixed native and npm Claude Code fixtures only on the
-  disposable online runner. Under disposable standard-user profiles it validates the
-  plugin with the real CLI, proves a previously disabled skills-directory plugin is
-  enabled, verifies the pinned Python launch, and exercises both supported Claude
-  installation shapes. The pinned npm fixture uses its package-declared native PE,
-  while source assertions retain compatibility with older Node-backed npm bins. The
-  target installer never downloads, installs, upgrades, or repairs Claude Code.
+- The Windows release gate uses fixed native and current npm Claude Code fixtures on
+  the disposable online runner, plus an exact 2.1.84 legacy npm fixture for the
+  negative preflight case. Before packaging, the actual installer is run with that
+  legacy fixture; the expected-absent target and the pre-existing settings/lock
+  hashes are checked afterward, and it must reject the version before plugin
+  validation or mutation. Under disposable standard-user profiles the gate
+  validates the plugin with the real CLI, proves a
+  previously disabled skills-directory plugin is enabled, verifies the pinned
+  Python launch, and exercises both supported Claude installation shapes. The
+  pinned npm fixture uses its package-declared native PE; the negative fixture uses
+  the package-declared Node entry point. The target installer never downloads,
+  installs, upgrades, or repairs Claude Code.
 - The real Claude plugin inventory is authoritative for enabled/disabled state.
   Current Claude releases may represent enablement by removing an explicit `false`
   settings override rather than writing `true`; the gate accepts that documented
@@ -557,7 +567,9 @@ shared session.
     packaged lifecycle scripts contain no `Move-Item` directory transition.
 17. The installed MCP uses the Python executable pinned during installation, and the
     Windows gate validates and enables the installed plugin through real native and
-    npm Claude Code entry points before accepting the artifact.
+    npm Claude Code entry points before accepting the artifact; it also proves that
+    the legacy CLI path which rejects `--strict` is stopped by the minimum-version
+    preflight before mutation.
 18. Account configuration publication and new credential creation form a recoverable
     transaction, including a test fault after credential creation but before config
     publication.

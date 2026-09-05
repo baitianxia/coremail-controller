@@ -1,9 +1,9 @@
 # Claude Code Coremail 接口优先连接器
 
-> **当前发布线：0.7.0。** 只安装由成功的 Windows PowerShell 5.1 生命周期门禁上传、
+> **当前发布线：0.7.1。** 只安装由成功的 Windows PowerShell 5.1 生命周期门禁上传、
 > 且 ZIP 与相邻 `.sha256` 文件匹配的 `coremail-controller-windows-gated` 产物。
-> 私有仓库的 `gated-release/releases/0.7.0/` 保存同一对已复核文件。0.6.0 及更早
-> 构建已撤回，不得继续安装或测试。
+> 私有仓库的 `gated-release/releases/0.7.1/` 保存同一对已复核文件。0.7.0 及更早
+> 构建已被 0.7.1 取代；0.6.0 及更早构建已撤回，不得继续安装或测试。
 
 这是一个供 Windows 上 Claude Code 使用的本地插件。它**不会启动、显示或操作
 Coremail 客户端界面**。用户可直接用文字要求 Claude Code 搜索、读取、整理和准备
@@ -61,8 +61,10 @@ coremail-controller/
 
 - Windows 10/11；
 - Claude Code 2.1.157 或更高版本（支持 skills-directory 插件；原生 `claude.exe` 或标准 npm
-  `claude.cmd` 安装均可）。npm 安装会按其官方包清单解析：新版包内原生 PE 直接执行，
-  旧版 JS 入口使用该安装已有的 Node；不会通过 `cmd.exe` 拼接命令；
+  `claude.cmd` 安装均可）。2.1.84–2.1.156 虽然可能能执行部分 `plugin` 命令，但不支持
+  本插件所需的 skills-directory 清单；安装器会在任何插件验证或文件替换前明确拒绝并提示
+  升级。npm 安装会按其官方包清单解析：新版包内原生 PE 直接执行，旧版 JS 入口使用该
+  安装已有的 Node；不会通过 `cmd.exe` 拼接命令；
 - 当前版本只管理默认的 `%USERPROFILE%\.claude` 用户配置目录；启动安装或卸载进程时，
   `CLAUDE_CONFIG_DIR` 必须未设置，或明确指向这个默认目录。其他配置根不会被猜测或改写；
 - Python 3.10 或更高版本，安装时可由 `py.exe` 或 `python.exe` 找到；安装器会固定并
@@ -278,8 +280,8 @@ python .\scripts\build-release.py --output-dir .\dist --force
 ```
 
 本地构建结果会明确命名为
-`dist\coremail-controller-0.7.0-windows-UNVERIFIED.zip`，目标安装器会拒绝它。正式
-`coremail-controller-0.7.0-windows.zip` 只能由 `.github/workflows/windows-release-gate.yml`
+`dist\coremail-controller-0.7.1-windows-UNVERIFIED.zip`，目标安装器会拒绝它。正式
+`coremail-controller-0.7.1-windows.zip` 只能由 `.github/workflows/windows-release-gate.yml`
 在干净的 `windows-2022` 环境中生成。门禁使用 Windows PowerShell 5.1、一次性标准
 用户和真实的原生/npm Claude Code 两种入口，验证包内清单、脚本解析、凭据 C# 编译、
 Python 固定启动、Claude 启用状态、安装/覆盖安装/卸载/重装，还会注入临时目录移动
@@ -294,6 +296,10 @@ Python 固定启动、Claude 启用状态、安装/覆盖安装/卸载/重装，
 
 常见问题：
 
+- `unknown option '--strict'` 或提示 Claude 版本过旧：2.1.84–2.1.156 不支持本插件依赖的
+  skills-directory 插件清单。请先用 Claude Code 官方安装器升级到 2.1.157 或更高版本，
+  再运行 INSTALL.cmd；安装器在此检查前不会替换插件或设置。若新版本仍失败，请把窗口
+  显示的 `%TEMP%\CoremailController\INSTALL-*.log` 提供给维护者，不要手工改写插件清单；
 - `credential unavailable`：重新运行 `setup-account.ps1`，并确认当前 Windows 用户一致；
 - `no existing shared login session`：保持 Coremail 已登录，确认它是默认 Windows 邮件
   客户端；若仍失败，可能未注册 MAPI 或位数不匹配，改用 `-Transport imap_smtp`；

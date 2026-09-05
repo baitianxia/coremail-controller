@@ -33,7 +33,7 @@ if ([string]::IsNullOrWhiteSpace($LogPath)) {
 Initialize-CoremailLifecycleLog -Path $LogPath
 
 $pluginId = 'coremail-controller@skills-dir'
-$expectedVersion = '0.7.0'
+$expectedVersion = '0.7.1'
 $lifecycleLockStream = $null
 $lifecycleLockPath = $null
 $activationStageRoot = $null
@@ -50,6 +50,7 @@ $runtimeMutationStarted = $false
 $preserveActivationStage = $false
 $pythonRuntime = $null
 $claudeInvocation = $null
+$claudeVersion = $null
 $existingPluginVersion = $null
 $legacyPermissionRepairAttempted = $false
 
@@ -320,7 +321,9 @@ try {
     if ($null -eq $claudeInvocation) {
         throw 'Claude Code was not found as a native per-user executable or a validated npm installation.'
     }
-    Invoke-Claude -Arguments @('--version') -Label 'Claude Code version probe'
+    $claudeVersion = Assert-CoremailClaudeMinimumVersion `
+        -Invocation $claudeInvocation `
+        -Label 'Claude Code version probe'
 
     Assert-CoremailRelease -Root $sourceRoot -AllowPythonRuntime:$runningFromTarget
     $sourceVersion = Get-CoremailManifestVersion -Root $sourceRoot
@@ -332,7 +335,7 @@ try {
         -Label 'Claude plugin validation'
     Write-Host "Plugin version: $sourceVersion"
     Write-Host "Pinned Python: $($pythonRuntime.executable) ($($pythonRuntime.version), $($pythonRuntime.pointer_bits)-bit)"
-    Write-Host "Claude Code: $($claudeInvocation.CommandPath) ($($claudeInvocation.Kind))"
+    Write-Host "Claude Code: $($claudeInvocation.CommandPath) ($($claudeInvocation.Kind), $($claudeVersion.Version))"
 
     Write-Step 2 'Acquiring the user lifecycle lock and staging under the Claude profile'
     $lifecycleLockPath = Join-Path $claudeRoot 'coremail-controller.lifecycle.lock'

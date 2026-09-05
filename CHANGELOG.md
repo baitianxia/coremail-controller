@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.7.1 - 2026-09-05
+
+- Detect and reject Claude Code versions before 2.1.157 before plugin validation,
+  lifecycle-lock acquisition, or filesystem replacement, with an actionable
+  upgrade message. These versions do not expose the skills-directory inventory
+  required by this plugin; skipping `--strict` would not produce a working
+  installation.
+- Remove the optional `$schema` manifest field so the package remains acceptable to
+  older diagnostic validators while the supported lifecycle continues to use strict
+  validation and the internal integrity manifest.
+- Add an exact Claude Code 2.1.84 Node-backed fixture to the Windows release gate as
+  a negative preflight test, alongside the full native and current npm lifecycle
+  tests for supported Claude versions.
+
 ## 0.7.0 - 2026-09-01
 
 - Replace PowerShell provider directory moves with one shared same-volume

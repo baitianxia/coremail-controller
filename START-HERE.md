@@ -1,7 +1,8 @@
 # Coremail Controller：Windows 三步开始
 
-> **适用于 0.7.0。** 只使用成功的 Windows PowerShell 5.1 自动生命周期门禁所上传的
-> `coremail-controller-windows-gated` 产物，并核对随包 SHA-256。0.6.0 及更早构建已撤回。
+> **适用于 0.7.1。** 只使用成功的 Windows PowerShell 5.1 自动生命周期门禁所上传的
+> `coremail-controller-windows-gated` 产物，并核对随包 SHA-256。0.7.0 及更早构建已被
+> 0.7.1 取代；0.6.0 及更早构建已撤回。
 
 本插件先尝试复用已登录 Coremail 的 Windows Simple MAPI 共享会话；接口不可用时再
 安全配置 IMAP/SMTP。两种模式都不启动或操作 Coremail 桌面、网页界面。
@@ -13,8 +14,8 @@
 如果发布包旁有 `.sha256` 文件，可在 PowerShell 中核对：
 
 ```powershell
-Get-FileHash .\coremail-controller-0.7.0-windows.zip -Algorithm SHA256
-Get-Content .\coremail-controller-0.7.0-windows.zip.sha256
+Get-FileHash .\coremail-controller-0.7.1-windows.zip -Algorithm SHA256
+Get-Content .\coremail-controller-0.7.1-windows.zip.sha256
 ```
 
 两处哈希不一致时停止，不要安装。
@@ -24,7 +25,7 @@ Get-Content .\coremail-controller-0.7.0-windows.zip.sha256
 进入解压出的目录，双击 `INSTALL.cmd`。向导会自动：
 
 1. 核对包内完整性和 Windows 门禁元数据，固定 Python 3.10+；
-2. 用真实 Claude Code 严格验证插件，备份旧版本并原子安装新版本；
+2. 用真实 Claude Code 严格验证插件；2.1.84–2.1.156 会在验证前被明确识别为不支持，需先升级到 2.1.157+；
 3. 显式启用并核对 `coremail-controller@skills-dir` 的版本和实际路径；
 4. 首先检查 Coremail 是否注册了可复用的已登录共享 MAPI 会话；
 5. 探测成功时免密码配置；失败时才询问邮箱、IMAP/SMTP 主机和域/Coremail 密码，

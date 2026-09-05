@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -64,7 +65,7 @@ class ReleaseTests(unittest.TestCase):
                         f"{release.BUNDLE_NAME}/FILE-MANIFEST.json"
                     ).decode("utf-8")
                 )
-            self.assertEqual("0.7.0", plugin["version"])
+            self.assertEqual("0.7.1", plugin["version"])
             self.assertEqual("local-unverified", metadata["release_channel"])
             self.assertFalse(metadata["target_mcp_smoke_tested"])
             self.assertEqual(len(release.EXACT_FILES) + 1, len(internal["files"]))
@@ -188,6 +189,9 @@ class ReleaseTests(unittest.TestCase):
         self.assertNotIn("2>&1", common)
         self.assertIn("$global:LASTEXITCODE = $null", common)
         self.assertIn("Invoke-CoremailClaudeChecked", common)
+        self.assertIn("Assert-CoremailClaudeMinimumVersion", common)
+        self.assertIn("2.1.157", common)
+        self.assertIn("skills-directory plugins", common)
         self.assertIn("DISABLE_AUTOUPDATER", common)
         common_normalized = " ".join(common.lower().split())
         self.assertIn("assert-coremaildefaultclaudeconfigdirectory", common_normalized)
@@ -252,6 +256,71 @@ class ReleaseTests(unittest.TestCase):
         )
         self.assertIn("CredDeleteW", credential_helper)
 
+    def test_unsupported_claude_is_rejected_before_plugin_validation(self) -> None:
+        installer = (ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
+        minimum = installer.index("Assert-CoremailClaudeMinimumVersion")
+        validation = installer.index("plugin', 'validate'")
+        self.assertLess(minimum, validation)
+        self.assertLess(minimum, installer.index("Enter-CoremailLifecycleLock"))
+        self.assertLess(minimum, installer.index("Copy-CoremailPluginTree -Source"))
+        common = (ROOT / "scripts" / "windows-lifecycle-common.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("2.1.157", common)
+        self.assertIn("skills-directory plugins", common)
+        self.assertIn("No plugin files or Claude settings were changed", common)
+        manifest = json.loads(
+            (ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+        )
+        self.assertNotIn("$schema", manifest)
+        workflow = (ROOT / ".github" / "workflows" / "windows-release-gate.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("CLAUDE_LEGACY_CODE_VERSION: \"2.1.84\"", workflow)
+        self.assertIn("unsupported legacy Claude fixture", workflow)
+
+    def test_claude_version_preflight_parses_semver_and_restores_environment(self) -> None:
+        shell = shutil.which("powershell.exe") or shutil.which("powershell") or shutil.which("pwsh")
+        if shell is None:
+            self.skipTest("PowerShell is not available on this host")
+        common_path = str(ROOT / "scripts" / "windows-lifecycle-common.ps1").replace("'", "''")
+        shell_path = str(Path(shell).resolve()).replace("'", "''")
+        command = f"""
+$ErrorActionPreference = 'Stop'
+. '{common_path}'
+$env:DISABLE_AUTOUPDATER = 'before-auto'
+$env:DISABLE_UPDATES = 'before-updates'
+$old = [pscustomobject]@{{
+    Executable = '{shell_path}'
+    Prefix = [string[]]@('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', "Write-Output '2.1.84 (Claude Code)'")
+}}
+$rejected = $false
+try {{ [void](Assert-CoremailClaudeMinimumVersion -Invocation $old -Label 'unit old') }}
+catch {{
+    if ($_.Exception.Message -match '2\\.1\\.157 or newer') {{ $rejected = $true }}
+    else {{ throw }}
+}}
+if (-not $rejected) {{ throw 'The old semantic version was accepted.' }}
+$minimum = [pscustomobject]@{{
+    Executable = '{shell_path}'
+    Prefix = [string[]]@('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', "Write-Output '2.1.157 (Claude Code)'")
+}}
+[void](Assert-CoremailClaudeMinimumVersion -Invocation $minimum -Label 'unit minimum')
+if ($env:DISABLE_AUTOUPDATER -ne 'before-auto' -or
+    $env:DISABLE_UPDATES -ne 'before-updates') {{
+    throw 'Claude update environment was not restored.'
+}}
+Write-Output 'PASS'
+"""
+        completed = subprocess.run(
+            [shell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(0, completed.returncode, msg=completed.stderr + completed.stdout)
+        self.assertIn("PASS", completed.stdout)
+
     def test_windows_gate_uses_real_native_and_npm_claude_under_standard_users(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "windows-release-gate.yml").read_text(
             encoding="utf-8"
@@ -265,6 +334,7 @@ class ReleaseTests(unittest.TestCase):
         normalized = " ".join(workflow.lower().split())
         self.assertIn("runs-on: windows-2022", normalized)
         self.assertIn("claude_code_version: \"2.1.246\"", normalized)
+        self.assertIn("claude_legacy_code_version: \"2.1.84\"", normalized)
         self.assertIn("claude_npm_node_version: \"24.19.0\"", normalized)
         self.assertIn("@anthropic-ai/claude-code@$env:claude_code_version", normalized)
         self.assertNotIn("--ignore-scripts", normalized)
@@ -273,6 +343,15 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("-scenarioname native", normalized)
         self.assertIn("-scenarioname npm", normalized)
         self.assertEqual(2, normalized.count("& $orchestrator"))
+        self.assertIn("legacy_npm_claude", normalized)
+        self.assertIn("2\\.1\\.157 or newer", normalized)
+        self.assertIn("legacy-install-stdout.txt", normalized)
+        self.assertIn("the unsupported claude preflight changed claude settings", normalized)
+        self.assertIn("the unsupported claude preflight created a lifecycle lock", normalized)
+        self.assertLess(
+            normalized.index("legacy-install-stdout.txt"),
+            normalized.index("$legacyinvocation"),
+        )
         self.assertNotIn("native claude lifecycle gate failed", normalized)
         self.assertNotIn("npm claude lifecycle gate failed", normalized)
         self.assertLess(
@@ -371,6 +450,10 @@ class ReleaseTests(unittest.TestCase):
         self.assertLess(
             uninstaller.index("UNINSTALL no active plugin found"),
             uninstaller.index("$claudeInvocation = Resolve-ClaudeCodeInvocation"),
+        )
+        self.assertLess(
+            uninstaller.index("Assert-CoremailClaudeMinimumVersion"),
+            uninstaller.index("Enter-CoremailLifecycleLock"),
         )
 
     def test_release_refuses_to_overwrite_by_default(self) -> None:

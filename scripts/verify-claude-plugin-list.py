@@ -68,7 +68,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("inventory", type=Path)
     parser.add_argument("--plugin-id", default="coremail-controller@skills-dir")
-    parser.add_argument("--version", default="0.7.0")
+    parser.add_argument("--version", default="0.7.1")
     parser.add_argument("--expected-path", required=True, type=Path)
     parser.add_argument("--state", choices=("present", "enabled", "disabled"), required=True)
     arguments = parser.parse_args()

@@ -165,6 +165,72 @@ function Invoke-CoremailClaudeChecked {
     }
 }
 
+function Get-CoremailClaudeVersion {
+    param(
+        [Parameter(Mandatory = $true)][object]$Invocation,
+        [string]$Label = 'Claude Code version probe'
+    )
+
+    $capturePath = Join-Path ([IO.Path]::GetTempPath()) (
+        'coremail-claude-version-' + [guid]::NewGuid().ToString('N') + '.txt'
+    )
+    try {
+        Invoke-CoremailClaudeChecked `
+            -Invocation $Invocation `
+            -Arguments @('--version') `
+            -CapturePath $capturePath `
+            -Label $Label
+        $versionText = [IO.File]::ReadAllText($capturePath)
+    }
+    finally {
+        if (Test-Path -LiteralPath $capturePath -PathType Leaf) {
+            Remove-Item -LiteralPath $capturePath -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $match = [regex]::Match(
+        $versionText,
+        '(?<![0-9])([0-9]+)\.([0-9]+)\.([0-9]+)(?![0-9])'
+    )
+    if (-not $match.Success) {
+        throw (
+            "$Label did not report a semantic Claude Code version. " +
+            'The installed Claude executable cannot be validated safely.'
+        )
+    }
+    $versionTextValue = '{0}.{1}.{2}' -f @(
+        $match.Groups[1].Value,
+        $match.Groups[2].Value,
+        $match.Groups[3].Value
+    )
+    $version = [Version]::Parse($versionTextValue)
+    Write-CoremailLifecycleLog "CLAUDE VERSION label=$Label; version=$version"
+    return [pscustomobject]@{
+        Version = $version
+        Text = $versionText.Trim()
+    }
+}
+
+function Assert-CoremailClaudeMinimumVersion {
+    param(
+        [Parameter(Mandatory = $true)][object]$Invocation,
+        [string]$MinimumVersion = '2.1.157',
+        [string]$Label = 'Claude Code version probe'
+    )
+
+    try { $minimum = [Version]::Parse($MinimumVersion) }
+    catch { throw "The lifecycle minimum Claude Code version is invalid: $MinimumVersion" }
+    $observed = Get-CoremailClaudeVersion -Invocation $Invocation -Label $Label
+    if ($observed.Version -lt $minimum) {
+        throw (
+            "Claude Code $($observed.Version) is not supported by this release. " +
+            "Claude Code $minimum or newer is required for skills-directory plugins. " +
+            'Upgrade Claude Code with its official installer, then run INSTALL.cmd again. ' +
+            'No plugin files or Claude settings were changed.'
+        )
+    }
+    return $observed
+}
+
 function Assert-CoremailDefaultClaudeConfigDirectory {
     param([Parameter(Mandatory = $true)][string]$UserProfile)
 

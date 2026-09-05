@@ -151,9 +151,6 @@ try {
     $currentIdentityName = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
     Write-CoremailLifecycleLog "UNINSTALL identity=$currentIdentityName; target=$targetRoot"
     [void](Assert-CoremailSafeClaudePath -UserProfile $userProfile -Path $skillsRoot)
-    $lockPath = Join-Path $claudeRoot 'coremail-controller.lifecycle.lock'
-    [void](Assert-CoremailSafeClaudePath -UserProfile $userProfile -Path $lockPath)
-    $lockStream = Enter-CoremailLifecycleLock -Path $lockPath
 
     $targetLookupDenied = $false
     try {
@@ -177,7 +174,16 @@ try {
     if ($null -eq $claudeInvocation) {
         throw 'Claude Code was not found; the plugin cannot be disabled and verified safely.'
     }
-    Invoke-Claude -Invocation $claudeInvocation -Arguments @('--version') -Label 'Claude Code version probe'
+    [void](Assert-CoremailClaudeMinimumVersion `
+        -Invocation $claudeInvocation `
+        -Label 'Claude Code version probe')
+
+    # Do not create the lifecycle lock (or any other state) until the CLI
+    # version preflight has accepted the skills-directory contract. This keeps
+    # unsupported Claude releases fail-before-mutation just like installation.
+    $lockPath = Join-Path $claudeRoot 'coremail-controller.lifecycle.lock'
+    [void](Assert-CoremailSafeClaudePath -UserProfile $userProfile -Path $lockPath)
+    $lockStream = Enter-CoremailLifecycleLock -Path $lockPath
 
     if ($targetLookupDenied) {
         Invoke-LegacyPermissionRepair -UserProfile $userProfile -Root $targetRoot

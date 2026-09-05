@@ -14,7 +14,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 BUNDLE_NAME = f"coremail-controller-{VERSION}"
 LOCAL_ARCHIVE_NAME = f"{BUNDLE_NAME}-windows-UNVERIFIED.zip"
 GATED_ARCHIVE_NAME = f"{BUNDLE_NAME}-windows.zip"

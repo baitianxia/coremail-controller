@@ -157,7 +157,7 @@ function Assert-ExactClaudePlugin {
     & $PythonCommand -B -I (Join-Path $targetRoot 'scripts\verify-claude-plugin-list.py') `
         $inventory `
         --plugin-id 'coremail-controller@skills-dir' `
-        --version '0.7.0' `
+        --version '0.7.1' `
         --expected-path $targetRoot `
         --state $State
     if ($LASTEXITCODE -ne 0) { throw "Claude plugin state verification failed: $State" }

@@ -16,7 +16,7 @@ class ProtocolTests(unittest.TestCase):
     def test_claude_plugin_layout_and_mcp_path_are_portable(self) -> None:
         manifest = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["name"], "coremail-controller")
-        self.assertEqual(manifest["version"], "0.7.0")
+        self.assertEqual(manifest["version"], "0.7.1")
 
         coremail_skill = (ROOT / "skills" / "coremail" / "SKILL.md").read_text(encoding="utf-8")
         browser_skill = (ROOT / "skills" / "web-to-coremail" / "SKILL.md").read_text(encoding="utf-8")
@@ -92,7 +92,7 @@ class ProtocolTests(unittest.TestCase):
         responses = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
         self.assertEqual([response["id"] for response in responses], [1, 2, 3])
         self.assertEqual(responses[0]["result"]["serverInfo"]["name"], "coremail-headless")
-        self.assertEqual(responses[0]["result"]["serverInfo"]["version"], "0.7.0")
+        self.assertEqual(responses[0]["result"]["serverInfo"]["version"], "0.7.1")
         names = {tool["name"] for tool in responses[1]["result"]["tools"]}
         self.assertEqual(len(names), 10)
         self.assertIn("coremail_discover_local", names)
