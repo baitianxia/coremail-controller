@@ -13,10 +13,14 @@ SERVER = ROOT / "mcp" / "server.py"
 
 
 class ProtocolTests(unittest.TestCase):
-    def test_claude_plugin_layout_and_mcp_path_are_portable(self) -> None:
+    def test_user_skill_layout_and_mcp_path_are_portable(self) -> None:
         manifest = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["name"], "coremail-controller")
-        self.assertEqual(manifest["version"], "0.7.1")
+        self.assertEqual(manifest["version"], "0.8.0")
+
+        user_skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+        self.assertTrue(user_skill.startswith("---\nname: coremail-controller\n"))
+        self.assertIn("确认发送", user_skill)
 
         coremail_skill = (ROOT / "skills" / "coremail" / "SKILL.md").read_text(encoding="utf-8")
         browser_skill = (ROOT / "skills" / "web-to-coremail" / "SKILL.md").read_text(encoding="utf-8")
@@ -33,9 +37,16 @@ class ProtocolTests(unittest.TestCase):
             self.assertTrue((ROOT / launcher).is_file())
 
         installer = (ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
+        registrar = (ROOT / "scripts" / "register_claude_user_mcp.py").read_text(encoding="utf-8")
         self.assertIn("plugin-backups", installer)
         self.assertNotIn("skills\\coremail-controller.backup", installer)
         self.assertIn("tests\\smoke-mcp.ps1", installer)
+        self.assertIn("register_claude_user_mcp.py", installer)
+        self.assertIn("--scope", registrar)
+        self.assertIn("user-scope MCP", installer)
+        self.assertNotIn("plugin validate", installer.lower())
+        self.assertNotIn("plugin enable", installer.lower())
+        self.assertNotIn("plugin list", installer.lower())
         launch_sources = installer + (ROOT / "INSTALL.cmd").read_text(encoding="utf-8")
         launch_sources += (ROOT / "tests" / "smoke-mcp.ps1").read_text(encoding="utf-8")
         self.assertNotIn("ExecutionPolicy", launch_sources)
@@ -92,7 +103,7 @@ class ProtocolTests(unittest.TestCase):
         responses = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
         self.assertEqual([response["id"] for response in responses], [1, 2, 3])
         self.assertEqual(responses[0]["result"]["serverInfo"]["name"], "coremail-headless")
-        self.assertEqual(responses[0]["result"]["serverInfo"]["version"], "0.7.1")
+        self.assertEqual(responses[0]["result"]["serverInfo"]["version"], "0.8.0")
         names = {tool["name"] for tool in responses[1]["result"]["tools"]}
         self.assertEqual(len(names), 10)
         self.assertIn("coremail_discover_local", names)
@@ -190,6 +201,7 @@ class ProtocolTests(unittest.TestCase):
             normalized,
         )
         self.assertIsNone(re.search(r"(?<![a-z])move-item\b", normalized))
+        self.assertIn("register_claude_user_mcp.py", normalized)
 
     def test_uninstall_fails_closed_on_lock_or_acl_denial(self) -> None:
         uninstaller = (ROOT / "scripts" / "uninstall.ps1").read_text(encoding="utf-8").lower()

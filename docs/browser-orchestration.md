@@ -28,7 +28,8 @@ results, account configuration, and credentials are not browser inputs.
 
 - Each MCP server has its own process, repository/package, launch configuration,
   dependencies, logs, cache, and update lifecycle.
-- The Coremail plugin `.mcp.json` declares only `coremail-windows`; it neither starts
+- The Coremail package declares only `coremail-windows` in its development
+  `.mcp.json`; the installed `coremail-controller` user-scope entry neither starts
   nor configures the browser MCP.
 - The browser MCP must not receive mailbox secrets, a Windows credential target,
   Coremail configuration overrides, or attachment roots. Do not set `COREMAIL_*`
@@ -60,7 +61,7 @@ stronger deployments:
    storage. Do not mount the mailbox profile or outgoing attachment directories.
 
 The Coremail MCP must remain under the Windows identity that owns its Generic
-Credential or existing Coremail shared MAPI session. Version 0.7.1 deliberately
+Credential or existing Coremail shared MAPI session. Version 0.8.0 deliberately
 does not accept a password through an environment variable because sibling MCP
 processes can inherit the same environment.
 
@@ -107,10 +108,12 @@ claude mcp list
 /mcp
 ```
 
-Use `/coremail-controller:web-to-coremail` for the isolated combined workflow. The
-browser MCP's own visible/headless mode, authentication, and sandboxing remain its
-configuration responsibility; choose headless mode if visible browser operation is
-not acceptable.
+Ask Claude in natural language to research public pages and prepare a Coremail
+message. The installed `coremail-controller` user skill applies the isolated
+combined workflow; a version-specific slash alias is optional and is not required.
+The browser MCP's own visible/headless mode, authentication, and sandboxing remain
+its configuration responsibility; choose headless mode if visible browser operation
+is not acceptable.
 
 When the user requests strict or complete isolation, use the two-session handoff
 above instead of the combined workflow.

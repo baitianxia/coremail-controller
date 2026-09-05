@@ -1,13 +1,13 @@
 # Claude Code Coremail 接口优先连接器
 
-> **当前发布线：0.7.1。** 只安装由成功的 Windows PowerShell 5.1 生命周期门禁上传、
+> **当前发布线：0.8.0。** 只安装由成功的 Windows PowerShell 5.1 生命周期门禁上传、
 > 且 ZIP 与相邻 `.sha256` 文件匹配的 `coremail-controller-windows-gated` 产物。
-> 私有仓库的 `gated-release/releases/0.7.1/` 保存同一对已复核文件。0.7.0 及更早
-> 构建已被 0.7.1 取代；0.6.0 及更早构建已撤回，不得继续安装或测试。
+> 私有仓库的 `gated-release/releases/0.8.0/` 保存同一对已复核文件。0.7.x 及更早
+> 构建已被 0.8.0 取代；0.6.0 及更早构建已撤回，不得继续安装或测试。
 
-这是一个供 Windows 上 Claude Code 使用的本地插件。它**不会启动、显示或操作
+这是一个供 Windows 上 Claude Code 使用的本地用户级 MCP 包。它**不会启动、显示或操作
 Coremail 客户端界面**。用户可直接用文字要求 Claude Code 搜索、读取、整理和准备
-邮件。插件按以下顺序建立邮箱访问：
+邮件。安装包按以下顺序建立邮箱访问：
 
 - 若 Windows 默认邮件客户端明确注册为 Coremail，先用系统 Simple MAPI 接口尝试
   连接**已经登录的共享会话**；调用不带用户名、密码和任何界面标志；
@@ -18,7 +18,7 @@ Coremail 客户端界面**。用户可直接用文字要求 Claude Code 搜索�
   Coremail 草稿或待发送邮件。
 
 Simple MAPI 是 Windows 文档化、但微软已不建议新系统依赖的兼容接口，不是对
-Coremail 私有协议的猜测。插件不会读取或解密 Coremail 保存的密码，也不会通过 UI
+Coremail 私有协议的猜测。安装包不会读取或解密 Coremail 保存的密码，也不会通过 UI
 Automation、截图、鼠标或键盘控制客户端。若 Coremail 未提供可复用的 MAPI 会话，
 实时访问需要管理员启用 IMAP/SMTP。
 
@@ -47,8 +47,9 @@ coremail-controller/
 ├── CONFIGURE-ACCOUNT.cmd       # 双击重新配置账号
 ├── UNINSTALL.cmd               # 双击可恢复式卸载
 ├── START-HERE.md               # 最短使用入口
-├── .claude-plugin/             # Claude Code 插件清单
-├── .mcp.json                   # 仅声明 Coremail MCP
+├── .claude-plugin/             # 包元数据（用于分发和校验）
+├── .mcp.json                   # 开发/兼容环境中的 Coremail MCP 声明
+├── SKILL.md                    # 安装到用户 skills 目录的自然语言入口
 ├── skills/                     # Coremail 与网页转邮件工作流
 ├── mcp/                        # Windows MAPI 与 IMAP/SMTP 传输服务
 ├── scripts/                    # 安装、配置、卸载和发布脚本
@@ -60,13 +61,13 @@ coremail-controller/
 ## 环境要求
 
 - Windows 10/11；
-- Claude Code 2.1.157 或更高版本（支持 skills-directory 插件；原生 `claude.exe` 或标准 npm
-  `claude.cmd` 安装均可）。2.1.84–2.1.156 虽然可能能执行部分 `plugin` 命令，但不支持
-  本插件所需的 skills-directory 清单；安装器会在任何插件验证或文件替换前明确拒绝并提示
-  升级。npm 安装会按其官方包清单解析：新版包内原生 PE 直接执行，旧版 JS 入口使用该
-  安装已有的 Node；不会通过 `cmd.exe` 拼接命令；
-- 当前版本只管理默认的 `%USERPROFILE%\.claude` 用户配置目录；启动安装或卸载进程时，
-  `CLAUDE_CONFIG_DIR` 必须未设置，或明确指向这个默认目录。其他配置根不会被猜测或改写；
+- Claude Code 需要提供 `mcp add`、`mcp remove` 和 `mcp get` 命令；原生 `claude.exe` 或标准
+  npm `claude.cmd` 安装均可。用户级注册路径已用 Claude Code 2.1.84 和当前版本验证，
+  不依赖 `plugin validate --strict`、插件清单或固定版本下限。npm 安装会按其官方包清单
+  解析：新版包内原生 PE 直接执行，旧版 JS 入口使用该安装已有的 Node；不会通过 `cmd.exe`
+  拼接命令。`--version` 仅作启动诊断，不是版本门槛；
+- 默认把用户级 MCP 写入 `%USERPROFILE%\.claude.json`。如果已经设置 `CLAUDE_CONFIG_DIR`，
+  安装器和卸载器会沿用它；只接受本机盘符绝对路径，拒绝相对路径、`~` 和 UNC 路径；
 - Python 3.10 或更高版本，安装时可由 `py.exe` 或 `python.exe` 找到；安装器会固定并
   校验实际 `python.exe`，以后不再随 `PATH` 漂移；
 - 接口模式：Coremail 是 Windows 默认邮件客户端，并暴露与 Python 位数匹配的 Simple
@@ -88,9 +89,10 @@ Windows 上完整解压发布 ZIP，进入解压目录，双击：
 INSTALL.cmd
 ```
 
-向导会先逐文件核对包内清单和 Windows 门禁元数据，固定 Python 运行时，并通过真实
-Claude Code 执行严格插件验证；随后在当前用户的 `.claude` 目录暂存、验证 MCP、原子
-替换插件，显式启用并再次从 `claude plugin list --json` 核对准确版本和路径。插件安装到：
+向导会先逐文件核对包内清单和 Windows 门禁元数据，固定 Python 运行时，在当前用户的
+`.claude\skills` 目录暂存并原子替换包，然后通过真实 Claude Code 执行用户级
+`mcp remove → mcp add → mcp get`，核对实际写入的 `.claude.json` 条目。包和用户 skill
+安装到：
 
 ```text
 %USERPROFILE%\.claude\skills\coremail-controller
@@ -98,13 +100,13 @@ Claude Code 执行严格插件验证；随后在当前用户的 `.claude` 目录
 
 首次安装会先探测已有 Coremail 共享会话；探测成功则不询问密码，探测失败才进入
 IMAP/SMTP 配置。升级默认保留已有账号配置及 Windows 凭据。
-识别到旧插件时，安装器会把它移动到以下目录，而不是覆盖或删除：
+识别到旧 Coremail 包时，安装器会把它移动到以下目录，而不是覆盖或删除：
 
 ```text
 %USERPROFILE%\.claude\plugin-backups
 ```
 
-备份刻意放在 `skills` 目录之外，避免 Claude Code 把旧版本再次加载为插件。正常流程
+备份刻意放在 `skills` 目录之外，避免 Claude Code 把旧版本再次加载为用户 skill。正常流程
 只在当前用户范围运行，不请求管理员权限，也不绕过机器的 PowerShell 执行策略。若
 检测到已撤回旧版本留下的
 `%USERPROFILE%\.claude\skills\coremail-controller` 只有 `SYSTEM/Administrators`
@@ -172,12 +174,11 @@ powershell.exe -NoProfile -File .\scripts\setup-account.ps1 -Transport windows_s
 powershell.exe -NoProfile -File .\scripts\setup-account.ps1 -Transport imap_smtp
 ```
 
-配置完成后重启 Claude Code，或在会话内执行 `/reload-plugins`。可用以下方式核验：
+配置完成后重启 Claude Code，或在会话内执行 `/reload-plugins`。可用以下方式核验用户级 MCP：
 
 ```text
-claude plugin list
-/coremail-controller:coremail
-/coremail-controller:web-to-coremail
+claude mcp get coremail-controller
+claude mcp list
 ```
 
 然后让 Claude “检查 Coremail 连接”。MCP 工具名均以 `coremail_` 开头。
@@ -210,8 +211,9 @@ claude mcp list
 /mcp
 ```
 
-然后使用 `/coremail-controller:web-to-coremail`，或直接要求 Claude“用现有浏览器 MCP
-研究这些公共网页，把结论整理成 Coremail 草稿”。工作流按以下顺序执行：
+然后直接要求 Claude“用现有浏览器 MCP 研究这些公共网页，把结论整理成 Coremail 草稿”。
+支持用户 skill 命令的版本也可以使用 `/coremail-controller`，但不依赖版本特定的
+slash 别名。工作流按以下顺序执行：
 
 ```text
 浏览器 MCP（只读研究）
@@ -280,15 +282,15 @@ python .\scripts\build-release.py --output-dir .\dist --force
 ```
 
 本地构建结果会明确命名为
-`dist\coremail-controller-0.7.1-windows-UNVERIFIED.zip`，目标安装器会拒绝它。正式
-`coremail-controller-0.7.1-windows.zip` 只能由 `.github/workflows/windows-release-gate.yml`
+`dist\coremail-controller-0.8.0-windows-UNVERIFIED.zip`，目标安装器会拒绝它。正式
+`coremail-controller-0.8.0-windows.zip` 只能由 `.github/workflows/windows-release-gate.yml`
 在干净的 `windows-2022` 环境中生成。门禁使用 Windows PowerShell 5.1、一次性标准
 用户和真实的原生/npm Claude Code 两种入口，验证包内清单、脚本解析、凭据 C# 编译、
-Python 固定启动、Claude 启用状态、安装/覆盖安装/卸载/重装，还会注入临时目录移动
+Python 固定启动、Claude 用户级 MCP 注册/移除、安装/覆盖安装/卸载/重装，还会注入临时目录移动
 拒绝和旧版本 `SYSTEM/Administrators`-only ACL、生命周期锁冲突及“凭据已写但配置未
 发布”故障并证明同进程恢复。安全桌面的 UAC 点击不能由托管 CI 代替；门禁中的普通
 用户进程通过专用握手请求恢复，已提升的外层编排器独立核对一次性账号 SID、固定插件
-目录、无重解析路径及插件身份/版本后，实际调用 System32 `icacls.exe` 完成同等授权，
+目录、无重解析路径及包身份/版本后，实际调用 System32 `icacls.exe` 完成同等授权，
 普通用户进程再复核并继续卸载。源码约束同时保证正式路径只能使用当前用户 SID、
 `Modify` 和 `/L`，禁止 `/T`、ACL reset、接管所有权或删除。它使用无密码的
 离线邮箱配置且跳过真实连接，不读取或发送邮件。ZIP 在测试前后和发布任务中都会再次
@@ -296,10 +298,10 @@ Python 固定启动、Claude 启用状态、安装/覆盖安装/卸载/重装，
 
 常见问题：
 
-- `unknown option '--strict'` 或提示 Claude 版本过旧：2.1.84–2.1.156 不支持本插件依赖的
-  skills-directory 插件清单。请先用 Claude Code 官方安装器升级到 2.1.157 或更高版本，
-  再运行 INSTALL.cmd；安装器在此检查前不会替换插件或设置。若新版本仍失败，请把窗口
-  显示的 `%TEMP%\CoremailController\INSTALL-*.log` 提供给维护者，不要手工改写插件清单；
+- `mcp add/remove/get` 不可用：当前 Claude Code 没有提供用户级 MCP 命令。安装器会在任何
+  包替换或配置写入前停止；请使用支持这些命令的 Claude Code，或把完整的
+  `%TEMP%\CoremailController\INSTALL-*.log` 提供给维护者。安装器不要求固定版本，也不
+  会运行 `plugin validate --strict`；
 - `credential unavailable`：重新运行 `setup-account.ps1`，并确认当前 Windows 用户一致；
 - `no existing shared login session`：保持 Coremail 已登录，确认它是默认 Windows 邮件
   客户端；若仍失败，可能未注册 MAPI 或位数不匹配，改用 `-Transport imap_smtp`；
@@ -319,12 +321,13 @@ Python 固定启动、Claude 启用状态、安装/覆盖安装/卸载/重装，
 powershell.exe -NoProfile -File .\scripts\uninstall.ps1
 ```
 
-卸载脚本只把插件移动到 `%USERPROFILE%\.claude\plugins-disabled`，不会删除账号配置或
+卸载脚本先通过真实 Claude Code 移除 `coremail-controller` 用户级 MCP，再把包移动到
+`%USERPROFILE%\.claude\plugins-disabled`，不会删除账号配置或
 Windows 凭据，因而可以恢复。若要删除凭据，请在确认目标名后通过 Windows“凭据
 管理器”手动完成。
 
-卸载器会先通过真实 Claude Code 核对准确的 `coremail-controller@skills-dir`，再禁用并
-使用同卷原子移动；若 Defender、EDR、索引或刚结束的进程短暂占用目录，会在同一进程
+卸载器会先通过真实 Claude Code 核对并移除用户级 `coremail-controller`，再使用同卷原子
+移动；若 Defender、EDR、索引或刚结束的进程短暂占用目录，会在同一进程
 中自动有界重试。若旧版本目录明确拒绝当前用户访问，则可能出现一次上述受限 UAC
 修复；它只增加当前用户对固定插件目录的 `Modify`，不会接管所有权、重置 ACL、递归
 处理或删除内容。若最终仍失败，插件和 Claude 设置会保持或恢复到原状态；根据窗口给出

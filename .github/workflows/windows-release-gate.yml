@@ -94,12 +94,14 @@ jobs:
           $npmNode = (Get-Command node.exe -CommandType Application -ErrorAction Stop |
             Select-Object -First 1).Source
           $npmVersion = ((& $npmClaude --version 2>&1) -join "`n").Trim()
+          $npmExitCode = $LASTEXITCODE
           $nodeVersion = ((& $npmNode --version 2>&1) -join "`n").Trim()
-          if ($LASTEXITCODE -ne 0 -or
+          $nodeExitCode = $LASTEXITCODE
+          if ($npmExitCode -ne 0 -or
               $npmVersion -notmatch ('^' + [regex]::Escape($env:CLAUDE_CODE_VERSION) + '(?:\s|$)')) {
             throw "Expected npm Claude $env:CLAUDE_CODE_VERSION; found $npmVersion"
           }
-          if ($nodeVersion -ne "v$env:CLAUDE_NPM_NODE_VERSION") {
+          if ($nodeExitCode -ne 0 -or $nodeVersion -ne "v$env:CLAUDE_NPM_NODE_VERSION") {
             throw "Expected npm Node v$env:CLAUDE_NPM_NODE_VERSION; found $nodeVersion"
           }
           $legacyNpmRoot = Join-Path $env:RUNNER_TEMP 'coremail-npm-claude-legacy'
@@ -108,7 +110,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'The CI-only legacy npm Claude fixture failed to install.' }
           $legacyNpmClaude = Join-Path $legacyNpmRoot 'claude.cmd'
           $legacyNpmVersion = ((& $legacyNpmClaude --version 2>&1) -join "`n").Trim()
-          if ($LASTEXITCODE -ne 0 -or
+          $legacyNpmExitCode = $LASTEXITCODE
+          if ($legacyNpmExitCode -ne 0 -or
               $legacyNpmVersion -notmatch ('^' + [regex]::Escape($env:CLAUDE_LEGACY_CODE_VERSION) + '(?:\s|$)')) {
             throw "Expected legacy npm Claude $env:CLAUDE_LEGACY_CODE_VERSION; found $legacyNpmVersion"
           }
@@ -122,119 +125,93 @@ jobs:
           Write-Host "CI-only npm Claude: $npmVersion / $nodeVersion"
           Write-Host "CI-only legacy npm Claude: $legacyNpmVersion / $nodeVersion"
 
-      - name: Prove source MCP and Claude plugin compatibility before packaging
+      - name: Prove source MCP and user-scope registration compatibility before packaging
         shell: powershell
         run: |
+          $ErrorActionPreference = 'Stop'
           $pythonCommand = (Get-Command python.exe -ErrorAction Stop).Source
           & .\tests\smoke-mcp.ps1 -IgnoreAccountConfiguration -PythonExecutable $pythonCommand
+          if ($LASTEXITCODE -ne 0) { throw 'Source MCP smoke test failed.' }
           $sourceRoot = (Get-Location).Path
+          $registrar = Join-Path $sourceRoot 'scripts\register_claude_user_mcp.py'
+          & $pythonCommand -B -I $registrar self-test
+          if ($LASTEXITCODE -ne 0) { throw 'The user-scope registrar self-test failed.' }
+
           . .\scripts\windows-lifecycle-common.ps1
           . .\scripts\windows-tool-discovery.ps1
           $sourceInvocation = Resolve-ClaudeCodeInvocation -ExplicitPath $env:NATIVE_CLAUDE
           if ($null -eq $sourceInvocation) { throw 'The native Claude fixture could not be resolved.' }
-          [void](Assert-CoremailClaudeMinimumVersion `
-            -Invocation $sourceInvocation `
-            -Label 'Real Claude Code version probe')
           Invoke-CoremailClaudeChecked `
             -Invocation $sourceInvocation `
-            -Arguments @('plugin', 'validate', $sourceRoot, '--strict') `
-            -CapturePath (Join-Path $env:RUNNER_TEMP 'source-claude-validation.txt') `
-            -Label 'Real Claude plugin validation'
+            -Arguments @('--version') `
+            -Label 'Real Claude Code version probe'
+          Invoke-CoremailClaudeChecked `
+            -Invocation $sourceInvocation `
+            -Arguments @('mcp', '--help') `
+            -Label 'Real Claude user-scope MCP capability probe'
 
-          # Exercise the actual installer with the exact legacy package. The
-          # process must stop at the version preflight, before it can create a
-          # lifecycle lock, replace a plugin, or change Claude settings.
-          $legacyInstaller = Join-Path $sourceRoot 'scripts\install.ps1'
-          $legacyProfile = [Environment]::GetFolderPath('UserProfile')
-          $legacyTarget = Join-Path $legacyProfile '.claude\skills\coremail-controller'
-          $legacySettings = Join-Path $legacyProfile '.claude\settings.json'
-          $legacyLock = Join-Path $legacyProfile '.claude\coremail-controller.lifecycle.lock'
-          if (Test-Path -LiteralPath $legacyTarget) {
-            throw "The source preflight profile unexpectedly contains a Coremail plugin: $legacyTarget"
-          }
-          $legacySettingsPresent = Test-Path -LiteralPath $legacySettings -PathType Leaf
-          $legacySettingsHash = if ($legacySettingsPresent) {
-            (Get-FileHash -LiteralPath $legacySettings -Algorithm SHA256).Hash
-          }
-          else { $null }
-          $legacyLockPresent = Test-Path -LiteralPath $legacyLock -PathType Leaf
-          $legacyLockHash = if ($legacyLockPresent) {
-            (Get-FileHash -LiteralPath $legacyLock -Algorithm SHA256).Hash
-          }
-          else { $null }
-          $legacyStdout = Join-Path $env:RUNNER_TEMP 'legacy-install-stdout.txt'
-          $legacyStderr = Join-Path $env:RUNNER_TEMP 'legacy-install-stderr.txt'
-          $legacyLog = Join-Path $env:RUNNER_TEMP 'legacy-install.log'
-          $legacyPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-          Remove-Item Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
-          $legacyOutput = @()
-          $legacyPreviousPreference = $ErrorActionPreference
-          try {
-            # Invoke with an argument array so paths containing spaces are kept
-            # intact; keep stderr in its own file for an unambiguous assertion.
-            $ErrorActionPreference = 'Continue'
-            $global:LASTEXITCODE = $null
-            $legacyOutput = @(& $legacyPowerShell `
-              -NoLogo -NoProfile -NonInteractive -File $legacyInstaller `
-              -SkipConnectionCheck -PythonExecutable $pythonCommand `
-              -ClaudeCommand $env:LEGACY_NPM_CLAUDE -LogPath $legacyLog 2> $legacyStderr)
-            $legacyExitCode = $global:LASTEXITCODE
-          }
-          finally { $ErrorActionPreference = $legacyPreviousPreference }
-          $legacyStdoutText = (@($legacyOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine)
-          [IO.File]::WriteAllText(
-            $legacyStdout,
-            ($legacyStdoutText + [Environment]::NewLine),
-            (New-Object System.Text.UTF8Encoding($false))
-          )
-          $legacyStderrText = if (Test-Path -LiteralPath $legacyStderr) {
-            Get-Content -LiteralPath $legacyStderr -Raw
-          }
-          else { '' }
-          $legacyText = $legacyStdoutText + "`n" + $legacyStderrText
-          Write-Host $legacyText
-          if ($legacyExitCode -ne 1 -or $legacyText -notmatch '2\.1\.157 or newer') {
-            throw "The exact legacy installer preflight returned an unexpected result (exit=$legacyExitCode): $legacyText"
-          }
-          if (Test-Path -LiteralPath $legacyTarget) {
-            throw 'The unsupported Claude preflight created or replaced the Coremail plugin.'
-          }
-          if ($legacySettingsPresent) {
-            if (-not (Test-Path -LiteralPath $legacySettings -PathType Leaf) -or
-                (Get-FileHash -LiteralPath $legacySettings -Algorithm SHA256).Hash -ne $legacySettingsHash) {
-              throw 'The unsupported Claude preflight changed Claude settings.'
-            }
-          }
-          elseif (Test-Path -LiteralPath $legacySettings) {
-            throw 'The unsupported Claude preflight created Claude settings.'
-          }
-          if ($legacyLockPresent) {
-            if (-not (Test-Path -LiteralPath $legacyLock -PathType Leaf) -or
-                (Get-FileHash -LiteralPath $legacyLock -Algorithm SHA256).Hash -ne $legacyLockHash) {
-              throw 'The unsupported Claude preflight changed the lifecycle lock.'
-            }
-          }
-          elseif (Test-Path -LiteralPath $legacyLock) {
-            throw 'The unsupported Claude preflight created a lifecycle lock.'
-          }
-
+          # Claude Code 2.1.84 is a supported compatibility fixture. Exercise
+          # the real Node-backed npm entry in an isolated user config, then
+          # prove that registration and removal leave no Coremail entry behind.
           $legacyInvocation = Resolve-ClaudeCodeInvocation -ExplicitPath $env:LEGACY_NPM_CLAUDE
           if ($null -eq $legacyInvocation -or
               [string]$legacyInvocation.NpmBinKind -ne 'node') {
             throw 'The legacy Claude fixture did not resolve its package-declared Node entry point.'
           }
-          $legacyRejected = $false
+          $probeRoot = Join-Path $env:RUNNER_TEMP 'coremail-legacy-user-mcp-probe'
+          New-Item -ItemType Directory -Path $probeRoot -Force | Out-Null
+          $probeConfig = Join-Path $probeRoot '.claude.json'
+          $probeBackup = Join-Path $probeRoot 'register.backup'
+          $removeBackup = Join-Path $probeRoot 'remove.backup'
+          $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+          $registrarArguments = @(
+            '-B', '-I', $registrar, 'register',
+            '--claude-executable', [string]$legacyInvocation.Executable,
+            '--server-name', 'coremail-controller',
+            '--user-config', $probeConfig,
+            '--backup', $probeBackup,
+            '--powershell-executable', $windowsPowerShell,
+            '--server-script', (Join-Path $sourceRoot 'mcp\run-server.ps1')
+          )
+          foreach ($prefix in @($legacyInvocation.Prefix)) {
+            $registrarArguments += @('--claude-prefix', [string]$prefix)
+          }
+          $previousClaudeConfigDir = [string]$env:CLAUDE_CONFIG_DIR
+          $hadClaudeConfigDir = Test-Path Env:CLAUDE_CONFIG_DIR
           try {
-            [void](Assert-CoremailClaudeMinimumVersion `
-              -Invocation $legacyInvocation `
-              -Label 'Legacy Claude Code version probe')
+            $env:CLAUDE_CONFIG_DIR = $probeRoot
+            & $pythonCommand @registrarArguments
+            if ($LASTEXITCODE -ne 0) { throw 'Claude 2.1.84 user-scope registration failed.' }
+            & $pythonCommand -B -I $registrar verify `
+              --server-name 'coremail-controller' `
+              --user-config $probeConfig `
+              --powershell-executable $windowsPowerShell `
+              --server-script (Join-Path $sourceRoot 'mcp\run-server.ps1')
+            if ($LASTEXITCODE -ne 0) { throw 'Claude 2.1.84 registration verification failed.' }
+            $removeArguments = @(
+              '-B', '-I', $registrar, 'unregister',
+              '--claude-executable', [string]$legacyInvocation.Executable,
+              '--server-name', 'coremail-controller',
+              '--user-config', $probeConfig,
+              '--backup', $removeBackup
+            )
+            foreach ($prefix in @($legacyInvocation.Prefix)) {
+              $removeArguments += @('--claude-prefix', [string]$prefix)
+            }
+            & $pythonCommand @removeArguments
+            if ($LASTEXITCODE -ne 0) { throw 'Claude 2.1.84 user-scope removal failed.' }
+            if (Test-Path -LiteralPath $probeConfig -PathType Leaf) {
+              $probePayload = Get-Content -LiteralPath $probeConfig -Raw | ConvertFrom-Json
+              $probeServers = $probePayload.PSObject.Properties['mcpServers']
+              if ($null -ne $probeServers -and
+                  $null -ne $probeServers.Value.PSObject.Properties['coremail-controller']) {
+                throw 'Claude 2.1.84 removal left the Coremail user entry behind.'
+              }
+            }
           }
-          catch {
-            if ($_.Exception.Message -match '2\.1\.157 or newer') { $legacyRejected = $true }
-            else { throw }
-          }
-          if (-not $legacyRejected) {
-            throw 'The unsupported legacy Claude fixture was not rejected before plugin validation.'
+          finally {
+            if ($hadClaudeConfigDir) { $env:CLAUDE_CONFIG_DIR = $previousClaudeConfigDir }
+            else { Remove-Item Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue }
           }
 
       - name: Build and exercise the exact packaged Windows artifact
@@ -249,7 +226,7 @@ jobs:
 
           $archives = @(Get-ChildItem -LiteralPath $candidateRoot -Filter '*.zip' -File)
           if ($archives.Count -ne 1 -or
-              $archives[0].Name -ne 'coremail-controller-0.7.1-windows.zip') {
+              $archives[0].Name -ne 'coremail-controller-0.8.0-windows.zip') {
             throw 'Expected exactly the versioned gated ZIP.'
           }
           $archive = $archives[0]

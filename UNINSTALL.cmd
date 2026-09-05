@@ -17,7 +17,7 @@ set "UNINSTALL_EXIT=%ERRORLEVEL%"
 
 echo.
 if "%UNINSTALL_EXIT%"=="0" (
-  echo Coremail Controller was disabled successfully.
+  echo Coremail Controller was removed from Claude user scope successfully.
 ) else (
   echo Uninstall stopped with exit code %UNINSTALL_EXIT%.
   if exist "%COREMAIL_LAUNCH_LOG%" powershell.exe -NoLogo -NoProfile -Command "Get-Content -LiteralPath $env:COREMAIL_LAUNCH_LOG -Tail 40"

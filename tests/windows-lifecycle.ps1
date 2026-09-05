@@ -75,6 +75,7 @@ if (-not [string]::IsNullOrWhiteSpace($localAppData)) { $env:LOCALAPPDATA = $loc
 
 $claudeRoot = Join-Path $userProfile '.claude'
 $targetRoot = Join-Path $claudeRoot 'skills\coremail-controller'
+$claudeUserConfigPath = Join-Path $claudeRoot '.claude.json'
 $configDirectory = Join-Path $appData 'ClaudeCode\Coremail'
 $configPath = Join-Path $configDirectory 'config.json'
 $installer = Join-Path $PluginRoot 'scripts\install.ps1'
@@ -148,37 +149,51 @@ function Assert-ConfigUnchanged {
     }
 }
 
-function Assert-ExactClaudePlugin {
-    param([ValidateSet('enabled', 'disabled')][string]$State)
-    $inventory = Join-Path $RunnerTemp (
-        'inventory-' + $State + '-' + [guid]::NewGuid().ToString('N') + '.json'
-    )
-    Invoke-ExactClaude -Arguments @('plugin', 'list', '--json') -CapturePath $inventory
-    & $PythonCommand -B -I (Join-Path $targetRoot 'scripts\verify-claude-plugin-list.py') `
-        $inventory `
-        --plugin-id 'coremail-controller@skills-dir' `
-        --version '0.7.1' `
-        --expected-path $targetRoot `
-        --state $State
-    if ($LASTEXITCODE -ne 0) { throw "Claude plugin state verification failed: $State" }
+function Assert-UserMcpRegistered {
+    $registrar = Join-Path $targetRoot 'scripts\register_claude_user_mcp.py'
+    & $PythonCommand -B -I $registrar verify `
+        --server-name 'coremail-controller' `
+        --user-config $claudeUserConfigPath `
+        --powershell-executable $windowsPowerShell `
+        --server-script (Join-Path $targetRoot 'mcp\run-server.ps1')
+    $verifyExitCode = $LASTEXITCODE
+    if ($verifyExitCode -ne 0) {
+        throw "Claude user-scope MCP verification failed with exit code $verifyExitCode."
+    }
 }
 
-function Get-ClaudePluginSettingsOverride {
-    $settingsPayload = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
-    $enabledPluginsProperty = $settingsPayload.PSObject.Properties['enabledPlugins']
-    if ($null -eq $enabledPluginsProperty -or $null -eq $enabledPluginsProperty.Value) {
-        return [pscustomobject]@{ Present = $false; Value = $null }
+function Assert-UserMcpAbsent {
+    if (-not (Test-Path -LiteralPath $claudeUserConfigPath -PathType Leaf)) {
+        return
     }
-    $pluginProperty = $enabledPluginsProperty.Value.PSObject.Properties[
-        'coremail-controller@skills-dir'
-    ]
-    if ($null -eq $pluginProperty) {
-        return [pscustomobject]@{ Present = $false; Value = $null }
+    try { $payload = Get-Content -LiteralPath $claudeUserConfigPath -Raw | ConvertFrom-Json }
+    catch { throw "Claude user configuration is not valid JSON: $($_.Exception.Message)" }
+    if ($null -eq $payload -or $payload -isnot [psobject]) {
+        throw 'Claude user configuration root is not an object.'
     }
-    if ($pluginProperty.Value -isnot [bool]) {
-        throw 'Claude settings contain a non-boolean Coremail plugin override.'
+    $serversProperty = $payload.PSObject.Properties['mcpServers']
+    if ($null -eq $serversProperty -or $null -eq $serversProperty.Value) {
+        return
     }
-    return [pscustomobject]@{ Present = $true; Value = [bool]$pluginProperty.Value }
+    if ($serversProperty.Value -isnot [psobject]) {
+        throw 'Claude user configuration mcpServers is not an object.'
+    }
+    $entry = $serversProperty.Value.PSObject.Properties['coremail-controller']
+    if ($null -ne $entry) {
+        throw 'Claude user-scope Coremail MCP entry is still present.'
+    }
+}
+
+function Assert-UserConfigCustomSetting {
+    if (-not (Test-Path -LiteralPath $claudeUserConfigPath -PathType Leaf)) {
+        throw "Claude user configuration was unexpectedly removed: $claudeUserConfigPath"
+    }
+    try { $payload = Get-Content -LiteralPath $claudeUserConfigPath -Raw | ConvertFrom-Json }
+    catch { throw "Claude user configuration is not valid JSON: $($_.Exception.Message)" }
+    $property = $payload.PSObject.Properties['customSetting']
+    if ($null -eq $property -or [string]$property.Value -ne 'preserve-me') {
+        throw 'Unrelated Claude user configuration was not preserved.'
+    }
 }
 
 Write-Host "[gate 1/11][$ScenarioName] Parsing all packaged PowerShell and compiling Credential Manager helper"
@@ -202,14 +217,14 @@ $credentialMatch = [regex]::Match($credentialText, $credentialPattern)
 if (-not $credentialMatch.Success) { throw 'Unable to extract the credential helper C# source.' }
 Add-Type -TypeDefinition $credentialMatch.Groups['source'].Value -Language CSharp | Out-Null
 
-Write-Host "[gate 2/11][$ScenarioName] Verifying package integrity, metadata, direct MCP, and real Claude validation"
+Write-Host "[gate 2/11][$ScenarioName] Verifying package integrity, MCP capability, and real Claude user-scope registration"
 & $PythonCommand -B -I (Join-Path $PluginRoot 'scripts\verify-release.py') `
     $PluginRoot --require-windows-gate
 if ($LASTEXITCODE -ne 0) { throw 'Packaged internal integrity verification failed.' }
 & (Join-Path $PluginRoot 'tests\smoke-mcp.ps1') `
     -IgnoreAccountConfiguration -PythonExecutable $PythonCommand
 Invoke-ExactClaude -Arguments @('--version')
-Invoke-ExactClaude -Arguments @('plugin', 'validate', $PluginRoot, '--strict')
+Invoke-ExactClaude -Arguments @('mcp', '--help')
 if ($ScenarioName -eq 'npm') {
     $legacyResolverRoot = Join-Path $RunnerTemp 'legacy-node-backed-npm'
     $legacyPackageRoot = Join-Path $legacyResolverRoot 'node_modules\@anthropic-ai\claude-code'
@@ -278,7 +293,7 @@ if ($corruptVerifierText -notmatch 'size mismatch: README\.md') {
 }
 Write-Host 'Corrupted package was rejected for the injected README.md size mismatch.'
 
-Write-Host "[gate 3/11][$ScenarioName] Creating non-secret config and a previously-disabled Claude state"
+Write-Host "[gate 3/11][$ScenarioName] Creating non-secret mailbox and unrelated Claude user configuration"
 New-Item -ItemType Directory -Path $configDirectory -Force | Out-Null
 $fixture = [ordered]@{
     transport = 'windows_simple_mapi'
@@ -290,14 +305,13 @@ $fixture = [ordered]@{
 [IO.File]::WriteAllText($configPath, ($fixture | ConvertTo-Json -Depth 8), $utf8)
 $fixtureHash = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
 New-Item -ItemType Directory -Path $claudeRoot -Force | Out-Null
-$initialSettings = [ordered]@{ enabledPlugins = [ordered]@{ 'coremail-controller@skills-dir' = $false } }
-$settingsPath = Join-Path $claudeRoot 'settings.json'
-[IO.File]::WriteAllText($settingsPath, ($initialSettings | ConvertTo-Json -Depth 8), $utf8)
-$settingsHashBeforeCustomRoot = (Get-FileHash -LiteralPath $settingsPath -Algorithm SHA256).Hash
-$env:CLAUDE_CONFIG_DIR = Join-Path $RunnerTemp 'unsupported-custom-claude-root'
+$initialUserConfig = [ordered]@{ customSetting = 'preserve-me' }
+[IO.File]::WriteAllText($claudeUserConfigPath, ($initialUserConfig | ConvertTo-Json -Depth 8), $utf8)
+$userConfigHashBeforeCustomRoot = (Get-FileHash -LiteralPath $claudeUserConfigPath -Algorithm SHA256).Hash
+$env:CLAUDE_CONFIG_DIR = 'relative-custom-claude-root'
 try {
     Invoke-WindowsPowerShellScript -ScriptPath $installer -ExpectFailure `
-        -ExpectedText 'default per-user Claude directory' `
+        -ExpectedText 'local absolute path; relative paths are not supported' `
         -ScriptArguments @(
             '-SkipConnectionCheck',
             '-PythonExecutable', $PythonCommand,
@@ -307,20 +321,21 @@ try {
 }
 finally { Remove-Item Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue }
 if ((Test-Path -LiteralPath $targetRoot) -or
-    (Get-FileHash -LiteralPath $settingsPath -Algorithm SHA256).Hash -ne $settingsHashBeforeCustomRoot) {
-    throw 'Rejected custom Claude root changed plugin or settings state.'
+    (Get-FileHash -LiteralPath $claudeUserConfigPath -Algorithm SHA256).Hash -ne $userConfigHashBeforeCustomRoot) {
+    throw 'Rejected custom Claude root changed package or user configuration state.'
 }
 Assert-ConfigUnchanged -ExpectedHash $fixtureHash
 
-Write-Host "[gate 4/11][$ScenarioName] Installing as a standard user and proving Claude re-enablement"
+Write-Host "[gate 4/11][$ScenarioName] Installing as a standard user and proving direct user-scope registration"
 Invoke-WindowsPowerShellScript -ScriptPath $installer -ScriptArguments @(
     '-SkipConnectionCheck',
     '-PythonExecutable', $PythonCommand,
     '-ClaudeCommand', $ClaudeCommand,
     '-LogPath', $installLog
 )
-if (-not (Test-Path -LiteralPath (Join-Path $targetRoot '.claude-plugin\plugin.json') -PathType Leaf)) {
-    throw "Installer did not activate the plugin: $targetRoot"
+if (-not (Test-Path -LiteralPath (Join-Path $targetRoot '.claude-plugin\plugin.json') -PathType Leaf) -or
+    -not (Test-Path -LiteralPath (Join-Path $targetRoot 'SKILL.md') -PathType Leaf)) {
+    throw "Installer did not activate the Coremail package and user skill: $targetRoot"
 }
 Assert-ConfigUnchanged -ExpectedHash $fixtureHash
 $runtime = Get-Content -LiteralPath (Join-Path $targetRoot 'mcp\python-runtime.json') -Raw |
@@ -329,11 +344,8 @@ if ([string]$runtime.executable_sha256 -ine
     (Get-FileHash -LiteralPath $PythonCommand -Algorithm SHA256).Hash) {
     throw 'Installed Python runtime is not pinned to the selected executable hash.'
 }
-$pluginOverride = Get-ClaudePluginSettingsOverride
-if ($pluginOverride.Present -and -not $pluginOverride.Value) {
-    throw 'Installer did not reverse the persisted disabled state.'
-}
-Assert-ExactClaudePlugin -State enabled
+Assert-UserMcpRegistered
+Assert-UserConfigCustomSetting
 & (Join-Path $targetRoot 'tests\smoke-mcp.ps1')
 if ((Get-Content -LiteralPath $installLog -Raw) -notmatch 'INSTALLATION COMMITTED') {
     throw 'Persistent install log does not contain the commit marker.'
@@ -351,13 +363,14 @@ $recognizedBackups = @(Get-ChildItem -LiteralPath $backupDirectory -Directory -E
     Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName '.claude-plugin\plugin.json') -PathType Leaf })
 if ($recognizedBackups.Count -lt 1) { throw 'Reinstallation did not preserve a previous-plugin backup.' }
 Assert-ConfigUnchanged -ExpectedHash $fixtureHash
-Assert-ExactClaudePlugin -State enabled
+Assert-UserMcpRegistered
+Assert-UserConfigCustomSetting
 
 Write-Host "[gate 6/11][$ScenarioName] Rejecting a concurrent lifecycle without mutation"
 $lockPath = Join-Path $claudeRoot 'coremail-controller.lifecycle.lock'
 $lockStream = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
 $targetHashBeforeLock = (Get-FileHash -LiteralPath (Join-Path $targetRoot '.claude-plugin\plugin.json') -Algorithm SHA256).Hash
-$settingsHashBeforeLock = (Get-FileHash -LiteralPath $settingsPath -Algorithm SHA256).Hash
+$userConfigHashBeforeLock = (Get-FileHash -LiteralPath $claudeUserConfigPath -Algorithm SHA256).Hash
 try {
     Invoke-WindowsPowerShellScript -ScriptPath $installer -ExpectFailure `
         -ExpectedText 'Another Coremail Controller install, upgrade, or uninstall is already running' `
@@ -370,8 +383,8 @@ try {
 }
 finally { $lockStream.Dispose() }
 if ((Get-FileHash -LiteralPath (Join-Path $targetRoot '.claude-plugin\plugin.json') -Algorithm SHA256).Hash -ne $targetHashBeforeLock -or
-    (Get-FileHash -LiteralPath $settingsPath -Algorithm SHA256).Hash -ne $settingsHashBeforeLock) {
-    throw 'Lock contention changed plugin or Claude settings state.'
+    (Get-FileHash -LiteralPath $claudeUserConfigPath -Algorithm SHA256).Hash -ne $userConfigHashBeforeLock) {
+    throw 'Lock contention changed package or Claude user configuration state.'
 }
 
 Write-Host "[gate 7/11][$ScenarioName] Rolling back a credential/config fault exactly"
@@ -486,7 +499,7 @@ if ($moveLogText -notmatch 'DIRECTORY MOVE RETRY' -or $moveLogText -notmatch 'DI
     throw 'ACL retry evidence is missing from the persistent log.'
 }
 
-Write-Host "[gate 9/11][$ScenarioName] Recovering a legacy ACL, then reversibly uninstalling through real Claude"
+Write-Host "[gate 9/11][$ScenarioName] Recovering a legacy ACL, then reversibly removing the user MCP through real Claude"
 $legacyManifestPath = Join-Path $targetRoot '.claude-plugin\plugin.json'
 $originalTargetAcl = Get-Acl -LiteralPath $targetRoot
 $originalTargetSddl = $originalTargetAcl.GetSecurityDescriptorSddlForm('All')
@@ -516,7 +529,7 @@ foreach ($principalSid in @(
     [void]$restrictedTargetAcl.AddAccessRule($fullControlRule)
 }
 
-$settingsHashBeforeLegacyDenial = (Get-FileHash -LiteralPath $settingsPath -Algorithm SHA256).Hash
+$userConfigHashBeforeLegacyDenial = (Get-FileHash -LiteralPath $claudeUserConfigPath -Algorithm SHA256).Hash
 try {
     Set-Acl -LiteralPath $targetRoot -AclObject $restrictedTargetAcl
     $legacyReadDenied = $false
@@ -536,13 +549,13 @@ try {
             '-NoLegacyPermissionRepair',
             '-ClaudeCommand', $ClaudeCommand,
             '-LogPath', (Join-Path $RunnerTemp "LEGACY-ACL-DISABLED-$ScenarioName.log")
-        )
+    )
     if (-not (Test-Path -LiteralPath $targetRoot -PathType Container)) {
-        throw 'Disabled legacy ACL repair moved the active plugin.'
+        throw 'Disabled legacy ACL repair moved the active Coremail package.'
     }
-    if ((Get-FileHash -LiteralPath $settingsPath -Algorithm SHA256).Hash -ne
-        $settingsHashBeforeLegacyDenial) {
-        throw 'Disabled legacy ACL repair changed Claude plugin state.'
+    if ((Get-FileHash -LiteralPath $claudeUserConfigPath -Algorithm SHA256).Hash -ne
+        $userConfigHashBeforeLegacyDenial) {
+        throw 'Disabled legacy ACL repair changed Claude user MCP state.'
     }
 
     $env:COREMAIL_GATE_PERMISSION_REPAIR_REQUEST = $PermissionRepairRequestPath
@@ -562,16 +575,14 @@ finally {
         Set-Acl -LiteralPath $targetRoot -AclObject $restoreTargetAcl -ErrorAction SilentlyContinue
     }
 }
-if (Test-Path -LiteralPath $targetRoot) { throw 'Uninstaller left the active plugin directory in place.' }
+if (Test-Path -LiteralPath $targetRoot) { throw 'Uninstaller left the active Coremail package in place.' }
 if (-not (Test-Path -LiteralPath $PermissionRepairRequestPath -PathType Leaf) -or
     -not (Test-Path -LiteralPath $PermissionRepairCompletePath -PathType Leaf)) {
     throw 'The administrator permission-repair handshake markers are incomplete.'
 }
 Assert-ConfigUnchanged -ExpectedHash $fixtureHash
-$pluginOverride = Get-ClaudePluginSettingsOverride
-if (-not $pluginOverride.Present -or $pluginOverride.Value -ne $false) {
-    throw 'Uninstaller did not persist the disabled plugin state.'
-}
+Assert-UserMcpAbsent
+Assert-UserConfigCustomSetting
 if ((Get-Content -LiteralPath $uninstallLog -Raw) -notmatch 'UNINSTALL COMMITTED') {
     throw 'Persistent uninstall log does not contain the commit marker.'
 }
@@ -581,7 +592,7 @@ if ($uninstallLogText -notmatch 'LEGACY ACL REPAIR REQUESTED' -or
     throw 'Legacy ACL recovery evidence is missing from the uninstall log.'
 }
 
-Write-Host "[gate 10/11][$ScenarioName] Reinstalling after disable and proving re-enable again"
+Write-Host "[gate 10/11][$ScenarioName] Reinstalling after removal and proving registration again"
 Invoke-WindowsPowerShellScript -ScriptPath $installer -ScriptArguments @(
     '-SkipConnectionCheck',
     '-PythonExecutable', $PythonCommand,
@@ -589,7 +600,8 @@ Invoke-WindowsPowerShellScript -ScriptPath $installer -ScriptArguments @(
     '-LogPath', (Join-Path $RunnerTemp "FINAL-INSTALL-$ScenarioName.log")
 )
 Assert-ConfigUnchanged -ExpectedHash $fixtureHash
-Assert-ExactClaudePlugin -State enabled
+Assert-UserMcpRegistered
+Assert-UserConfigCustomSetting
 
 Write-Host "[gate 11/11][$ScenarioName] Repeating clean removal and preservation"
 $installedUninstaller = Join-Path $targetRoot 'scripts\uninstall.ps1'
@@ -597,15 +609,17 @@ Invoke-WindowsPowerShellScript -ScriptPath $installedUninstaller -ScriptArgument
     '-ClaudeCommand', $ClaudeCommand,
     '-LogPath', (Join-Path $RunnerTemp "FINAL-UNINSTALL-$ScenarioName.log")
 )
-if (Test-Path -LiteralPath $targetRoot) { throw 'The final uninstall left an active plugin directory.' }
+if (Test-Path -LiteralPath $targetRoot) { throw 'The final uninstall left an active Coremail package directory.' }
 Assert-ConfigUnchanged -ExpectedHash $fixtureHash
+Assert-UserMcpAbsent
+Assert-UserConfigCustomSetting
 $missingClaude = Join-Path $RunnerTemp 'intentionally-absent-claude.exe'
 Invoke-WindowsPowerShellScript -ScriptPath $uninstaller -ScriptArguments @(
     '-ClaudeCommand', $missingClaude,
     '-LogPath', (Join-Path $RunnerTemp "IDEMPOTENT-UNINSTALL-$ScenarioName.log")
 )
 if (Test-Path -LiteralPath $targetRoot) {
-    throw 'Idempotent uninstall unexpectedly recreated the active plugin directory.'
+    throw 'Idempotent uninstall unexpectedly recreated the active Coremail package directory.'
 }
 
 Write-Host "Windows PowerShell 5.1 packaged lifecycle gate passed: $ScenarioName" -ForegroundColor Green

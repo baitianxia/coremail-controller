@@ -56,7 +56,7 @@ if ([string]$sourceManifest.name -ne 'coremail-controller' -or
     [string]::IsNullOrWhiteSpace([string]$sourceManifest.version)) {
     throw 'The packaged plugin manifest has an unexpected identity.'
 }
-$expectedPluginVersion = [string]$sourceManifest.version
+$expectedPackageVersion = [string]$sourceManifest.version
 
 $suffix = [guid]::NewGuid().ToString('N')
 $userName = 'cmgate' + $suffix.Substring(0, 10)
@@ -75,7 +75,7 @@ $stderrPath = Join-Path $gateRoot 'stderr.log'
 $permissionRepairRequest = Join-Path $standardTemp 'legacy-permission-request.marker'
 $permissionRepairComplete = Join-Path $standardTemp 'legacy-permission-complete.marker'
 $expectedUserProfile = Join-Path (Join-Path $env:SystemDrive 'Users') $userName
-$expectedPluginTarget = Join-Path $expectedUserProfile '.claude\skills\coremail-controller'
+$expectedPackageTarget = Join-Path $expectedUserProfile '.claude\skills\coremail-controller'
 $stagedClaudeCommand = $null
 $userCreated = $false
 $process = $null
@@ -115,7 +115,7 @@ function Complete-CoremailGatePermissionRepair {
         ConvertFrom-Json
     if ([string]$manifest.name -ne 'coremail-controller' -or
         [string]$manifest.version -ne $ExpectedVersion) {
-        throw 'The inaccessible gate target has an unexpected plugin identity.'
+        throw 'The inaccessible gate target has an unexpected Coremail package identity.'
     }
     if (Test-Path -LiteralPath $CompletePath) {
         throw 'The gate permission repair completion marker already exists.'
@@ -256,9 +256,9 @@ try {
                 Complete-CoremailGatePermissionRepair `
                     -RequestPath $permissionRepairRequest `
                     -CompletePath $permissionRepairComplete `
-                    -ExpectedTarget $expectedPluginTarget `
+                    -ExpectedTarget $expectedPackageTarget `
                     -ExpectedSid $localUser.SID `
-                    -ExpectedVersion $expectedPluginVersion `
+                    -ExpectedVersion $expectedPackageVersion `
                     -DiagnosticRoot $standardTemp
                 $permissionRepairHandled = $true
             }

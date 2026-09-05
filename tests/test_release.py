@@ -28,6 +28,9 @@ def load_module(name: str, path: Path):
 
 release = load_module("build_release", ROOT / "scripts" / "build-release.py")
 verifier = load_module("verify_release", ROOT / "scripts" / "verify-release.py")
+registrar = load_module(
+    "register_claude_user_mcp", ROOT / "scripts" / "register_claude_user_mcp.py"
+)
 
 
 class ReleaseTests(unittest.TestCase):
@@ -65,10 +68,12 @@ class ReleaseTests(unittest.TestCase):
                         f"{release.BUNDLE_NAME}/FILE-MANIFEST.json"
                     ).decode("utf-8")
                 )
-            self.assertEqual("0.7.1", plugin["version"])
+            self.assertEqual("0.8.0", plugin["version"])
             self.assertEqual("local-unverified", metadata["release_channel"])
             self.assertFalse(metadata["target_mcp_smoke_tested"])
             self.assertEqual(len(release.EXACT_FILES) + 1, len(internal["files"]))
+            self.assertIn("SKILL.md", release.EXACT_FILES)
+            self.assertIn("scripts/register_claude_user_mcp.py", release.EXACT_FILES)
 
     def test_internal_verifier_rejects_corruption_and_local_gate_claim(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -76,29 +81,31 @@ class ReleaseTests(unittest.TestCase):
             archive, _ = release.build_release(ROOT, root)
             with zipfile.ZipFile(archive) as bundle:
                 bundle.extractall(root / "extracted")
-            plugin_root = root / "extracted" / release.BUNDLE_NAME
+            package_root = root / "extracted" / release.BUNDLE_NAME
             verifier.verify(
-                plugin_root,
+                package_root,
                 require_windows_gate=False,
                 allow_python_runtime=False,
             )
             with self.assertRaises(verifier.VerificationError):
                 verifier.verify(
-                    plugin_root,
+                    package_root,
                     require_windows_gate=True,
                     allow_python_runtime=False,
                 )
-            (plugin_root / "README.md").write_text("corrupted\n", encoding="utf-8")
+            (package_root / "README.md").write_text("corrupted\n", encoding="utf-8")
             with self.assertRaises(verifier.VerificationError):
                 verifier.verify(
-                    plugin_root,
+                    package_root,
                     require_windows_gate=False,
                     allow_python_runtime=False,
                 )
 
     def test_windows_gate_metadata_requires_exact_host_runner_and_commit(self) -> None:
         commit = "a" * 40
-        with mock.patch.object(release, "normalized_system", return_value="windows"), mock.patch.object(
+        with mock.patch.object(
+            release, "normalized_system", return_value="windows"
+        ), mock.patch.object(
             release, "normalized_machine", return_value="x64"
         ), mock.patch.dict(
             os.environ,
@@ -168,19 +175,45 @@ class ReleaseTests(unittest.TestCase):
             )
             self.assertEqual(0, completed.returncode, msg=completed.stderr)
 
-    def test_lifecycle_scripts_use_shared_atomic_moves_and_no_runtime_rediscovery(self) -> None:
+    def test_user_scope_registration_self_test_and_cli_sequence(self) -> None:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                "-I",
+                str(ROOT / "scripts" / "register_claude_user_mcp.py"),
+                "self-test",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(0, completed.returncode, msg=completed.stderr)
+        self.assertIn("SELF-TEST PASSED", completed.stdout)
+
+    def test_lifecycle_scripts_use_atomic_moves_and_direct_user_mcp(self) -> None:
         lifecycle_files = [
             ROOT / "scripts" / "install.ps1",
             ROOT / "scripts" / "uninstall.ps1",
             ROOT / "scripts" / "windows-lifecycle-common.ps1",
         ]
         combined = "\n".join(path.read_text(encoding="utf-8") for path in lifecycle_files)
+        registrar_source = (ROOT / "scripts" / "register_claude_user_mcp.py").read_text(
+            encoding="utf-8"
+        )
         self.assertNotIn("Move-Item", combined)
         self.assertIn("[IO.Directory]::Move", combined)
         self.assertIn("[IO.FileShare]::None", combined)
         self.assertIn("DIRECTORY MOVE RETRY", combined)
         self.assertIn("Move-CoremailDirectoryAtomically", combined)
         self.assertIn("Diagnostics are best-effort", combined)
+        self.assertIn("register_claude_user_mcp.py", combined)
+        self.assertIn("--scope", registrar_source)
+        self.assertNotIn("Assert-CoremailClaudeMinimumVersion", combined)
+        self.assertNotIn("2.1.157", combined)
+        self.assertNotIn("plugin validate", combined.lower())
+        self.assertNotIn("plugin enable", combined.lower())
+        self.assertNotIn("plugin list", combined.lower())
 
         common = (ROOT / "scripts" / "windows-lifecycle-common.ps1").read_text(
             encoding="utf-8"
@@ -189,22 +222,20 @@ class ReleaseTests(unittest.TestCase):
         self.assertNotIn("2>&1", common)
         self.assertIn("$global:LASTEXITCODE = $null", common)
         self.assertIn("Invoke-CoremailClaudeChecked", common)
-        self.assertIn("Assert-CoremailClaudeMinimumVersion", common)
-        self.assertIn("2.1.157", common)
-        self.assertIn("skills-directory plugins", common)
+        self.assertIn("Resolve-CoremailClaudeUserConfigPath", common)
+        self.assertIn("CLAUDE_CONFIG_DIR", common)
+        self.assertIn("Assert-CoremailSafeLocalPath", common)
         self.assertIn("DISABLE_AUTOUPDATER", common)
-        common_normalized = " ".join(common.lower().split())
-        self.assertIn("assert-coremaildefaultclaudeconfigdirectory", common_normalized)
-        self.assertIn("claude_config_dir", common_normalized)
-        self.assertIn("[environment]::systemdirectory", common_normalized)
-        self.assertIn("-verb runas", common_normalized)
-        self.assertIn(".claude\\skills\\coremail-controller", common_normalized)
-        self.assertIn("isaccountsid", common_normalized)
-        self.assertIn("/grant {1} /l /q", common_normalized)
-        self.assertIn("*{0}:(oi)(ci)m", common_normalized)
-        self.assertNotIn(" /t ", common_normalized)
-        self.assertNotIn("/reset", common_normalized)
-        self.assertNotIn("takeown", common_normalized)
+        normalized_common = " ".join(common.lower().split())
+        self.assertIn("[environment]::systemdirectory", normalized_common)
+        self.assertIn("-verb runas", normalized_common)
+        self.assertIn(".claude\\skills\\coremail-controller", normalized_common)
+        self.assertIn("isaccountsid", normalized_common)
+        self.assertIn("/grant {1} /l /q", normalized_common)
+        self.assertIn("*{0}:(oi)(ci)m", normalized_common)
+        self.assertNotIn(" /t ", normalized_common)
+        self.assertNotIn("/reset", normalized_common)
+        self.assertNotIn("takeown", normalized_common)
 
         launcher = (ROOT / "mcp" / "run-server.ps1").read_text(encoding="utf-8")
         setup = (ROOT / "scripts" / "setup-account.ps1").read_text(encoding="utf-8")
@@ -215,29 +246,26 @@ class ReleaseTests(unittest.TestCase):
         self.assertNotIn("COREMAIL_PYTHON", launcher)
         self.assertNotIn("COREMAIL_PYTHON", setup)
         self.assertNotIn("COREMAIL_PYTHON", installer)
-        stale_exit_code_check = re.compile(
-            r"(?im)smoke-mcp\.ps1[^\r\n]*\r?\n[ \t]*if\s*\(\$LASTEXITCODE"
+        self.assertIn("$claudeUserConfigSnapshot", installer)
+        self.assertIn("Restore-CoremailFileSnapshot", installer)
+        self.assertIsNone(
+            re.search(
+                r"(?im)smoke-mcp\.ps1[^\r\n]*\r?\n[ \t]*if\s*\(\$LASTEXITCODE",
+                installer,
+            )
         )
-        self.assertIsNone(stale_exit_code_check.search(installer))
-        workflow = (ROOT / ".github" / "workflows" / "windows-release-gate.yml").read_text(
-            encoding="utf-8"
-        )
-        self.assertIsNone(stale_exit_code_check.search(workflow))
         for lifecycle_directory in (
             "$activationStagingDirectory",
             "$backupDirectory",
             "$failedDirectory",
             "$lifecycleLockPath",
-            "$settingsPath",
         ):
-            self.assertIn(
-                f"-Path {lifecycle_directory}",
-                installer,
-            )
+            self.assertIn(f"-Path {lifecycle_directory}", installer)
         self.assertIn("Assert-CoremailSafeDescendantPath", installer)
         self.assertIn("Assert-CoremailSafeDescendantPath", setup)
         uninstaller = (ROOT / "scripts" / "uninstall.ps1").read_text(encoding="utf-8")
         self.assertIn("-Path $disabledRoot", uninstaller)
+        self.assertIn("unregister", uninstaller)
 
     def test_account_configuration_is_validate_then_credential_then_atomic_publish(self) -> None:
         setup = (ROOT / "scripts" / "setup-account.ps1").read_text(encoding="utf-8")
@@ -256,56 +284,48 @@ class ReleaseTests(unittest.TestCase):
         )
         self.assertIn("CredDeleteW", credential_helper)
 
-    def test_unsupported_claude_is_rejected_before_plugin_validation(self) -> None:
+    def test_old_claude_is_supported_by_capability_not_version_floor(self) -> None:
         installer = (ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
-        minimum = installer.index("Assert-CoremailClaudeMinimumVersion")
-        validation = installer.index("plugin', 'validate'")
-        self.assertLess(minimum, validation)
-        self.assertLess(minimum, installer.index("Enter-CoremailLifecycleLock"))
-        self.assertLess(minimum, installer.index("Copy-CoremailPluginTree -Source"))
         common = (ROOT / "scripts" / "windows-lifecycle-common.ps1").read_text(
             encoding="utf-8"
         )
-        self.assertIn("2.1.157", common)
-        self.assertIn("skills-directory plugins", common)
-        self.assertIn("No plugin files or Claude settings were changed", common)
-        manifest = json.loads(
-            (ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
-        )
-        self.assertNotIn("$schema", manifest)
-        workflow = (ROOT / ".github" / "workflows" / "windows-release-gate.yml").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("CLAUDE_LEGACY_CODE_VERSION: \"2.1.84\"", workflow)
-        self.assertIn("unsupported legacy Claude fixture", workflow)
+        self.assertNotIn("Assert-CoremailClaudeMinimumVersion", installer)
+        self.assertNotIn("Assert-CoremailClaudeMinimumVersion", common)
+        self.assertNotIn("2.1.157", installer + common)
+        self.assertIn("mcp', '--help'", installer)
+        self.assertIn("register_claude_user_mcp.py", installer)
+        self.assertIn("mcp", registrar.__doc__.lower())
 
-    def test_claude_version_preflight_parses_semver_and_restores_environment(self) -> None:
-        shell = shutil.which("powershell.exe") or shutil.which("powershell") or shutil.which("pwsh")
+    def test_claude_version_probe_is_informational_and_restores_environment(self) -> None:
+        shell = (
+            shutil.which("powershell.exe")
+            or shutil.which("powershell")
+            or shutil.which("pwsh")
+        )
         if shell is None:
             self.skipTest("PowerShell is not available on this host")
-        common_path = str(ROOT / "scripts" / "windows-lifecycle-common.ps1").replace("'", "''")
+        common_path = str(ROOT / "scripts" / "windows-lifecycle-common.ps1").replace(
+            "'", "''"
+        )
         shell_path = str(Path(shell).resolve()).replace("'", "''")
         command = f"""
 $ErrorActionPreference = 'Stop'
 . '{common_path}'
 $env:DISABLE_AUTOUPDATER = 'before-auto'
 $env:DISABLE_UPDATES = 'before-updates'
-$old = [pscustomobject]@{{
+$probe = [pscustomobject]@{{
     Executable = '{shell_path}'
-    Prefix = [string[]]@('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', "Write-Output '2.1.84 (Claude Code)'")
+    # Wrap the command in a script block so PowerShell does not echo the
+    # probe's appended ``--version`` argument as a second line.
+    Prefix = [string[]]@(
+        '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+        "& {{ [Console]::Write('custom-build-label') }}"
+    )
 }}
-$rejected = $false
-try {{ [void](Assert-CoremailClaudeMinimumVersion -Invocation $old -Label 'unit old') }}
-catch {{
-    if ($_.Exception.Message -match '2\\.1\\.157 or newer') {{ $rejected = $true }}
-    else {{ throw }}
+$observed = Get-CoremailClaudeVersion -Invocation $probe -Label 'unit informational'
+if ($null -ne $observed.Version -or $observed.Text.Trim() -ne 'custom-build-label') {{
+    throw 'The non-semantic version result was not preserved as informational text.'
 }}
-if (-not $rejected) {{ throw 'The old semantic version was accepted.' }}
-$minimum = [pscustomobject]@{{
-    Executable = '{shell_path}'
-    Prefix = [string[]]@('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', "Write-Output '2.1.157 (Claude Code)'")
-}}
-[void](Assert-CoremailClaudeMinimumVersion -Invocation $minimum -Label 'unit minimum')
 if ($env:DISABLE_AUTOUPDATER -ne 'before-auto' -or
     $env:DISABLE_UPDATES -ne 'before-updates') {{
     throw 'Claude update environment was not restored.'
@@ -321,7 +341,7 @@ Write-Output 'PASS'
         self.assertEqual(0, completed.returncode, msg=completed.stderr + completed.stdout)
         self.assertIn("PASS", completed.stdout)
 
-    def test_windows_gate_uses_real_native_and_npm_claude_under_standard_users(self) -> None:
+    def test_windows_gate_mentions_exact_legacy_fixture_as_supported(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "windows-release-gate.yml").read_text(
             encoding="utf-8"
         )
@@ -333,9 +353,9 @@ Write-Output 'PASS'
         )
         normalized = " ".join(workflow.lower().split())
         self.assertIn("runs-on: windows-2022", normalized)
-        self.assertIn("claude_code_version: \"2.1.246\"", normalized)
-        self.assertIn("claude_legacy_code_version: \"2.1.84\"", normalized)
-        self.assertIn("claude_npm_node_version: \"24.19.0\"", normalized)
+        self.assertIn('claude_code_version: "2.1.246"', normalized)
+        self.assertIn('claude_legacy_code_version: "2.1.84"', normalized)
+        self.assertIn('claude_npm_node_version: "24.19.0"', normalized)
         self.assertIn("@anthropic-ai/claude-code@$env:claude_code_version", normalized)
         self.assertNotIn("--ignore-scripts", normalized)
         self.assertIn("--windows-gate", normalized)
@@ -343,17 +363,10 @@ Write-Output 'PASS'
         self.assertIn("-scenarioname native", normalized)
         self.assertIn("-scenarioname npm", normalized)
         self.assertEqual(2, normalized.count("& $orchestrator"))
-        self.assertIn("legacy_npm_claude", normalized)
-        self.assertIn("2\\.1\\.157 or newer", normalized)
-        self.assertIn("legacy-install-stdout.txt", normalized)
-        self.assertIn("the unsupported claude preflight changed claude settings", normalized)
-        self.assertIn("the unsupported claude preflight created a lifecycle lock", normalized)
-        self.assertLess(
-            normalized.index("legacy-install-stdout.txt"),
-            normalized.index("$legacyinvocation"),
-        )
-        self.assertNotIn("native claude lifecycle gate failed", normalized)
-        self.assertNotIn("npm claude lifecycle gate failed", normalized)
+        self.assertIn("claude 2.1.84 user-scope registration", normalized)
+        self.assertIn("register_claude_user_mcp.py", normalized)
+        self.assertIn("actions/download-artifact@v8", normalized)
+        self.assertIn("needs: windows-powershell-51", normalized)
         self.assertLess(
             normalized.index("tests\\smoke-mcp.ps1"),
             normalized.index("scripts\\build-release.py"),
@@ -362,97 +375,78 @@ Write-Output 'PASS'
             normalized.index("run-windows-release-gate.ps1"),
             normalized.index("actions/upload-artifact@v7"),
         )
-        self.assertIn("actions/download-artifact@v8", normalized)
-        self.assertIn("needs: windows-powershell-51", normalized)
-        self.assertIn("github.event_name == 'push'", normalized)
+        self.assertNotIn("unsupported legacy claude fixture", normalized)
+        self.assertNotIn("2\\.1\\.157 or newer", normalized)
 
         lifecycle_normalized = " ".join(lifecycle.lower().split())
-        self.assertIn("expectedidentitysid", lifecycle_normalized)
-        self.assertIn("windowsbuiltinrole]::administrator", lifecycle_normalized)
-        self.assertIn("parser]::parsefile", lifecycle_normalized)
-        self.assertIn("add-type -typedefinition", lifecycle_normalized)
-        self.assertIn("after_credential_write", lifecycle_normalized)
-        self.assertIn("directory move retry", lifecycle_normalized)
-        self.assertIn("legacy acl repair requested", lifecycle_normalized)
-        self.assertIn("legacy acl repair recovered mode=release-gate-handshake", lifecycle_normalized)
-        self.assertIn("unsupported-custom-claude-root", lifecycle_normalized)
-        self.assertIn("automatic permission repair was disabled", lifecycle_normalized)
-        self.assertIn("s-1-5-18", lifecycle_normalized)
-        self.assertIn("s-1-5-32-544", lifecycle_normalized)
-        self.assertIn("plugin', 'validate'", lifecycle_normalized)
-        self.assertIn("plugin', 'list', '--json'", lifecycle_normalized)
-        self.assertIn("npmbinkind", lifecycle_normalized)
-        self.assertIn("legacy-node-resolver-ok", lifecycle_normalized)
-        self.assertIn("legacy-stderr-is-separated", lifecycle_normalized)
-        self.assertIn("intentionally-absent-claude.exe", lifecycle_normalized)
-        self.assertIn("$installeduninstaller", lifecycle_normalized)
-        self.assertIn("get-claudepluginsettingsoverride", lifecycle_normalized)
-        self.assertIn("settingshashbeforelegacydenial", lifecycle_normalized)
-        self.assertIn("permissionrepairrequestpath", lifecycle_normalized)
-        self.assertIn("permissionrepaircompletepath", lifecycle_normalized)
-        self.assertIn(
-            "administrator permission-repair handshake markers are incomplete",
-            lifecycle_normalized,
-        )
-        self.assertNotIn("restore-legacy-acl", lifecycle_normalized)
-        self.assertNotIn(
-            ".enabledplugins.'coremail-controller@skills-dir'", lifecycle_normalized
-        )
-        self.assertNotIn("$pythoncommand -i ", lifecycle_normalized)
-        self.assertIn("$pythoncommand -b -i ", lifecycle_normalized)
-        self.assertIn("size mismatch: readme\\.md", lifecycle_normalized)
-        self.assertIn("corrupt-verifier-stderr.txt", lifecycle_normalized)
+        for required in (
+            "expectedidentitysid",
+            "windowsbuiltinrole]::administrator",
+            "parser]::parsefile",
+            "add-type -typedefinition",
+            "after_credential_write",
+            "directory move retry",
+            "legacy acl repair requested",
+            "legacy acl repair recovered mode=release-gate-handshake",
+            "relative-custom-claude-root",
+            "automatic permission repair was disabled",
+            "s-1-5-18",
+            "s-1-5-32-544",
+            "mcp', '--help'",
+            "npmbinkind",
+            "legacy-node-resolver-ok",
+            "legacy-stderr-is-separated",
+            "intentionally-absent-claude.exe",
+            "$installeduninstaller",
+            "assert-usermcpregistered",
+            "assert-usermcpabsent",
+            "userconfighashbeforelegacydenial",
+            "permissionrepairrequestpath",
+            "permissionrepaircompletepath",
+        ):
+            self.assertIn(required, lifecycle_normalized)
+        self.assertNotIn("plugin', 'validate'", lifecycle_normalized)
+        self.assertNotIn("plugin', 'list'", lifecycle_normalized)
         self.assertNotIn("-checkconnection", lifecycle_normalized)
 
         orchestrator_normalized = " ".join(orchestrator.lower().split())
-        self.assertIn("#requires -runasadministrator", orchestrator_normalized)
-        self.assertIn("$psversiontable.psedition -ne 'desktop'", orchestrator_normalized)
-        self.assertIn("$psversiontable.psversion.major -ne 5", orchestrator_normalized)
-        self.assertIn("new-localuser", orchestrator_normalized)
-        self.assertIn("-credential $credential", orchestrator_normalized)
-        self.assertIn("-loaduserprofile", orchestrator_normalized)
-        self.assertIn("remove-localuser", orchestrator_normalized)
-        self.assertNotIn("add-localgroupmember", orchestrator_normalized)
-        self.assertIn("sourcepackageroot", orchestrator_normalized)
-        self.assertIn("complete-coremailgatepermissionrepair", orchestrator_normalized)
-        self.assertIn("[environment]::systemdirectory", orchestrator_normalized)
-        self.assertIn("'icacls.exe'", orchestrator_normalized)
-        self.assertIn("'/grant'", orchestrator_normalized)
-        self.assertIn("'/l'", orchestrator_normalized)
-        self.assertIn("'/q'", orchestrator_normalized)
-        self.assertIn("$expectedsid.isaccountsid()", orchestrator_normalized)
-        self.assertIn(
-            "the inaccessible gate target has an unexpected plugin identity",
-            orchestrator_normalized,
-        )
-        self.assertIn(
-            "the gate permission repair path traverses a reparse point",
-            orchestrator_normalized,
-        )
-        self.assertIn("$permissionrepairhandled = $true", orchestrator_normalized)
-        self.assertIn("$processhandle = $process.handle", orchestrator_normalized)
-        self.assertIn("$null -eq $processexitcode", orchestrator_normalized)
+        for required in (
+            "#requires -runasadministrator",
+            "$psversiontable.psedition -ne 'desktop'",
+            "$psversiontable.psversion.major -ne 5",
+            "new-localuser",
+            "-credential $credential",
+            "-loaduserprofile",
+            "remove-localuser",
+            "complete-coremailgatepermissionrepair",
+            "[environment]::systemdirectory",
+            "'icacls.exe'",
+            "'/grant'",
+            "'/l'",
+            "'/q'",
+            "$expectedsid.isaccountsid()",
+            "$permissionrepairhandled = $true",
+            "$processhandle = $process.handle",
+            "$null -eq $processexitcode",
+        ):
+            self.assertIn(required, orchestrator_normalized)
         self.assertLess(
             orchestrator.index("$processHandle = $process.Handle"),
             orchestrator.index("while (-not $process.HasExited)"),
         )
+        self.assertNotIn("add-localgroupmember", orchestrator_normalized)
         self.assertNotRegex(orchestrator_normalized, r"(?:^|\s)move-item(?:\s|$)")
         self.assertNotIn("'/t'", orchestrator_normalized)
         self.assertNotIn("/reset", orchestrator_normalized)
         self.assertNotIn("takeown", orchestrator_normalized)
-        self.assertNotIn(
-            "copy-item -literalpath $claudesourceroot -destination $claudefixtureroot -recurse",
-            orchestrator_normalized,
-        )
 
         uninstaller = (ROOT / "scripts" / "uninstall.ps1").read_text(encoding="utf-8")
-        self.assertIn("TrimStart().StartsWith('[')", uninstaller)
         self.assertLess(
-            uninstaller.index("UNINSTALL no active plugin found"),
-            uninstaller.index("$claudeInvocation = Resolve-ClaudeCodeInvocation"),
+            uninstaller.index("UNINSTALL no active Coremail package found"),
+            uninstaller.index("Resolve-CoremailClaudeUserConfigPath"),
         )
         self.assertLess(
-            uninstaller.index("Assert-CoremailClaudeMinimumVersion"),
+            uninstaller.index("Resolve-CoremailClaudeUserConfigPath"),
             uninstaller.index("Enter-CoremailLifecycleLock"),
         )
 

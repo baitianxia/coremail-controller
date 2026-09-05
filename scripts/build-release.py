@@ -14,7 +14,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.7.1"
+VERSION = "0.8.0"
 BUNDLE_NAME = f"coremail-controller-{VERSION}"
 LOCAL_ARCHIVE_NAME = f"{BUNDLE_NAME}-windows-UNVERIFIED.zip"
 GATED_ARCHIVE_NAME = f"{BUNDLE_NAME}-windows.zip"
@@ -32,6 +32,7 @@ EXACT_FILES = (
     "INSTALL.cmd",
     "LICENSE",
     "README.md",
+    "SKILL.md",
     "START-HERE.md",
     "UNINSTALL.cmd",
     "docs/architecture.md",
@@ -47,10 +48,10 @@ EXACT_FILES = (
     "scripts/build-release.py",
     "scripts/configure-account.ps1",
     "scripts/install.ps1",
+    "scripts/register_claude_user_mcp.py",
     "scripts/setup-account.ps1",
     "scripts/uninstall.ps1",
     "scripts/verify-release.py",
-    "scripts/verify-claude-plugin-list.py",
     "scripts/windows-credential.ps1",
     "scripts/windows-lifecycle-common.ps1",
     "scripts/windows-tool-discovery.ps1",
@@ -58,6 +59,7 @@ EXACT_FILES = (
     "skills/web-to-coremail/SKILL.md",
     "tests/smoke-mcp.ps1",
     "tests/run-windows-release-gate.ps1",
+    "tests/test_claude_mcp_registration.py",
     "tests/windows-lifecycle.ps1",
     "tests/test_backend.py",
     "tests/test_protocol.py",

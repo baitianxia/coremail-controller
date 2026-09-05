@@ -104,7 +104,7 @@ try {
         params = [ordered]@{
             protocolVersion = '2024-11-05'
             capabilities = [ordered]@{}
-            clientInfo = [ordered]@{ name = 'coremail-smoke-test'; version = '0.7.1' }
+            clientInfo = [ordered]@{ name = 'coremail-smoke-test'; version = '0.8.0' }
         }
     })))
     $process.StandardInput.Flush()

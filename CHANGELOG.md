@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 0.8.0 - 2026-09-05
+
+- Replace the Claude plugin inventory/enablement lifecycle with a transactional,
+  user-scoped `claude mcp remove → add → get` registration. The installer now works
+  with Claude Code 2.1.84 as well as current native and npm entry points and no longer
+  imposes a hard-coded Claude version floor.
+- Add a top-level `SKILL.md` at the installed skills root so older user-skill
+  discovery paths can expose natural-language Coremail tasks without plugin
+  inventory support.
+- Preserve and restore `%USERPROFILE%\.claude.json` byte-for-byte on registration,
+  removal, and lifecycle failures; validate the exact PowerShell launcher and server
+  script and reject link/reparse paths.
+- Update the Windows release gate to exercise real user-scope registration/removal,
+  including an isolated Claude Code 2.1.84 compatibility probe, while retaining the
+  standard-user ACL, rollback, and artifact-integrity checks.
+- Update the architecture, quick-start, isolation, and troubleshooting guidance to
+  describe the user-level MCP contract and natural-language workflow.
+
 ## 0.7.1 - 2026-09-05
 
 - Detect and reject Claude Code versions before 2.1.157 before plugin validation,

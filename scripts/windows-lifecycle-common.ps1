@@ -191,64 +191,122 @@ function Get-CoremailClaudeVersion {
         $versionText,
         '(?<![0-9])([0-9]+)\.([0-9]+)\.([0-9]+)(?![0-9])'
     )
-    if (-not $match.Success) {
-        throw (
-            "$Label did not report a semantic Claude Code version. " +
-            'The installed Claude executable cannot be validated safely.'
+    $version = $null
+    if ($match.Success) {
+        $versionTextValue = '{0}.{1}.{2}' -f @(
+            $match.Groups[1].Value,
+            $match.Groups[2].Value,
+            $match.Groups[3].Value
         )
+        $version = [Version]::Parse($versionTextValue)
+        Write-CoremailLifecycleLog "CLAUDE VERSION label=$Label; version=$version"
     }
-    $versionTextValue = '{0}.{1}.{2}' -f @(
-        $match.Groups[1].Value,
-        $match.Groups[2].Value,
-        $match.Groups[3].Value
-    )
-    $version = [Version]::Parse($versionTextValue)
-    Write-CoremailLifecycleLog "CLAUDE VERSION label=$Label; version=$version"
+    else {
+        # --version is a launch probe and diagnostic only.  A distribution that
+        # reports a non-semantic build label is still accepted when the actual
+        # user-scope MCP capability probe and registration transaction succeed.
+        Write-CoremailLifecycleLog "CLAUDE VERSION label=$Label; semantic-version=unavailable"
+    }
     return [pscustomobject]@{
         Version = $version
         Text = $versionText.Trim()
     }
 }
 
-function Assert-CoremailClaudeMinimumVersion {
+function Assert-CoremailSafeLocalPath {
+    <#
+      Validate a local-drive path and inspect every existing component for a
+      reparse point.  Claude's user MCP file may live in CLAUDE_CONFIG_DIR,
+      which is intentionally independent from the skills directory.  Keeping
+      this check here makes the custom-root support safe without weakening the
+      stricter profile-bound checks used for lifecycle directories.
+    #>
     param(
-        [Parameter(Mandatory = $true)][object]$Invocation,
-        [string]$MinimumVersion = '2.1.157',
-        [string]$Label = 'Claude Code version probe'
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$Label = 'managed path'
     )
 
-    try { $minimum = [Version]::Parse($MinimumVersion) }
-    catch { throw "The lifecycle minimum Claude Code version is invalid: $MinimumVersion" }
-    $observed = Get-CoremailClaudeVersion -Invocation $Invocation -Label $Label
-    if ($observed.Version -lt $minimum) {
-        throw (
-            "Claude Code $($observed.Version) is not supported by this release. " +
-            "Claude Code $minimum or newer is required for skills-directory plugins. " +
-            'Upgrade Claude Code with its official installer, then run INSTALL.cmd again. ' +
-            'No plugin files or Claude settings were changed.'
-        )
+    try { $candidate = [IO.Path]::GetFullPath($Path) }
+    catch { throw "$Label is not a valid absolute path: $Path" }
+    if ($candidate -notmatch '^[A-Za-z]:\\') {
+        throw "$Label must be an absolute local-drive Windows path: $candidate"
     }
-    return $observed
+    $root = [IO.Path]::GetPathRoot($candidate)
+    $cursor = $root
+    if (Test-Path -LiteralPath $cursor) {
+        try { $rootItem = Get-Item -LiteralPath $cursor -Force -ErrorAction Stop }
+        catch {
+            if (Test-CoremailAccessDeniedError -ErrorRecord $_) { throw }
+            throw "$Label could not be inspected: $cursor ($($_.Exception.Message))"
+        }
+        if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "$Label root is an unsupported link or junction: $cursor"
+        }
+    }
+    $relative = $candidate.Substring($root.Length)
+    foreach ($segment in @($relative -split '\\')) {
+        if ([string]::IsNullOrWhiteSpace($segment)) { continue }
+        $cursor = Join-Path $cursor $segment
+        if (-not (Test-Path -LiteralPath $cursor)) { continue }
+        try { $item = Get-Item -LiteralPath $cursor -Force -ErrorAction Stop }
+        catch {
+            if (Test-CoremailAccessDeniedError -ErrorRecord $_) { throw }
+            throw "$Label could not be inspected: $cursor ($($_.Exception.Message))"
+        }
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "$Label traverses an unsupported link or junction: $cursor"
+        }
+    }
+    return $candidate
 }
 
-function Assert-CoremailDefaultClaudeConfigDirectory {
+function Resolve-CoremailClaudeUserConfigPath {
+    <#
+      Claude stores user-scope MCP servers in <config-root>\.claude.json.
+      With no override, the root is the current user's profile.  Claude's
+      documented CLAUDE_CONFIG_DIR override is accepted when it is a local,
+      absolute path; relative, tilde, and UNC values fail before mutation.
+    #>
     param([Parameter(Mandatory = $true)][string]$UserProfile)
 
-    if ([string]::IsNullOrWhiteSpace([string]$env:CLAUDE_CONFIG_DIR)) { return }
-    $expected = [IO.Path]::GetFullPath((Join-Path $UserProfile '.claude')).TrimEnd('\')
-    $configured = $null
-    try { $configured = [IO.Path]::GetFullPath([string]$env:CLAUDE_CONFIG_DIR).TrimEnd('\') }
-    catch { throw 'CLAUDE_CONFIG_DIR must be unset or point to the default per-user .claude directory.' }
-    if (-not [string]::Equals(
-        $configured,
-        $expected,
-        [StringComparison]::OrdinalIgnoreCase
-    )) {
-        throw (
-            'This release installs only into the default per-user Claude directory. ' +
-            "Unset CLAUDE_CONFIG_DIR for this process or set it to: $expected"
-        )
+    try {
+        $profilePath = [IO.Path]::GetFullPath($UserProfile)
+        $profileRoot = [IO.Path]::GetPathRoot($profilePath)
+        if (-not [string]::Equals($profilePath, $profileRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            $profilePath = $profilePath.TrimEnd('\')
+        }
     }
+    catch { throw 'The current Windows user profile path is invalid.' }
+    if ($profilePath -notmatch '^[A-Za-z]:\\') {
+        throw 'Coremail Controller requires a local-drive Windows user profile.'
+    }
+    $configRoot = $profilePath
+    if (-not [string]::IsNullOrWhiteSpace([string]$env:CLAUDE_CONFIG_DIR)) {
+        $raw = [string]$env:CLAUDE_CONFIG_DIR
+        if ($raw.StartsWith('~') -or $raw.StartsWith('\\') -or
+            -not [IO.Path]::IsPathRooted($raw) -or
+            $raw -notmatch '^[A-Za-z]:[\\/]') {
+            throw 'CLAUDE_CONFIG_DIR must be a local absolute path; ~ and UNC paths are not supported.'
+        }
+        try {
+            $configRoot = [IO.Path]::GetFullPath($raw)
+            $configRootRoot = [IO.Path]::GetPathRoot($configRoot)
+            if (-not [string]::Equals($configRoot, $configRootRoot, [StringComparison]::OrdinalIgnoreCase)) {
+                $configRoot = $configRoot.TrimEnd('\')
+            }
+        }
+        catch { throw 'CLAUDE_CONFIG_DIR must be a local absolute path.' }
+        if ($configRoot -notmatch '^[A-Za-z]:\\') {
+            throw 'CLAUDE_CONFIG_DIR must be a local absolute path; relative paths are not supported.'
+        }
+    }
+    [void](Assert-CoremailSafeLocalPath -Path $configRoot -Label 'Claude configuration directory')
+    if (Test-Path -LiteralPath $configRoot -PathType Leaf) {
+        throw 'CLAUDE_CONFIG_DIR must name a directory, not an existing file.'
+    }
+    $configPath = Join-Path $configRoot '.claude.json'
+    [void](Assert-CoremailSafeLocalPath -Path $configPath -Label 'Claude user configuration')
+    return $configPath
 }
 
 function Save-CoremailFileSnapshot {
@@ -445,7 +503,11 @@ function Exit-CoremailLifecycleLock {
         try { $Stream.Dispose() }
         catch { Write-CoremailLifecycleLog "WARNING lifecycle lock release failed: $($_.Exception.Message)" }
     }
-    if (-not [string]::IsNullOrWhiteSpace($Path) -and
+    # Only the process that successfully acquired the exclusive stream may
+    # remove the lock path.  On contention, deleting a lock file in finally
+    # could invalidate another lifecycle process's coordination state.
+    if ($null -ne $Stream -and
+        -not [string]::IsNullOrWhiteSpace($Path) -and
         (Test-Path -LiteralPath $Path -PathType Leaf)) {
         try { [IO.File]::Delete([IO.Path]::GetFullPath($Path)) }
         catch { Write-CoremailLifecycleLog "WARNING lifecycle lock file cleanup failed: $($_.Exception.Message)" }
@@ -458,19 +520,39 @@ function Assert-CoremailSafeClaudePath {
         [Parameter(Mandatory = $true)][string]$Path
     )
 
-    $profilePath = [IO.Path]::GetFullPath($UserProfile).TrimEnd('\')
-    $candidatePath = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $profilePath = [IO.Path]::GetFullPath($UserProfile)
+    $profileRoot = [IO.Path]::GetPathRoot($profilePath)
+    if (-not [string]::Equals($profilePath, $profileRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        $profilePath = $profilePath.TrimEnd('\')
+    }
+    $candidatePath = [IO.Path]::GetFullPath($Path)
+    $candidateRoot = [IO.Path]::GetPathRoot($candidatePath)
+    if (-not [string]::Equals($candidatePath, $candidateRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        $candidatePath = $candidatePath.TrimEnd('\')
+    }
     if ($profilePath -notmatch '^[A-Za-z]:\\' -or
         $candidatePath -notmatch '^[A-Za-z]:\\') {
         throw 'Coremail Controller V1 requires a local-drive Windows user profile.'
     }
-    $prefix = $profilePath + '\'
-    if (-not $candidatePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+    $prefix = if ($profilePath.EndsWith('\')) { $profilePath } else { $profilePath + '\' }
+    if (-not [string]::Equals($candidatePath, $profilePath, [StringComparison]::OrdinalIgnoreCase) -and
+        -not $candidatePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Lifecycle path is outside the current Windows user profile: $candidatePath"
     }
 
-    $relative = $candidatePath.Substring($prefix.Length)
+    if ([string]::Equals($candidatePath, $profilePath, [StringComparison]::OrdinalIgnoreCase)) {
+        $relative = ''
+    }
+    else {
+        $relative = $candidatePath.Substring($prefix.Length)
+    }
     $cursor = $profilePath
+    if (Test-Path -LiteralPath $cursor) {
+        $profileItem = Get-Item -LiteralPath $cursor -Force -ErrorAction Stop
+        if (($profileItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Lifecycle path root is an unsupported link or junction: $cursor"
+        }
+    }
     foreach ($segment in @($relative -split '\\')) {
         if ([string]::IsNullOrWhiteSpace($segment)) { continue }
         $cursor = Join-Path $cursor $segment
@@ -490,9 +572,17 @@ function Assert-CoremailSafeDescendantPath {
         [string]$Label = 'managed path'
     )
 
-    $rootPath = [IO.Path]::GetFullPath($Root).TrimEnd('\')
-    $candidatePath = [IO.Path]::GetFullPath($Path).TrimEnd('\')
-    $prefix = $rootPath + '\'
+    $rootPath = [IO.Path]::GetFullPath($Root)
+    $rootPathRoot = [IO.Path]::GetPathRoot($rootPath)
+    if (-not [string]::Equals($rootPath, $rootPathRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        $rootPath = $rootPath.TrimEnd('\')
+    }
+    $candidatePath = [IO.Path]::GetFullPath($Path)
+    $candidatePathRoot = [IO.Path]::GetPathRoot($candidatePath)
+    if (-not [string]::Equals($candidatePath, $candidatePathRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        $candidatePath = $candidatePath.TrimEnd('\')
+    }
+    $prefix = if ($rootPath.EndsWith('\')) { $rootPath } else { $rootPath + '\' }
     if (-not $candidatePath.StartsWith(
         $prefix,
         [StringComparison]::OrdinalIgnoreCase

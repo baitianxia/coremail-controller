@@ -32,8 +32,8 @@ if ([string]::IsNullOrWhiteSpace($LogPath)) {
 }
 Initialize-CoremailLifecycleLog -Path $LogPath
 
-$pluginId = 'coremail-controller@skills-dir'
-$expectedVersion = '0.7.1'
+$mcpServerName = 'coremail-controller'
+$expectedVersion = '0.8.0'
 $lifecycleLockStream = $null
 $lifecycleLockPath = $null
 $activationStageRoot = $null
@@ -43,8 +43,9 @@ $backupRoot = $null
 $failedRoot = $null
 $targetContainsNewPlugin = $false
 $activationCommitted = $false
-$settingsSnapshot = $null
-$settingsMutationStarted = $false
+$claudeUserConfigPath = $null
+$claudeUserConfigSnapshot = $null
+$claudeUserConfigMutationStarted = $false
 $runtimeSnapshot = $null
 $runtimeMutationStarted = $false
 $preserveActivationStage = $false
@@ -82,7 +83,7 @@ function Test-ExistingPluginIdentity {
     param([Parameter(Mandatory = $true)][string]$Root)
     $version = Get-CoremailManifestVersion -Root $Root
     if ([string]::IsNullOrWhiteSpace($version)) {
-        throw "Refusing to replace a plugin without a version: $Root"
+        throw "Refusing to replace a Coremail package without a version: $Root"
     }
     return $version
 }
@@ -126,7 +127,7 @@ function Get-ExistingPluginVersionWithLegacyRepair {
             -Parent $SkillsRoot `
             -Name 'coremail-controller'
         if ([string]::IsNullOrWhiteSpace([string]$entry)) {
-            throw 'The legacy plugin directory disappeared during permission repair.'
+            throw 'The legacy Coremail package directory disappeared during permission repair.'
         }
         [void](Assert-CoremailSafeClaudePath -UserProfile $UserProfile -Path $Root)
         $version = Test-ExistingPluginIdentity -Root $Root
@@ -193,42 +194,80 @@ function Assert-CoremailRelease {
     Invoke-PinnedPython -Arguments $arguments -Label 'Coremail release verifier'
 }
 
-function Assert-ClaudePluginState {
+function Get-CoremailClaudePowerShellPath {
+    $path = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "The Windows PowerShell launcher is unavailable: $path"
+    }
+    return [IO.Path]::GetFullPath($path)
+}
+
+function Invoke-CoremailUserMcpRegistration {
     param(
-        [Parameter(Mandatory = $true)][ValidateSet('present', 'enabled', 'disabled')]
-        [string]$State,
+        [Parameter(Mandatory = $true)][ValidateSet('register', 'unregister')]
+        [string]$Operation,
         [Parameter(Mandatory = $true)][string]$Root,
-        [Parameter(Mandatory = $true)][string]$TemporaryDirectory
+        [Parameter(Mandatory = $true)][string]$UserConfig,
+        [Parameter(Mandatory = $true)][string]$BackupPath
     )
-    $inventoryPath = Join-Path $TemporaryDirectory (
-        'claude-plugin-list-' + [guid]::NewGuid().ToString('N') + '.json'
+
+    $registrar = Join-Path $Root 'scripts\register_claude_user_mcp.py'
+    if (-not (Test-Path -LiteralPath $registrar -PathType Leaf)) {
+        throw "The Coremail Claude MCP registrar is missing: $registrar"
+    }
+    $arguments = @(
+        '-B', '-I', $registrar, $Operation,
+        '--claude-executable', [string]$claudeInvocation.Executable,
+        '--server-name', $mcpServerName,
+        '--user-config', $UserConfig,
+        '--backup', $BackupPath
     )
-    Invoke-Claude `
-        -Arguments @('plugin', 'list', '--json') `
-        -CapturePath $inventoryPath `
-        -Label 'Claude plugin inventory'
-    $verifier = Join-Path $Root 'scripts\verify-claude-plugin-list.py'
-    Invoke-PinnedPython `
-        -Arguments @(
-            '-B', '-I', $verifier, $inventoryPath,
-            '--plugin-id', $pluginId,
-            '--version', $expectedVersion,
-            '--expected-path', $Root,
-            '--state', $State
-        ) `
-        -Label 'Claude plugin state verifier'
+    foreach ($prefix in @($claudeInvocation.Prefix)) {
+        $arguments += @('--claude-prefix', [string]$prefix)
+    }
+    if ($Operation -eq 'register') {
+        $arguments += @(
+            '--powershell-executable', (Get-CoremailClaudePowerShellPath),
+            '--server-script', (Join-Path $Root 'mcp\run-server.ps1')
+        )
+    }
+    $label = if ($Operation -eq 'register') {
+        'Claude user-scope MCP registration'
+    }
+    else {
+        'Claude user-scope MCP removal'
+    }
+    $autoUpdaterWasPresent = Test-Path -LiteralPath 'Env:DISABLE_AUTOUPDATER'
+    $updatesWerePresent = Test-Path -LiteralPath 'Env:DISABLE_UPDATES'
+    $previousAutoUpdater = [string]$env:DISABLE_AUTOUPDATER
+    $previousUpdates = [string]$env:DISABLE_UPDATES
+    try {
+        # The registrar launches Claude itself. Keep the same no-update policy
+        # around that child process as the direct capability probes.
+        $env:DISABLE_AUTOUPDATER = '1'
+        $env:DISABLE_UPDATES = '1'
+        Invoke-PinnedPython `
+            -Arguments $arguments `
+            -Label $label
+    }
+    finally {
+        if ($autoUpdaterWasPresent) { $env:DISABLE_AUTOUPDATER = $previousAutoUpdater }
+        else { Remove-Item Env:DISABLE_AUTOUPDATER -ErrorAction SilentlyContinue }
+        if ($updatesWerePresent) { $env:DISABLE_UPDATES = $previousUpdates }
+        else { Remove-Item Env:DISABLE_UPDATES -ErrorAction SilentlyContinue }
+    }
 }
 
 function Restore-ActivationTransaction {
     param([Parameter(Mandatory = $true)][string]$OriginalMessage)
 
     Write-CoremailLifecycleLog "ROLLBACK STARTED reason=$OriginalMessage"
-    if ($settingsMutationStarted -and $null -ne $settingsSnapshot) {
+    if ($claudeUserConfigMutationStarted -and $null -ne $claudeUserConfigSnapshot) {
         Restore-CoremailFileSnapshot `
-            -Destination ([string]$settingsSnapshot.Path) `
-            -WasPresent ([bool]$settingsSnapshot.WasPresent) `
-            -BackupPath ([string]$settingsSnapshot.BackupPath)
-        Write-CoremailLifecycleLog 'ROLLBACK restored Claude user settings'
+            -Destination ([string]$claudeUserConfigSnapshot.Path) `
+            -WasPresent ([bool]$claudeUserConfigSnapshot.WasPresent) `
+            -BackupPath ([string]$claudeUserConfigSnapshot.BackupPath)
+        Write-CoremailLifecycleLog 'ROLLBACK restored Claude user MCP configuration'
     }
     if ($runtimeMutationStarted -and $null -ne $runtimeSnapshot) {
         Restore-CoremailFileSnapshot `
@@ -249,7 +288,7 @@ function Restore-ActivationTransaction {
         Move-CoremailDirectoryAtomically `
             -Source $targetRoot `
             -Destination $failedRoot `
-            -OperationLabel 'Quarantining the uncommitted plugin'
+            -OperationLabel 'Quarantining the uncommitted Coremail package'
         $targetContainsNewPlugin = $false
         Write-CoremailLifecycleLog "ROLLBACK quarantined uncommitted plugin at $failedRoot"
     }
@@ -259,7 +298,7 @@ function Restore-ActivationTransaction {
         Move-CoremailDirectoryAtomically `
             -Source $backupRoot `
             -Destination $targetRoot `
-            -OperationLabel 'Restoring the previous plugin'
+            -OperationLabel 'Restoring the previous Coremail package'
         $backupRoot = $null
         Write-CoremailLifecycleLog 'ROLLBACK restored previous plugin'
     }
@@ -275,10 +314,10 @@ try {
     if ([string]::IsNullOrWhiteSpace($userProfile)) {
         throw 'The current Windows user profile directory could not be resolved.'
     }
-    Assert-CoremailDefaultClaudeConfigDirectory -UserProfile $userProfile
     $claudeRoot = Join-Path $userProfile '.claude'
     $skillsRoot = Join-Path $claudeRoot 'skills'
     $targetRoot = Join-Path $skillsRoot 'coremail-controller'
+    $claudeUserConfigPath = Resolve-CoremailClaudeUserConfigPath -UserProfile $userProfile
     $sourceCanonical = $sourceRoot.TrimEnd('\')
     $targetCanonical = [IO.Path]::GetFullPath($targetRoot).TrimEnd('\')
     $runningFromTarget = [string]::Equals(
@@ -321,21 +360,36 @@ try {
     if ($null -eq $claudeInvocation) {
         throw 'Claude Code was not found as a native per-user executable or a validated npm installation.'
     }
-    $claudeVersion = Assert-CoremailClaudeMinimumVersion `
-        -Invocation $claudeInvocation `
-        -Label 'Claude Code version probe'
-
+    # Verify the package and selected Python before asking Claude to inspect its
+    # MCP capabilities.  Some Claude releases initialize a user config while
+    # handling a first command; an invalid/local-unverified package must never
+    # reach that point.
     Assert-CoremailRelease -Root $sourceRoot -AllowPythonRuntime:$runningFromTarget
     $sourceVersion = Get-CoremailManifestVersion -Root $sourceRoot
     if ($sourceVersion -ne $expectedVersion) {
         throw "The package version is $sourceVersion; expected $expectedVersion."
     }
+    # A version string is informational only.  Capability, not a hard-coded
+    # release floor, determines whether this installation can proceed.
+    $claudeVersion = Get-CoremailClaudeVersion `
+        -Invocation $claudeInvocation `
+        -Label 'Claude Code version probe'
+    $claudeVersionDisplay = if ($null -ne $claudeVersion.Version) {
+        [string]$claudeVersion.Version
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace([string]$claudeVersion.Text)) {
+        [string]$claudeVersion.Text
+    }
+    else {
+        '<unreported>'
+    }
     Invoke-Claude `
-        -Arguments @('plugin', 'validate', $sourceRoot, '--strict') `
-        -Label 'Claude plugin validation'
-    Write-Host "Plugin version: $sourceVersion"
+        -Arguments @('mcp', '--help') `
+        -Label 'Claude MCP capability probe'
+
+    Write-Host "Coremail package version: $sourceVersion"
     Write-Host "Pinned Python: $($pythonRuntime.executable) ($($pythonRuntime.version), $($pythonRuntime.pointer_bits)-bit)"
-    Write-Host "Claude Code: $($claudeInvocation.CommandPath) ($($claudeInvocation.Kind), $($claudeVersion.Version))"
+    Write-Host "Claude Code: $($claudeInvocation.CommandPath) ($($claudeInvocation.Kind), $claudeVersionDisplay); user MCP config: $claudeUserConfigPath"
 
     Write-Step 2 'Acquiring the user lifecycle lock and staging under the Claude profile'
     $lifecycleLockPath = Join-Path $claudeRoot 'coremail-controller.lifecycle.lock'
@@ -349,7 +403,7 @@ try {
         -SkillsRoot $skillsRoot `
         -Root $targetRoot
     if ($runningFromTarget -and $null -eq $existingPluginVersion) {
-        throw 'INSTALL.cmd is running from the active path, but that plugin entry disappeared.'
+        throw 'INSTALL.cmd is running from the active path, but that Coremail package entry disappeared.'
     }
     $activationStagingDirectory = Join-Path $claudeRoot 'plugin-staging'
     [void](Assert-CoremailSafeClaudePath `
@@ -362,7 +416,7 @@ try {
     New-Item -ItemType Directory -Path $activationStageRoot | Out-Null
 
     if ($runningFromTarget) {
-        Write-Host 'INSTALL.cmd is running from the active plugin; the verified files will be retained.'
+        Write-Host 'INSTALL.cmd is running from the active Coremail package; the verified files will be retained.'
         Assert-CoremailRelease -Root $targetRoot -AllowPythonRuntime
         $runtimePath = Join-Path $targetRoot 'mcp\python-runtime.json'
         $runtimeSnapshot = Save-CoremailFileSnapshot `
@@ -387,12 +441,10 @@ try {
             -OutputPath (Join-Path $activationPlugin 'mcp\python-runtime.json')
         Assert-CoremailRelease -Root $activationPlugin -AllowPythonRuntime
         & (Join-Path $activationPlugin 'tests\smoke-mcp.ps1') -IgnoreAccountConfiguration
-        Invoke-Claude `
-            -Arguments @('plugin', 'validate', $activationPlugin, '--strict') `
-            -Label 'Staged Claude plugin validation'
+        Write-CoremailLifecycleLog 'STAGED Coremail package validated; Claude plugin validation is not required for user-scope MCP registration'
     }
 
-    Write-Step 3 'Publishing the plugin with recoverable same-volume directory moves'
+    Write-Step 3 'Publishing the Coremail package with recoverable same-volume directory moves'
     if (-not $runningFromTarget) {
         if ($null -ne $existingPluginVersion) {
             $previousVersion = $existingPluginVersion
@@ -408,7 +460,7 @@ try {
             Move-CoremailDirectoryAtomically `
                 -Source $targetRoot `
                 -Destination $backupRoot `
-                -OperationLabel 'Archiving the previous plugin' `
+                -OperationLabel 'Archiving the previous Coremail package' `
                 -AccessDeniedRepair {
                     Invoke-LegacyPermissionRepair -UserProfile $userProfile -Root $targetRoot
                     [void](Assert-CoremailSafeClaudePath -UserProfile $userProfile -Path $targetRoot)
@@ -417,13 +469,13 @@ try {
                         throw 'The plugin identity changed while legacy permissions were repaired.'
                     }
                 }
-            Write-Host "Previous plugin version $previousVersion preserved at: $backupRoot"
+            Write-Host "Previous Coremail package version $previousVersion preserved at: $backupRoot"
         }
         try {
             Move-CoremailDirectoryAtomically `
                 -Source $activationPlugin `
                 -Destination $targetRoot `
-                -OperationLabel 'Publishing the new plugin'
+                -OperationLabel 'Publishing the new Coremail package'
             $activationPlugin = $null
             $targetContainsNewPlugin = $true
         }
@@ -439,7 +491,7 @@ try {
                 Move-CoremailDirectoryAtomically `
                     -Source $backupRoot `
                     -Destination $targetRoot `
-                    -OperationLabel 'Restoring the previous plugin after publication failure'
+                    -OperationLabel 'Restoring the previous Coremail package after publication failure'
                 $backupRoot = $null
             }
             throw $publishError
@@ -448,25 +500,25 @@ try {
     Assert-CoremailRelease -Root $targetRoot -AllowPythonRuntime
     & (Join-Path $targetRoot 'tests\smoke-mcp.ps1') -IgnoreAccountConfiguration
 
-    Write-Step 4 'Enabling and verifying the exact plugin through Claude Code'
-    $settingsPath = Join-Path $claudeRoot 'settings.json'
-    [void](Assert-CoremailSafeClaudePath -UserProfile $userProfile -Path $settingsPath)
-    $settingsSnapshot = Save-CoremailFileSnapshot `
-        -Path $settingsPath `
+    Write-Step 4 'Registering and verifying the Coremail MCP in Claude user scope'
+    # Snapshot the exact user configuration before invoking Claude.  The
+    # Python registrar performs remove → add → get and its own rollback; this
+    # outer snapshot also covers a later directory-move failure.
+    $claudeUserConfigSnapshot = Save-CoremailFileSnapshot `
+        -Path $claudeUserConfigPath `
         -BackupDirectory $activationStageRoot `
-        -Label 'claude-settings'
-    $settingsMutationStarted = $true
-    Invoke-Claude `
-        -Arguments @('plugin', 'enable', $pluginId, '--scope', 'user') `
-        -Label 'Claude plugin enable'
-    Assert-ClaudePluginState `
-        -State enabled `
+        -Label 'claude-user-config'
+    $claudeUserConfigMutationStarted = $true
+    $registrationBackup = Join-Path $activationStageRoot 'claude-user-config-registrar.backup'
+    Invoke-CoremailUserMcpRegistration `
+        -Operation register `
         -Root $targetRoot `
-        -TemporaryDirectory $activationStageRoot
+        -UserConfig $claudeUserConfigPath `
+        -BackupPath $registrationBackup
     $activationCommitted = $true
-    $settingsMutationStarted = $false
+    $claudeUserConfigMutationStarted = $false
     $runtimeMutationStarted = $false
-    Write-Host "Claude Code loaded and enabled: $pluginId" -ForegroundColor Green
+    Write-Host "Claude Code user-scope MCP registered: $mcpServerName" -ForegroundColor Green
 
     Write-Step 5 'Preserving or configuring the mailbox account'
     $appData = [Environment]::GetFolderPath('ApplicationData')
@@ -512,8 +564,9 @@ try {
 Coremail Controller installation
 
 Version: $sourceVersion
-Plugin: $targetRoot
-Claude plugin id: $pluginId (enabled and listed)
+Package and user skill: $targetRoot
+Claude MCP server: $mcpServerName (user scope; registered and verified)
+Claude user MCP configuration: $claudeUserConfigPath
 Python: $($pythonRuntime.executable)
 Python SHA-256: $($pythonRuntime.executable_sha256)
 Configuration: $configPath
@@ -521,9 +574,10 @@ Live connection: $connectionText
 Previous plugin backup: $backupRoot
 Lifecycle log: $LogPath
 
-Restart Claude Code or run /reload-plugins.
-Use /coremail-controller:coremail for mailbox work.
-Use /coremail-controller:web-to-coremail for the isolated browser-to-email workflow.
+Restart Claude Code if it was already running, or run /reload-plugins when available.
+Describe the mailbox task in natural language. The installed user skill is named
+coremail-controller; `/coremail-controller` may also be available on Claude versions
+that expose user skills as slash commands.
 "@
     $utf8 = New-Object System.Text.UTF8Encoding($false)
     [IO.File]::WriteAllText($summaryPath, $summary, $utf8)
@@ -533,14 +587,14 @@ Use /coremail-controller:web-to-coremail for the isolated browser-to-email workf
     Write-Host 'Coremail Controller installation completed.' -ForegroundColor Green
     Write-Host "Installation summary: $summaryPath"
     Write-Host "Diagnostic log: $LogPath"
-    Write-Host 'Restart Claude Code or run /reload-plugins, then invoke /coremail-controller:coremail.'
+    Write-Host 'Restart Claude Code or run /reload-plugins, then describe the mailbox task in natural language.'
     exit 0
 }
 catch {
     $installError = $_
     Write-CoremailLifecycleFailure -ErrorRecord $installError -Context 'installation'
     if (-not $activationCommitted -and
-        ($settingsMutationStarted -or $runtimeMutationStarted -or $targetContainsNewPlugin -or $backupRoot)) {
+        ($claudeUserConfigMutationStarted -or $runtimeMutationStarted -or $targetContainsNewPlugin -or $backupRoot)) {
         try { Restore-ActivationTransaction -OriginalMessage $installError.Exception.Message }
         catch {
             $rollbackError = $_
@@ -557,10 +611,10 @@ catch {
     Write-Host ''
     Write-Host "Setup stopped safely: $($installError.Exception.Message)" -ForegroundColor Red
     if ($activationCommitted) {
-        Write-Host "The verified plugin remains installed at $targetRoot; mailbox setup may be incomplete."
+        Write-Host "The verified Coremail package remains installed at $targetRoot; mailbox setup may be incomplete."
     }
     elseif ($failedRoot) {
-        Write-Host "The rejected new plugin was preserved for diagnosis at: $failedRoot"
+        Write-Host "The rejected new Coremail package was preserved for diagnosis at: $failedRoot"
     }
     Write-Host "Diagnostic log: $LogPath"
     exit 1
