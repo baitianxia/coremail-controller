@@ -519,14 +519,13 @@ function Invoke-CoremailManualDirectoryMoveAssistance {
             )
         }
         catch {
+            $manualRetryHint = ' 可继续释放占用后再次按 R。'
+            if ($AllowVersionedFallback) {
+                $manualRetryHint = ' 可继续释放占用后再次按 R，或按 V 继续。'
+            }
             Write-Warning (
                 "$OperationLabel 仍未完成：$($_.Exception.Message)。" +
-                $(if ($AllowVersionedFallback) {
-                    ' 可继续释放占用后再次按 R，或按 V 继续。'
-                }
-                else {
-                    ' 可继续释放占用后再次按 R。'
-                })
+                $manualRetryHint
             )
         }
     }
