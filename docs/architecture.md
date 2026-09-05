@@ -228,17 +228,29 @@ restores the prior package and user MCP configuration, and quarantines an uncomm
 replacement for diagnosis.
 
 The only elevation exception is a withdrawn package whose exact active directory
-denies the current user. After identity, path, and reparse checks, the constrained
-compatibility path may request one UAC grant using the protected System32
-`icacls.exe`:
+cannot be inspected or renamed by the current user. After identity, path, and
+reparse checks,
+the constrained compatibility path may request one UAC approval. The approved
+helper runs the protected System32 `icacls.exe` against the current account SID
+and then performs the same-volume `Directory.Move` to the one generated quarantine
+directory (`plugin-backups` during upgrade or `plugins-disabled` during uninstall):
 
-- current account SID only;
-- inheritable `Modify` on exactly `%USERPROFILE%\.claude\skills\coremail-controller`;
-- `/L`, with no recursion, ACL reset, ownership transfer, group grant, or deletion.
+- the source is exactly `%USERPROFILE%\.claude\skills\coremail-controller`;
+- the manifest name and already-verified version are checked again in the elevated
+  process;
+- the grant is inheritable `Modify` on that exact source (`/L`, never `/T`);
+- no recursion, ACL reset, ownership transfer, arbitrary group grant, overwrite,
+  or deletion is possible.
 
-The ordinary user process then repeats all checks. `-NoLegacyPermissionRepair`
-disables this path. It is never used for the `.claude` root, custom config roots,
-staging, backups, account data, or arbitrary paths.
+This avoids relying on a medium-integrity user token to rename a directory whose
+parent, integrity label, or inherited policy still denies `DELETE_CHILD`. The
+ordinary process verifies the source/destination postcondition and continues its
+bounded retry window if a process lock remains. If the move is still blocked,
+close Claude Code, Explorer, and security/indexing processes using the package and
+retry; the source and mailbox data remain intact. `-NoLegacyPermissionRepair`
+disables all automatic repair. The helper is never used for the `.claude` root,
+custom config roots, staging, backups other than the generated destination, account
+data, or arbitrary paths.
 
 Uninstall first removes the user-scope `coremail-controller` entry transactionally,
 then moves the recognized package to `.claude\plugins-disabled`. If the move fails,

@@ -109,13 +109,14 @@ IMAP/SMTP 配置。升级默认保留已有账号配置及 Windows 凭据。
 备份刻意放在 `skills` 目录之外，避免 Claude Code 把旧版本再次加载为用户 skill。正常流程
 只在当前用户范围运行，不请求管理员权限，也不绕过机器的 PowerShell 执行策略。若
 检测到已撤回旧版本留下的
-`%USERPROFILE%\.claude\skills\coremail-controller` 只有 `SYSTEM/Administrators`
-可访问，安装器会仅针对这个固定目录请求一次 UAC：调用 Windows 自带的
-`icacls.exe` 给当前用户 SID 增加可继承的 `Modify`，保留原 ACL 和所有权，不递归、
-不重置、不接管所有权、不删除内容；随后仍由普通用户进程复核路径、插件身份并完成
-原子迁移。取消授权或复核失败不会移动、覆盖或删除目录内容；若系统授权已经成功，
-新增的当前用户 ACE 会保留，原有 ACE 和所有权不变。企业策略禁止此兼容处理时，可用
-`-NoLegacyPermissionRepair` 让流程直接安全停止。
+`%USERPROFILE%\.claude\skills\coremail-controller` 无法由当前用户检查或改名时，安装器会
+仅针对这次精确迁移请求一次 UAC。受限助手先用 Windows 自带的 `icacls.exe` 给当前用户
+SID 增加该目录的可继承 `Modify`，再在同一提升进程中把它原子移动到本次生成的
+`plugin-backups`（卸载时为 `plugins-disabled`）。它保留原 ACL 和所有权，不递归、不重置、
+不接管所有权、不覆盖、不删除；随后普通用户进程复核源/目标状态。若目录仍被 Claude Code、
+资源管理器或安全/索引进程占用，窗口会明确提示关闭这些进程，源目录和邮件数据保持不变。
+取消授权或复核失败不会移动或覆盖内容；若授权已成功，新增的当前用户 ACE 会保留。企业
+策略禁止此兼容处理时，可用 `-NoLegacyPermissionRepair` 让流程直接安全停止。
 
 安装、配置和卸载都会把不含密码的诊断日志写入 `%TEMP%\CoremailController`；窗口关闭
 后仍可排错。
@@ -328,10 +329,11 @@ Windows 凭据，因而可以恢复。若要删除凭据，请在确认目标名
 
 卸载器会先通过真实 Claude Code 核对并移除用户级 `coremail-controller`，再使用同卷原子
 移动；若 Defender、EDR、索引或刚结束的进程短暂占用目录，会在同一进程
-中自动有界重试。若旧版本目录明确拒绝当前用户访问，则可能出现一次上述受限 UAC
-修复；它只增加当前用户对固定插件目录的 `Modify`，不会接管所有权、重置 ACL、递归
-处理或删除内容。若最终仍失败，插件和 Claude 设置会保持或恢复到原状态；根据窗口给出
-的 `%TEMP%\CoremailController\UNINSTALL-*.log` 定点排查即可。
+中自动有界重试。若旧版本目录明确拒绝当前用户改名，则可能出现一次上述受限 UAC
+迁移；它只处理固定插件源和本次生成的隔离目标，增加当前用户对源目录的 `Modify`，
+不会接管所有权、重置 ACL、递归处理、覆盖或删除内容。若最终仍失败，先关闭 Claude Code、
+资源管理器及安全/索引进程，再重试；插件和 Claude 设置会保持或恢复到原状态。仍需排查时，
+根据窗口给出的 `%TEMP%\CoremailController\UNINSTALL-*.log` 定点查看。
 
 ## 官方参考
 

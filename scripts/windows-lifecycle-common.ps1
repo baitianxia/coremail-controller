@@ -385,6 +385,32 @@ function Test-CoremailAccessDeniedError {
     return $false
 }
 
+function Test-CoremailReleaseGatePermissionRepairMode {
+    # The marker handshake is an internal CI boundary.  Production callers
+    # must never be able to select it accidentally merely because the general
+    # release-testing flag is present.
+    return $env:COREMAIL_RELEASE_GATE_TESTING -eq 'true' -and
+        -not [string]::IsNullOrWhiteSpace([string]$env:COREMAIL_GATE_PERMISSION_REPAIR_REQUEST) -and
+        -not [string]::IsNullOrWhiteSpace([string]$env:COREMAIL_GATE_PERMISSION_REPAIR_COMPLETE)
+}
+
+function Test-CoremailDirectoryPresent {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    try {
+        $entry = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return ($entry.PSIsContainer -eq $true)
+    }
+    catch {
+        # A protected source can deny READ_ATTRIBUTES to the ordinary token.
+        # Treat that state as present so the constrained repair callback gets
+        # a chance to run; treating it as absent would create a false
+        # ambiguous-state failure before elevation.
+        if (Test-CoremailAccessDeniedError -ErrorRecord $_) { return $true }
+        return $false
+    }
+}
+
 function Move-CoremailDirectoryAtomically {
     param(
         [Parameter(Mandatory = $true)][string]$Source,
@@ -428,8 +454,8 @@ function Move-CoremailDirectoryAtomically {
         }
         catch {
             $moveError = $_
-            $sourcePresent = Test-Path -LiteralPath $sourcePath -PathType Container
-            $destinationPresent = Test-Path -LiteralPath $destinationPath -PathType Container
+            $sourcePresent = Test-CoremailDirectoryPresent -Path $sourcePath
+            $destinationPresent = Test-CoremailDirectoryPresent -Path $destinationPath
             if (-not $sourcePresent -and $destinationPresent) {
                 Write-CoremailLifecycleLog (
                     "DIRECTORY MOVE RECOVERED operation=$OperationLabel; completed-while-reporting-error; destination=$destinationPath"
@@ -455,14 +481,38 @@ function Move-CoremailDirectoryAtomically {
                     "DIRECTORY MOVE ACCESS REPAIR operation=$OperationLabel; attempt=$attempt"
                 )
                 & $AccessDeniedRepair
+                # A repair callback may have completed the move itself (for
+                # example, a narrowly scoped elevated broker).  Check the
+                # postcondition before entering another Directory.Move call;
+                # otherwise the next iteration would manufacture a misleading
+                # "source not found" error.
+                $sourceAfterRepair = Test-CoremailDirectoryPresent -Path $sourcePath
+                $destinationAfterRepair = Test-CoremailDirectoryPresent -Path $destinationPath
+                if (-not $sourceAfterRepair -and $destinationAfterRepair) {
+                    Write-CoremailLifecycleLog (
+                        "DIRECTORY MOVE RECOVERED operation=$OperationLabel; completed-by-repair; destination=$destinationPath"
+                    )
+                    return
+                }
+                if (-not $sourceAfterRepair -or $destinationAfterRepair) {
+                    throw (
+                        "$OperationLabel entered an ambiguous state after access repair; " +
+                        "no retry or cleanup was attempted. sourcePresent=$sourceAfterRepair; " +
+                        "destinationPresent=$destinationAfterRepair"
+                    )
+                }
                 $delayMilliseconds = 250
                 continue
             }
             if ($attempt -ge $MaximumAttempts) {
+                $repairHint = if ($accessDeniedRepairAttempted) {
+                    ' An access repair was attempted; if the error persists, close Claude Code, Explorer, and any security/indexing process using this directory, then retry.'
+                }
+                else { '' }
                 throw (
                     "$OperationLabel remained blocked after $MaximumAttempts attempts. " +
                     "The source remains intact and the destination was not created. " +
-                    "Original error: $($moveError.Exception.Message)"
+                    "Original error: $($moveError.Exception.Message).$repairHint"
                 )
             }
             if ($attempt -eq 1) {
@@ -715,9 +765,7 @@ function Request-CoremailLegacyPluginPermissionRepair {
     # process waits for access restoration and then continues. It grants no rights.
     $gateRequest = [string]$env:COREMAIL_GATE_PERMISSION_REPAIR_REQUEST
     $gateComplete = [string]$env:COREMAIL_GATE_PERMISSION_REPAIR_COMPLETE
-    if ($env:COREMAIL_RELEASE_GATE_TESTING -eq 'true' -and
-        -not [string]::IsNullOrWhiteSpace($gateRequest) -and
-        -not [string]::IsNullOrWhiteSpace($gateComplete)) {
+    if (Test-CoremailReleaseGatePermissionRepairMode) {
         $runnerTemp = [IO.Path]::GetFullPath([string]$env:RUNNER_TEMP).TrimEnd('\')
         $requestPath = [IO.Path]::GetFullPath($gateRequest)
         $completePath = [IO.Path]::GetFullPath($gateComplete)
@@ -747,12 +795,26 @@ function Request-CoremailLegacyPluginPermissionRepair {
         throw 'The protected Windows icacls.exe utility is unavailable.'
     }
     $grant = '*{0}:(OI)(CI)M' -f $sid.Value
-    $argumentText = '"{0}" /grant {1} /L /Q' -f $targetPath, $grant
+    # Pass each icacls argument as a separate item.  Windows PowerShell's
+    # Start-Process joins an ArgumentList array using the native quoting rules;
+    # constructing one opaque command string is lossy when a profile path or
+    # SID contains characters that the ShellExecute layer treats specially.
+    # The protected path and SID have already been validated above.
+    $argumentList = @(
+        "`"$targetPath`"",
+        '/grant',
+        $grant,
+        '/L',
+        '/Q'
+    )
+    Write-CoremailLifecycleLog (
+        "LEGACY ACL REPAIR COMMAND target=$targetPath; grant=$grant; switches=/L,/Q"
+    )
     Write-Host 'Windows will now request one UAC approval for this exact ACL grant.' -ForegroundColor Yellow
     try {
         $repairProcess = Start-Process `
             -FilePath $icacls `
-            -ArgumentList $argumentText `
+            -ArgumentList $argumentList `
             -Verb RunAs `
             -Wait `
             -PassThru `
@@ -761,10 +823,54 @@ function Request-CoremailLegacyPluginPermissionRepair {
     catch {
         throw "Legacy plugin permission repair was cancelled or could not start: $($_.Exception.Message)"
     }
-    try { $repairExitCode = $repairProcess.ExitCode }
+    # Keep a native process handle alive and wait explicitly.  Windows
+    # PowerShell 5.1 can expose a stale/null ExitCode when a ShellExecute
+    # (RunAs) child is queried immediately after Start-Process returns.
+    try {
+        $repairHandle = $repairProcess.Handle
+        if ($repairHandle -eq [IntPtr]::Zero) {
+            throw 'the elevated ACL repair process did not expose a usable handle'
+        }
+        $repairProcess.WaitForExit()
+        $repairExitCode = $repairProcess.ExitCode
+    }
     finally { $repairProcess.Dispose() }
     if ($repairExitCode -ne 0) {
         throw "Windows permission repair failed with icacls exit code $repairExitCode."
+    }
+
+    # Do not assume an exit code of zero means that the requested ACE became
+    # effective.  Corporate UAC/ACL policy can let icacls return successfully
+    # while an inherited deny or a protected DACL still blocks the account.
+    # Read back the exact SID rule before the move retry loop continues, so a
+    # failed repair is reported immediately instead of looking like a generic
+    # transient directory lock.
+    try {
+        $repairedAcl = Get-Acl -LiteralPath $targetPath -ErrorAction Stop
+        $sidRules = @($repairedAcl.GetAccessRules(
+            $true,
+            $true,
+            [Security.Principal.SecurityIdentifier]
+        ) | Where-Object {
+            [string]$_.IdentityReference.Value -eq [string]$sid.Value -and
+            $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow
+        })
+        $hasModify = $false
+        foreach ($sidRule in $sidRules) {
+            if (([Security.AccessControl.FileSystemRights]$sidRule.FileSystemRights -band
+                [Security.AccessControl.FileSystemRights]::Delete) -ne 0 -and
+                ([Security.AccessControl.FileSystemRights]$sidRule.FileSystemRights -band
+                [Security.AccessControl.FileSystemRights]::ReadControl) -ne 0) {
+                $hasModify = $true
+                break
+            }
+        }
+        if (-not $hasModify) {
+            throw 'the current account Modify ACE was not visible after the elevated icacls command'
+        }
+    }
+    catch {
+        throw "Windows permission repair completed but the current account ACL was not effective: $($_.Exception.Message)"
     }
 
     $repairedEntry = Get-CoremailExactChildDirectory `
@@ -774,7 +880,321 @@ function Request-CoremailLegacyPluginPermissionRepair {
         throw 'The plugin directory disappeared during permission repair; no lifecycle move was attempted.'
     }
     [void](Assert-CoremailSafeClaudePath -UserProfile $profilePath -Path $targetPath)
+    Write-Host 'The ACL grant was verified. Retrying the protected package move now.' -ForegroundColor Green
     Write-CoremailLifecycleLog 'LEGACY ACL REPAIR RECOVERED mode=system-icacls'
+}
+
+function Invoke-CoremailElevatedDirectoryMove {
+    <#
+      Move one already-identified legacy package with a single, constrained
+      UAC approval.  This is the fallback for a directory whose ACL, parent
+      delete-child right, or integrity policy still prevents the ordinary
+      user process from renaming it after the normal retry/repair path.
+
+      The elevated command is generated in memory and receives a base64 JSON
+      payload.  It accepts only the exact active Coremail path and one of the
+      two package quarantine parents; it validates the manifest again before
+      using the same-volume Directory.Move primitive.  It never takes
+      ownership, resets ACLs, recurses, overwrites, or deletes.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$UserProfile,
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][string]$ExpectedVersion,
+        [switch]$DirectForVerifiedGate
+    )
+
+    $profilePath = [IO.Path]::GetFullPath($UserProfile).TrimEnd('\')
+    $sourcePath = [IO.Path]::GetFullPath($Source).TrimEnd('\')
+    $destinationPath = [IO.Path]::GetFullPath($Destination).TrimEnd('\')
+    $expectedSource = [IO.Path]::GetFullPath(
+        (Join-Path $profilePath '.claude\skills\coremail-controller')
+    ).TrimEnd('\')
+    if (-not [string]::Equals(
+        $sourcePath,
+        $expectedSource,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw 'Elevated legacy move was refused for an unexpected source path.'
+    }
+    if ([string]::IsNullOrWhiteSpace($ExpectedVersion)) {
+        throw 'Elevated legacy move requires the verified package version.'
+    }
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $sid = $identity.User
+    if ($null -eq $sid -or -not $sid.IsAccountSid()) {
+        throw 'Elevated legacy move requires a normal Windows account SID.'
+    }
+
+    $claudeRoot = [IO.Path]::GetFullPath((Join-Path $profilePath '.claude')).TrimEnd('\')
+    $allowedParents = @(
+        [IO.Path]::GetFullPath((Join-Path $claudeRoot 'plugin-backups')).TrimEnd('\'),
+        [IO.Path]::GetFullPath((Join-Path $claudeRoot 'plugins-disabled')).TrimEnd('\')
+    )
+    $destinationParent = [IO.Path]::GetFullPath((Split-Path -Parent $destinationPath)).TrimEnd('\')
+    if (-not ($allowedParents | Where-Object {
+        [string]::Equals($_, $destinationParent, [StringComparison]::OrdinalIgnoreCase)
+    })) {
+        throw 'Elevated legacy move was refused for an unexpected quarantine directory.'
+    }
+    $destinationLeaf = Split-Path -Leaf $destinationPath
+    if ([string]::IsNullOrWhiteSpace($destinationLeaf) -or
+        $destinationLeaf -in @('.', '..') -or
+        $destinationLeaf.IndexOfAny([char[]]'\/') -ge 0 -or
+        $destinationLeaf -notmatch '^coremail-controller-[A-Za-z0-9-]+$') {
+        throw 'Elevated legacy move requires one exact destination directory name.'
+    }
+    if ([IO.Path]::GetPathRoot($sourcePath) -ine [IO.Path]::GetPathRoot($destinationPath)) {
+        throw 'Elevated legacy move requires source and destination on the same volume.'
+    }
+    # The source is precisely allowlisted above, but its final directory may
+    # be the very ACL-protected object that triggered this callback.  Do not
+    # require the ordinary token to read that component before elevation;
+    # validate the accessible parent and let the elevated helper re-check the
+    # complete path and manifest.
+    [void](Assert-CoremailSafeClaudePath `
+        -UserProfile $profilePath `
+        -Path (Split-Path -Parent $sourcePath))
+    [void](Assert-CoremailSafeClaudePath -UserProfile $profilePath -Path $destinationParent)
+    try {
+        $existingDestination = Get-Item -LiteralPath $destinationPath -Force -ErrorAction Stop
+        if ($null -ne $existingDestination) {
+            throw 'The elevated move destination already exists; no overwrite was attempted.'
+        }
+    }
+    catch {
+        if (-not ($_.Exception -is [Management.Automation.ItemNotFoundException]) -and
+            -not ($_.Exception -is [IO.FileNotFoundException]) -and
+            -not ($_.Exception -is [IO.DirectoryNotFoundException])) {
+            throw
+        }
+    }
+
+    $payload = [ordered]@{
+        profile = $profilePath
+        source = $sourcePath
+        destination = $destinationPath
+        allowed_parents = $allowedParents
+        expected_version = [string]$ExpectedVersion
+        sid = [string]$sid.Value
+    }
+    $payloadJson = $payload | ConvertTo-Json -Compress -Depth 4
+    $payloadBase64 = [Convert]::ToBase64String(
+        [Text.Encoding]::UTF8.GetBytes($payloadJson)
+    )
+    $elevatedSource = @'
+$ErrorActionPreference = 'Stop'
+try {
+    $payloadJson = [Text.Encoding]::UTF8.GetString(
+        [Convert]::FromBase64String('__COREMAIL_PAYLOAD__')
+    )
+    $payload = $payloadJson | ConvertFrom-Json
+    $profile = [IO.Path]::GetFullPath([string]$payload.profile).TrimEnd('\')
+    $source = [IO.Path]::GetFullPath([string]$payload.source).TrimEnd('\')
+    $destination = [IO.Path]::GetFullPath([string]$payload.destination).TrimEnd('\')
+    $expectedSource = [IO.Path]::GetFullPath(
+        (Join-Path $profile '.claude\skills\coremail-controller')
+    ).TrimEnd('\')
+    if (-not [string]::Equals($source, $expectedSource, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The elevated source path did not match the exact Coremail target.'
+    }
+    $destinationParent = [IO.Path]::GetFullPath((Split-Path -Parent $destination)).TrimEnd('\')
+    $destinationLeaf = Split-Path -Leaf $destination
+    if ([string]::IsNullOrWhiteSpace($destinationLeaf) -or
+        $destinationLeaf -in @('.', '..') -or
+        $destinationLeaf.IndexOfAny([char[]]'\/') -ge 0 -or
+        $destinationLeaf -notmatch '^coremail-controller-[A-Za-z0-9-]+$') {
+        throw 'The elevated destination name was not allowlisted.'
+    }
+    $parentAllowed = $false
+    foreach ($allowedParent in @($payload.allowed_parents)) {
+        if ([string]::Equals(
+            $destinationParent,
+            [IO.Path]::GetFullPath([string]$allowedParent).TrimEnd('\'),
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+            $parentAllowed = $true
+            break
+        }
+    }
+    if (-not $parentAllowed) { throw 'The elevated destination parent was not allowlisted.' }
+    if ([IO.Path]::GetPathRoot($source) -ine [IO.Path]::GetPathRoot($destination)) {
+        throw 'The elevated source and destination are on different volumes.'
+    }
+    $sid = New-Object Security.Principal.SecurityIdentifier([string]$payload.sid)
+    if (-not $sid.IsAccountSid()) { throw 'The elevated account SID is not a normal user SID.' }
+    foreach ($path in @(
+        $profile,
+        (Join-Path $profile '.claude'),
+        (Join-Path $profile '.claude\skills'),
+        $source,
+        $destinationParent
+    )) {
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "The elevated move path traverses a reparse point: $path"
+        }
+    }
+    if (-not (Test-Path -LiteralPath $source -PathType Container)) {
+        throw 'The exact Coremail source directory is absent.'
+    }
+    try {
+        $existingDestination = Get-Item -LiteralPath $destination -Force -ErrorAction Stop
+        if ($null -ne $existingDestination) {
+            throw 'The elevated move destination already exists.'
+        }
+    }
+    catch {
+        if (-not ($_.Exception -is [Management.Automation.ItemNotFoundException]) -and
+            -not ($_.Exception -is [IO.FileNotFoundException]) -and
+            -not ($_.Exception -is [IO.DirectoryNotFoundException])) {
+            throw
+        }
+    }
+    $manifestPath = Join-Path $source '.claude-plugin\plugin.json'
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop | ConvertFrom-Json
+    if ([string]$manifest.name -ne 'coremail-controller' -or
+        [string]$manifest.version -ne [string]$payload.expected_version) {
+        throw 'The protected source package identity changed before elevated move.'
+    }
+    $icacls = Join-Path ([Environment]::SystemDirectory) 'icacls.exe'
+    if (-not (Test-Path -LiteralPath $icacls -PathType Leaf)) {
+        throw 'The protected Windows icacls.exe utility is unavailable to the elevated move.'
+    }
+    $grant = '*{0}:(OI)(CI)M' -f $sid.Value
+    $icaclsPreviousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $global:LASTEXITCODE = $null
+        & $icacls $source '/grant' $grant '/L' '/Q' 2>$null | Out-Null
+    }
+    finally { $ErrorActionPreference = $icaclsPreviousPreference }
+    if ($global:LASTEXITCODE -ne 0) {
+        throw "The elevated ACL grant failed with icacls exit code $($global:LASTEXITCODE)."
+    }
+    [IO.Directory]::Move($source, $destination)
+    if ((Test-Path -LiteralPath $source -PathType Container) -or
+        -not (Test-Path -LiteralPath $destination -PathType Container)) {
+        throw 'The elevated directory move did not reach its expected postcondition.'
+    }
+    exit 0
+}
+catch {
+    $message = $_.Exception.Message
+    [Console]::Error.WriteLine($message)
+    exit 1
+}
+'@
+    $elevatedSource = $elevatedSource.Replace('__COREMAIL_PAYLOAD__', $payloadBase64)
+    $encodedCommand = [Convert]::ToBase64String(
+        [Text.Encoding]::Unicode.GetBytes($elevatedSource)
+    )
+    $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $powershell -PathType Leaf)) {
+        throw 'The protected Windows PowerShell launcher is unavailable for elevated move.'
+    }
+    Write-CoremailLifecycleLog (
+        "ELEVATED DIRECTORY MOVE REQUESTED source=$sourcePath; destination=$destinationPath; version=$ExpectedVersion"
+    )
+    $elevatedExitCode = $null
+    if ($DirectForVerifiedGate) {
+        # The hosted release orchestrator is already elevated.  This guarded
+        # branch executes the exact encoded helper without another secure-
+        # desktop prompt so CI can exercise its payload, manifest checks,
+        # icacls grant, and Directory.Move postcondition.  It is rejected for
+        # every normal/user process and is never used by install/uninstall.
+        $gatePrincipal = New-Object Security.Principal.WindowsPrincipal(
+            [Security.Principal.WindowsIdentity]::GetCurrent()
+        )
+        if ($env:COREMAIL_RELEASE_GATE_TESTING -ne 'true' -or
+            -not $gatePrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw 'Direct elevated-move testing is restricted to the verified administrator release gate.'
+        }
+        Write-Host 'Release gate is exercising the exact elevated legacy move helper under its verified administrator token.' -ForegroundColor Yellow
+        $directPreviousPreference = $ErrorActionPreference
+        try {
+            # Windows PowerShell 5.1 promotes native stderr to ErrorRecord
+            # values even when a command is expected to return a nonzero code;
+            # keep the gate's explicit exit-code path in control.
+            $ErrorActionPreference = 'Continue'
+            $global:LASTEXITCODE = $null
+            & $powershell -NoLogo -NoProfile -NonInteractive -EncodedCommand $encodedCommand 2>$null | Out-Null
+            $elevatedExitCode = $global:LASTEXITCODE
+        }
+        finally { $ErrorActionPreference = $directPreviousPreference }
+    }
+    else {
+        Write-Host 'The protected legacy package still cannot be moved by the current token. Windows will now request one UAC approval for the exact atomic move.' -ForegroundColor Yellow
+        try {
+            $elevatedProcess = Start-Process `
+                -FilePath $powershell `
+                -ArgumentList @(
+                    '-NoLogo', '-NoProfile', '-NonInteractive',
+                    '-EncodedCommand', $encodedCommand
+                ) `
+                -Verb RunAs `
+                -Wait `
+                -PassThru `
+                -ErrorAction Stop
+        }
+        catch {
+            throw "Elevated legacy package move was cancelled or could not start: $($_.Exception.Message)"
+        }
+        try {
+            # Keep a process handle alive before reading ExitCode; this is
+            # required for the Windows PowerShell 5.1 ShellExecute/RunAs path.
+            $elevatedHandle = $elevatedProcess.Handle
+            if ($elevatedHandle -eq [IntPtr]::Zero) {
+                throw 'the elevated move process did not expose a usable handle'
+            }
+            $elevatedProcess.WaitForExit()
+            $elevatedExitCode = $elevatedProcess.ExitCode
+        }
+        finally { $elevatedProcess.Dispose() }
+    }
+    $sourceAfterElevated = Test-Path -LiteralPath $sourcePath -PathType Container
+    $destinationAfterElevated = Test-Path -LiteralPath $destinationPath -PathType Container
+    if (-not $sourceAfterElevated -and $destinationAfterElevated) {
+        Write-Host 'The exact legacy package move completed under the approved UAC action.' -ForegroundColor Green
+        Write-CoremailLifecycleLog 'ELEVATED DIRECTORY MOVE RECOVERED mode=system-powershell'
+        return
+    }
+    if ($elevatedExitCode -ne 0) {
+        # Before allowing ordinary retries after a failed elevated attempt,
+        # re-read the source identity.  A concurrent replacement must never
+        # turn a transient access error into permission to move an unknown
+        # directory.
+        try {
+            $identityManifest = Get-Content -LiteralPath (
+                Join-Path $sourcePath '.claude-plugin\plugin.json'
+            ) -Raw -ErrorAction Stop | ConvertFrom-Json
+            if ([string]$identityManifest.name -ne 'coremail-controller' -or
+                [string]$identityManifest.version -ne [string]$ExpectedVersion) {
+                throw 'the protected source package identity changed'
+            }
+        }
+        catch {
+            throw (
+                'The elevated legacy package move failed and the source identity could not be revalidated: ' +
+                $_.Exception.Message
+            )
+        }
+        Write-Warning (
+            "The elevated legacy package move did not complete (exit code ${elevatedExitCode}); " +
+            'the source is intact. The installer will continue its bounded retry window.'
+        )
+        Write-CoremailLifecycleLog (
+            "ELEVATED DIRECTORY MOVE BLOCKED exit=$elevatedExitCode; source=$sourcePath; destination=$destinationPath"
+        )
+        return
+    }
+    if ($sourceAfterElevated -or -not $destinationAfterElevated) {
+        throw 'The elevated move reported success but its source/destination postcondition was not met.'
+    }
+    Write-Host 'The exact legacy package move completed under the approved UAC action.' -ForegroundColor Green
+    Write-CoremailLifecycleLog 'ELEVATED DIRECTORY MOVE RECOVERED mode=system-powershell'
 }
 
 function Publish-CoremailFileAtomically {

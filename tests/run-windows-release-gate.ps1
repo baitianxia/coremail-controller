@@ -57,6 +57,11 @@ if ([string]$sourceManifest.name -ne 'coremail-controller' -or
     throw 'The packaged plugin manifest has an unexpected identity.'
 }
 $expectedPackageVersion = [string]$sourceManifest.version
+$commonLifecycleScript = Join-Path $PluginRoot 'scripts\windows-lifecycle-common.ps1'
+if (-not (Test-Path -LiteralPath $commonLifecycleScript -PathType Leaf)) {
+    throw 'The packaged lifecycle helper is missing.'
+}
+. $commonLifecycleScript
 
 $suffix = [guid]::NewGuid().ToString('N')
 $userName = 'cmgate' + $suffix.Substring(0, 10)
@@ -80,6 +85,7 @@ $stagedClaudeCommand = $null
 $userCreated = $false
 $process = $null
 $permissionRepairHandled = $false
+$utf8 = New-Object System.Text.UTF8Encoding($false)
 
 function Complete-CoremailGatePermissionRepair {
     param(
@@ -161,6 +167,48 @@ try {
     $userCreated = $true
 
     New-Item -ItemType Directory -Path $gateRoot | Out-Null
+
+    Write-Host "[$ScenarioName preflight] Exercising the constrained elevated legacy move helper"
+    # The orchestrator is already running with the hosted-runner administrator
+    # token.  A disposable profile-shaped tree lets the same encoded helper
+    # (including its manifest/path/reparse checks and icacls grant) run without
+    # showing a second UAC prompt in CI.  The helper's direct mode is guarded by
+    # COREMAIL_RELEASE_GATE_TESTING and an administrator-token check.
+    $elevatedFixtureProfile = Join-Path $gateRoot 'elevated-profile'
+    $elevatedFixtureSource = Join-Path $elevatedFixtureProfile '.claude\skills\coremail-controller'
+    $elevatedFixtureDestinationParent = Join-Path $elevatedFixtureProfile '.claude\plugin-backups'
+    $elevatedFixtureDestination = Join-Path $elevatedFixtureDestinationParent 'coremail-controller-gate'
+    New-Item -ItemType Directory -Path (Join-Path $elevatedFixtureSource '.claude-plugin') -Force | Out-Null
+    New-Item -ItemType Directory -Path $elevatedFixtureDestinationParent -Force | Out-Null
+    $fixtureManifest = [ordered]@{
+        name = 'coremail-controller'
+        version = $expectedPackageVersion
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $elevatedFixtureSource '.claude-plugin\plugin.json'),
+        ($fixtureManifest | ConvertTo-Json -Compress),
+        $utf8
+    )
+    $hadGateTesting = Test-Path Env:COREMAIL_RELEASE_GATE_TESTING
+    $previousGateTesting = [string]$env:COREMAIL_RELEASE_GATE_TESTING
+    $env:COREMAIL_RELEASE_GATE_TESTING = 'true'
+    try {
+        Invoke-CoremailElevatedDirectoryMove `
+            -UserProfile $elevatedFixtureProfile `
+            -Source $elevatedFixtureSource `
+            -Destination $elevatedFixtureDestination `
+            -ExpectedVersion $expectedPackageVersion `
+            -DirectForVerifiedGate
+    }
+    finally {
+        if ($hadGateTesting) { $env:COREMAIL_RELEASE_GATE_TESTING = $previousGateTesting }
+        else { Remove-Item Env:COREMAIL_RELEASE_GATE_TESTING -ErrorAction SilentlyContinue }
+    }
+    if ((Test-Path -LiteralPath $elevatedFixtureSource -PathType Container) -or
+        -not (Test-Path -LiteralPath $elevatedFixtureDestination -PathType Container)) {
+        throw 'The constrained elevated legacy move helper did not complete its postcondition.'
+    }
+
     Copy-Item -LiteralPath $PluginRoot -Destination $stagedPlugin -Recurse
     New-Item -ItemType Directory -Path $standardTemp | Out-Null
     if ($ScenarioName -eq 'native') {

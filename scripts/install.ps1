@@ -463,11 +463,26 @@ try {
                 -Destination $backupRoot `
                 -OperationLabel 'Archiving the previous Coremail package' `
                 -AccessDeniedRepair {
-                    Invoke-LegacyPermissionRepair -UserProfile $userProfile -Root $targetRoot
-                    [void](Assert-CoremailSafeClaudePath -UserProfile $userProfile -Path $targetRoot)
-                    $versionAfterRepair = Test-ExistingPluginIdentity -Root $targetRoot
-                    if ($versionAfterRepair -ne $previousVersion) {
-                        throw 'The plugin identity changed while legacy permissions were repaired.'
+                    if ($NoLegacyPermissionRepair) {
+                        throw 'Automatic legacy permission repair was disabled; the protected package was not moved.'
+                    }
+                    elseif (Test-CoremailReleaseGatePermissionRepairMode) {
+                        Invoke-LegacyPermissionRepair -UserProfile $userProfile -Root $targetRoot
+                        [void](Assert-CoremailSafeClaudePath -UserProfile $userProfile -Path $targetRoot)
+                        $versionAfterRepair = Test-ExistingPluginIdentity -Root $targetRoot
+                        if ($versionAfterRepair -ne $previousVersion) {
+                            throw 'The plugin identity changed while legacy permissions were repaired.'
+                        }
+                    }
+                    elseif ($env:COREMAIL_RELEASE_GATE_TESTING -eq 'true') {
+                        throw 'The release gate encountered an unexpected production elevation path.'
+                    }
+                    else {
+                        Invoke-CoremailElevatedDirectoryMove `
+                            -UserProfile $userProfile `
+                            -Source $targetRoot `
+                            -Destination $backupRoot `
+                            -ExpectedVersion $previousVersion
                     }
                 }
             Write-Host "Previous Coremail package version $previousVersion preserved at: $backupRoot"

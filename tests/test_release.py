@@ -208,6 +208,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("Move-CoremailDirectoryAtomically", combined)
         self.assertIn("Diagnostics are best-effort", combined)
         self.assertIn("register_claude_user_mcp.py", combined)
+        self.assertIn("automatic legacy permission repair was disabled", combined.lower())
         self.assertIn("--scope", registrar_source)
         self.assertNotIn("Assert-CoremailClaudeMinimumVersion", combined)
         self.assertNotIn("2.1.157", combined)
@@ -231,11 +232,20 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("-verb runas", normalized_common)
         self.assertIn(".claude\\skills\\coremail-controller", normalized_common)
         self.assertIn("isaccountsid", normalized_common)
-        self.assertIn("/grant {1} /l /q", normalized_common)
+        self.assertIn("'/grant', $grant, '/l', '/q'", normalized_common)
         self.assertIn("*{0}:(oi)(ci)m", normalized_common)
+        self.assertIn("invoke-coremailelevateddirectorymove", normalized_common)
+        self.assertIn("test-coremaildirectorypresent", normalized_common)
+        self.assertIn("-encodedcommand", normalized_common)
+        self.assertIn("directforverifiedgate", normalized_common)
+        self.assertIn("direct elevated-move testing is restricted", normalized_common)
+        self.assertIn("expected_version", normalized_common)
+        self.assertIn("completed-by-repair", normalized_common)
+        self.assertIn("close claude code, explorer", normalized_common)
         self.assertNotIn(" /t ", normalized_common)
         self.assertNotIn("/reset", normalized_common)
         self.assertNotIn("takeown", normalized_common)
+        self.assertNotIn("-executionpolicy', 'bypass'", normalized_common)
 
         launcher = (ROOT / "mcp" / "run-server.ps1").read_text(encoding="utf-8")
         setup = (ROOT / "scripts" / "setup-account.ps1").read_text(encoding="utf-8")
@@ -436,6 +446,8 @@ Write-Output 'PASS'
             "$permissionrepairhandled = $true",
             "$processhandle = $process.handle",
             "$null -eq $processexitcode",
+            "constrained elevated legacy move helper",
+            "directforverifiedgate",
         ):
             self.assertIn(required, orchestrator_normalized)
         self.assertLess(

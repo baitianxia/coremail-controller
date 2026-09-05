@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Harden legacy-package replacement when a withdrawn directory still returns
+  `ERROR_ACCESS_DENIED` after the initial user-scope retry attempts. The installer and
+  uninstaller now use a narrowly allowlisted, manifest-rechecking elevated move
+  helper after one UAC approval, verify the postcondition before continuing, and
+  report a concrete close-the-locking-processes recovery path. The Windows gate
+  executes the same encoded helper under its verified administrator token.
+
 ## 0.8.0 - 2026-09-05
 
 - Replace the Claude plugin inventory/enablement lifecycle with a transactional,

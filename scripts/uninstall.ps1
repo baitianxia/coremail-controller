@@ -266,11 +266,26 @@ try {
         -Destination $destination `
         -OperationLabel "Disabling the Coremail package for $([Security.Principal.WindowsIdentity]::GetCurrent().Name)" `
         -AccessDeniedRepair {
-            Invoke-LegacyPermissionRepair -UserProfile $userProfile -Root $targetRoot
-            [void](Assert-CoremailSafeClaudePath -UserProfile $userProfile -Path $targetRoot)
-            $manifestAfterRepair = Get-RecognizedCoremailPackage -Root $targetRoot
-            if ([string]$manifestAfterRepair.version -ne [string]$manifest.version) {
-                throw 'The package identity changed while legacy permissions were repaired.'
+            if ($NoLegacyPermissionRepair) {
+                throw 'Automatic legacy permission repair was disabled; the protected package was not moved.'
+            }
+            elseif (Test-CoremailReleaseGatePermissionRepairMode) {
+                Invoke-LegacyPermissionRepair -UserProfile $userProfile -Root $targetRoot
+                [void](Assert-CoremailSafeClaudePath -UserProfile $userProfile -Path $targetRoot)
+                $manifestAfterRepair = Get-RecognizedCoremailPackage -Root $targetRoot
+                if ([string]$manifestAfterRepair.version -ne [string]$manifest.version) {
+                    throw 'The package identity changed while legacy permissions were repaired.'
+                }
+            }
+            elseif ($env:COREMAIL_RELEASE_GATE_TESTING -eq 'true') {
+                throw 'The release gate encountered an unexpected production elevation path.'
+            }
+            else {
+                Invoke-CoremailElevatedDirectoryMove `
+                    -UserProfile $userProfile `
+                    -Source $targetRoot `
+                    -Destination $destination `
+                    -ExpectedVersion ([string]$manifest.version)
             }
         }
     $uninstallCommitted = $true
