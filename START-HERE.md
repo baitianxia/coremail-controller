@@ -1,69 +1,43 @@
 # Coremail Controller：Windows 三步开始
 
-> **适用于 0.8.0。** 只使用成功的 Windows PowerShell 5.1 自动生命周期门禁所上传的
-> `coremail-controller-windows-gated` 产物，并核对随包 SHA-256。0.7.x 及更早构建已被
-> 0.8.0 取代；0.6.0 及更早构建已撤回。
+> **适用于 0.9.0。** 只使用 Windows PowerShell 5.1 生命周期门禁成功上传的
+> `coremail-controller-windows-gated` ZIP，并核对随包 SHA-256。
 
-本安装包先尝试复用已登录 Coremail 的 Windows Simple MAPI 共享会话；接口不可用时再
-安全配置 IMAP/SMTP。两种模式都不启动或操作 Coremail 桌面、网页界面。
+## 1. 完整解压并核对
 
-## 1. 完整解压
-
-把发布 ZIP 完整解压到本机普通目录。不要直接在压缩包预览窗口中运行文件。
-
-如果发布包旁有 `.sha256` 文件，可在 PowerShell 中核对：
+把正式 ZIP 完整解压到本机普通目录，不要在压缩包预览窗口中运行：
 
 ```powershell
-Get-FileHash .\coremail-controller-0.8.0-windows.zip -Algorithm SHA256
-Get-Content .\coremail-controller-0.8.0-windows.zip.sha256
+Get-FileHash .\coremail-controller-0.9.0-windows.zip -Algorithm SHA256
+Get-Content .\coremail-controller-0.9.0-windows.zip.sha256
 ```
-
-两处哈希不一致时停止，不要安装。
 
 ## 2. 双击安装
 
-进入解压出的目录，双击 `INSTALL.cmd`。向导会自动：
+进入解压目录，双击 `INSTALL.cmd`。安装器会自动：
 
-1. 核对包内完整性和 Windows 门禁元数据，固定 Python 3.10+；
-2. 检查真实 Claude Code 的 `mcp` 能力，并在用户范围执行事务性的 `remove → add → get`；
-3. 核对 `%USERPROFILE%\.claude.json` 中的 `coremail-controller` 条目和安装到
-   `%USERPROFILE%\.claude\skills\coremail-controller\SKILL.md` 的自然语言入口；
-4. 首先检查 Coremail 是否注册了可复用的已登录共享 MAPI 会话；
-5. 探测成功时免密码配置；失败时才询问邮箱、IMAP/SMTP 主机和域/Coremail 密码，
-   并把密码写入 Windows 凭据管理器；
-6. 执行 MCP 离线冒烟测试，并尝试检查真实邮箱连接。
+1. 校验门禁包和固定 Python；
+2. 探测现有 Claude Code 的 user-scope MCP 能力；
+3. 把不可变运行时发布到
+   `%LOCALAPPDATA%\CoremailController\releases\...`；
+4. 执行真实的 `mcp remove → add → get` 注册；
+5. 先尝试复用已登录 Coremail 的无界面共享 MAPI 会话；
+6. 只有接口不可用时才询问邮箱、IMAP/SMTP 主机和密码。
 
-安装和账号配置正常都在当前用户范围内。升级时如果旧 Coremail 包正在被 Claude Code、资源
-管理器或安全软件占用，安装器会先尝试一次受限 UAC 修复，然后显示精确目录和人工处理提示。
-关闭占用者或修复 ACL 后输入 `R` 可在同一次安装中重试；输入 `V` 则把新包发布到唯一的版本
-目录并让用户级 MCP 指向新包，旧目录原样保留。两种路径都不需要重新打包或重新下载：
+安装器不会访问、搬移或修复 Claude Skill 目录，不请求 UAC，也不要求人工 ACL 操作。即使
+旧目录被锁定，升级仍会发布新的版本目录。卸载时版本目录保留，避免打开的进程造成权限
+问题。
 
-```text
-%USERPROFILE%\.claude\coremail-releases\coremail-controller-<version>-<id>
-```
+## 3. 用文字操作邮件
 
-不删除旧目录或邮件配置。升级时默认保留现有账号配置。
-若设置了 `CLAUDE_CONFIG_DIR`，安装和卸载会沿用它，但只接受本机盘符绝对路径，拒绝相对、
-`~` 和 UNC 路径。
-失败或成功后都可在 `%TEMP%\CoremailController` 找到不含密码的诊断日志。
-
-若企业 PowerShell 策略拦截脚本，请让管理员批准或签名，不要临时绕过组织策略。
-
-## 3. 在 Claude Code 使用
-
-重启 Claude Code，或执行 `/reload-plugins`，然后直接输入自然语言：
+重启 Claude Code，然后直接输入：
 
 ```text
 检查 Coremail 连接，并搜索本周来自 alice@example.com 的未读邮件。
 ```
 
-需要把现有浏览器 MCP 的公共网页研究结果整理成邮件时使用：
+也可以说“起草邮件但不要发送”。发送前 Claude 必须展示冻结的收件人、主题和附件清单；
+只有你明确回复 `确认发送` 才会提交。
 
-```text
-研究这些公共网页，并把有来源的结论整理成 Coremail 草稿。
-```
-
-重新配置账号可双击 `CONFIGURE-ACCOUNT.cmd`；移除用户级 MCP 并停用包可双击 `UNINSTALL.cmd`。
-卸载采用移动而非删除，不会删除账号配置和 Windows 凭据。若当前 MCP 使用的是版本化
-`coremail-releases`，卸载会停用该版本；升级时遗留的旧 skill 目录可能原样保留，不影响
-MCP 已被移除的结果。
+重新配置账号：双击 `CONFIGURE-ACCOUNT.cmd`。移除用户级 MCP：双击 `UNINSTALL.cmd`。两者
+都不会删除邮箱配置、凭据或版本运行时。

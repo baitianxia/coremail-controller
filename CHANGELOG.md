@@ -1,17 +1,22 @@
 # Changelog
 
-## Unreleased
+## 0.9.0 - 2026-09-05
 
-- Align upgrades with the intranet-browser-agent's immutable versioned-release
-  strategy. If the legacy Coremail skill directory remains protected or open after
-  the one constrained UAC attempt, installation prints a same-run manual recovery
-  prompt (`R` to retry after closing the holder/repairing the exact ACL, `V` to
-  continue with the immutable path) instead of requiring a new package download.
-  If no console is available, it leaves the old directory untouched and publishes
-  the verified package under `.claude\coremail-releases\<version>-<id>`, then
-  registers the user-scope MCP against that new path. The elevated helper now
-  records its child diagnostic, so a real ACL or handle failure is no longer
-  reduced to an opaque exit code.
+- Separate the MCP runtime from Claude Skill discovery. Install, upgrade, and
+  uninstall no longer inspect, move, repair, elevate, or delete anything under
+  the user's Skill directory.
+- Publish immutable, user-scoped releases under
+  `%LOCALAPPDATA%\CoremailController\releases`; reuse only a fully verified
+  matching release and never overwrite a published directory.
+- Make upgrades and uninstall non-blocking when an older directory is locked or
+  inaccessible: the old directory is left untouched, and uninstall removes only
+  the Claude user-scope MCP registration while retaining runtime files.
+- Put the natural-language policy in MCP tool descriptions and
+  `initialize.instructions`; an installed Skill is optional reference material,
+  not a prerequisite for mail operations.
+- Remove the UAC/ACL/manual-recovery lifecycle path and add Windows gate coverage
+  for locked legacy directories, immutable runtime publication/reuse, and
+  retention of an active runtime during uninstall.
 
 ## 0.8.0 - 2026-09-05
 

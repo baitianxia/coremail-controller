@@ -30,9 +30,43 @@ try {
     }
 
     $localRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
-    $installedRoot = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.claude\skills\coremail-controller'
-    if (Test-Path -LiteralPath (Join-Path $installedRoot 'scripts\setup-account.ps1') -PathType Leaf) {
-        $pluginRoot = $installedRoot
+    $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
+    if ([string]::IsNullOrWhiteSpace($localAppData)) { $localAppData = [string]$env:LOCALAPPDATA }
+    if ([string]::IsNullOrWhiteSpace($localAppData)) { throw 'The current Windows LocalAppData directory could not be resolved.' }
+    $runtimeRoot = $null
+    $userConfig = Resolve-CoremailClaudeUserConfigPath -UserProfile ([Environment]::GetFolderPath('UserProfile'))
+    if (Test-Path -LiteralPath $userConfig -PathType Leaf) {
+        try {
+            $payload = Get-Content -LiteralPath $userConfig -Raw | ConvertFrom-Json
+            $servers = $payload.PSObject.Properties['mcpServers']
+            $entry = $null
+            if ($null -ne $servers -and $null -ne $servers.Value) {
+                $entry = $servers.Value.PSObject.Properties['coremail-controller']
+            }
+            if ($null -ne $entry -and $null -ne $entry.Value) {
+                $args = @($entry.Value.args | ForEach-Object { [string]$_ })
+                for ($index = 0; $index -lt $args.Count - 1; $index++) {
+                    if ($args[$index] -ieq '-File') {
+                        $runtimeRoot = [IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $args[$index + 1])))
+                        break
+                    }
+                }
+            }
+        }
+        catch { $runtimeRoot = $null }
+    }
+    $releaseRoot = Join-Path ([IO.Path]::GetFullPath($localAppData)) 'CoremailController\releases'
+    if ($runtimeRoot -and
+        $runtimeRoot.StartsWith(([IO.Path]::GetFullPath($localAppData)).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) -and
+        (Test-Path -LiteralPath (Join-Path $runtimeRoot 'scripts\setup-account.ps1') -PathType Leaf)) {
+        $pluginRoot = $runtimeRoot
+    }
+    elseif (Test-Path -LiteralPath $releaseRoot -PathType Container) {
+        $candidateRelease = Get-ChildItem -LiteralPath $releaseRoot -Directory |
+            Where-Object { $_.Name -like 'coremail-controller-*' } |
+            Sort-Object Name -Descending | Select-Object -First 1
+        if ($null -ne $candidateRelease) { $pluginRoot = $candidateRelease.FullName }
+        else { $pluginRoot = $localRoot }
     }
     else {
         $pluginRoot = $localRoot
@@ -64,7 +98,7 @@ try {
     Write-Host ''
     Write-Host 'Coremail account configuration completed.' -ForegroundColor Green
     Write-Host "Diagnostic log: $LogPath"
-    Write-Host 'Restart Claude Code or run /reload-plugins, then ask Claude to check the Coremail connection.'
+    Write-Host 'Restart Claude Code, then ask Claude to check the Coremail connection.'
     exit 0
 }
 catch {

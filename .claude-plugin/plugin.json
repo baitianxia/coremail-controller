@@ -1,7 +1,7 @@
 {
   "name": "coremail-controller",
   "description": "Interface-first Coremail mailbox access with a secure IMAP/SMTP fallback.",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "author": {
     "name": "Local Claude Code integration"
   },

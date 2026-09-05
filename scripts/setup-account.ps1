@@ -387,7 +387,7 @@ try {
         Write-Host "Password location: Windows Credential Manager target '$CredentialTarget'"
     }
     Write-Host "Diagnostic log: $LogPath"
-    Write-Host 'Restart Claude Code or run /reload-plugins, then call coremail_check_connection.'
+    Write-Host 'Restart Claude Code, then call coremail_check_connection.'
     Write-Host 'The connector never starts, clicks, captures, or types into the Coremail interface.'
 }
 catch {

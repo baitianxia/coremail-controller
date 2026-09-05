@@ -39,7 +39,7 @@ from windows_mapi import (
     detect_coremail_mapi_registration,
 )
 
-SERVER_VERSION = "0.8.0"
+SERVER_VERSION = "0.9.0"
 DEFAULT_TOKEN_TTL_SECONDS = 15 * 60
 DEFAULT_MAX_MESSAGE_BYTES = 10 * 1024 * 1024
 DEFAULT_MAX_BODY_CHARS = 50_000

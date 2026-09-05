@@ -229,7 +229,7 @@ jobs:
 
           $archives = @(Get-ChildItem -LiteralPath $candidateRoot -Filter '*.zip' -File)
           if ($archives.Count -ne 1 -or
-              $archives[0].Name -ne 'coremail-controller-0.8.0-windows.zip') {
+              $archives[0].Name -ne 'coremail-controller-0.9.0-windows.zip') {
             throw 'Expected exactly the versioned gated ZIP.'
           }
           $archive = $archives[0]

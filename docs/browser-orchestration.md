@@ -61,7 +61,7 @@ stronger deployments:
    storage. Do not mount the mailbox profile or outgoing attachment directories.
 
 The Coremail MCP must remain under the Windows identity that owns its Generic
-Credential or existing Coremail shared MAPI session. Version 0.8.0 deliberately
+Credential or existing Coremail shared MAPI session. Version 0.9.0 deliberately
 does not accept a password through an environment variable because sibling MCP
 processes can inherit the same environment.
 
@@ -109,8 +109,9 @@ claude mcp list
 ```
 
 Ask Claude in natural language to research public pages and prepare a Coremail
-message. The installed `coremail-controller` user skill applies the isolated
-combined workflow; a version-specific slash alias is optional and is not required.
+message. The Coremail MCP tool descriptions and initialization instructions apply
+the isolated combined workflow; an installed user skill or version-specific slash
+alias is optional and is not required.
 The browser MCP's own visible/headless mode, authentication, and sandboxing remain
 its configuration responsibility; choose headless mode if visible browser operation
 is not acceptable.

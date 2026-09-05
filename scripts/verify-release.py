@@ -102,7 +102,7 @@ def verify(root: Path, *, require_windows_gate: bool, allow_python_runtime: bool
         if sha256(path) != expected_digest:
             raise VerificationError(f"SHA-256 mismatch: {relative}")
 
-    if metadata.get("schema_version") != 1 or metadata.get("version") != "0.8.0":
+    if metadata.get("schema_version") != 1 or metadata.get("version") != "0.9.0":
         raise VerificationError("unsupported build metadata identity")
     if require_windows_gate:
         required = {

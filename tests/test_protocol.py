@@ -13,10 +13,10 @@ SERVER = ROOT / "mcp" / "server.py"
 
 
 class ProtocolTests(unittest.TestCase):
-    def test_user_skill_layout_and_mcp_path_are_portable(self) -> None:
+    def test_mcp_layout_is_portable_without_a_skill_install(self) -> None:
         manifest = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["name"], "coremail-controller")
-        self.assertEqual(manifest["version"], "0.8.0")
+        self.assertEqual(manifest["version"], "0.9.0")
 
         user_skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
         self.assertTrue(user_skill.startswith("---\nname: coremail-controller\n"))
@@ -38,10 +38,11 @@ class ProtocolTests(unittest.TestCase):
 
         installer = (ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
         registrar = (ROOT / "scripts" / "register_claude_user_mcp.py").read_text(encoding="utf-8")
-        self.assertIn("plugin-backups", installer)
-        self.assertIn("coremail-releases", installer)
-        self.assertIn("IMMUTABLE RELEASE ACTIVE", installer)
-        self.assertNotIn("skills\\coremail-controller.backup", installer)
+        self.assertIn("LocalAppData", installer)
+        self.assertIn("releases", installer)
+        self.assertNotIn(".claude\\skills", installer)
+        self.assertNotIn("plugin-backups", installer)
+        self.assertNotIn("RunAs", installer)
         self.assertIn("tests\\smoke-mcp.ps1", installer)
         self.assertIn("register_claude_user_mcp.py", installer)
         self.assertIn("--scope", registrar)
@@ -105,7 +106,8 @@ class ProtocolTests(unittest.TestCase):
         responses = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
         self.assertEqual([response["id"] for response in responses], [1, 2, 3])
         self.assertEqual(responses[0]["result"]["serverInfo"]["name"], "coremail-headless")
-        self.assertEqual(responses[0]["result"]["serverInfo"]["version"], "0.8.0")
+        self.assertEqual(responses[0]["result"]["serverInfo"]["version"], "0.9.0")
+        self.assertIn("确认发送", responses[0]["result"]["instructions"])
         names = {tool["name"] for tool in responses[1]["result"]["tools"]}
         self.assertEqual(len(names), 10)
         self.assertIn("coremail_discover_local", names)
@@ -193,13 +195,13 @@ class ProtocolTests(unittest.TestCase):
     def test_install_activation_does_not_import_temporary_directory_acl(self) -> None:
         installer = (ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8").lower()
         normalized = " ".join(installer.split())
-        self.assertIn("plugin-staging", normalized)
+        self.assertIn("staging", normalized)
         self.assertIn(
-            "copy-coremailplugintree -source $sourceroot -destination $activationplugin",
+            "copy-coremailplugintree -source $sourceroot -destination $stageplugin",
             normalized,
         )
         self.assertIn(
-            "move-coremaildirectoryatomically ` -source $activationplugin ` -destination $targetroot",
+            "move-coremaildirectoryatomically -source $stageplugin -destination $activeroot",
             normalized,
         )
         self.assertIsNone(re.search(r"(?<![a-z])move-item\b", normalized))
@@ -216,10 +218,11 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn("ambiguous state", common)
         self.assertIn("guid", uninstaller)
         self.assertIn("fileshare]::none", common)
-        self.assertIn("move-coremaildirectoryatomically", uninstaller)
+        self.assertIn("unregister", uninstaller)
         self.assertIsNone(re.search(r"(?<![a-z])move-item\b", lifecycle))
         self.assertNotIn("takeown", uninstaller)
         self.assertNotIn("icacls", uninstaller)
+        self.assertNotIn(".claude\\skills", lifecycle)
 
     def test_python_version_probe_avoids_native_output_and_quote_loss(self) -> None:
         probe = ROOT / "mcp" / "check-python.py"
