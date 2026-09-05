@@ -411,6 +411,131 @@ function Test-CoremailDirectoryPresent {
     }
 }
 
+function Test-CoremailInteractivePromptAvailable {
+    # The hosted release gate and redirected automation must never block on
+    # Read-Host.  A normal INSTALL.cmd/UNINSTALL.cmd console remains eligible
+    # for the short, user-controlled recovery prompt below.
+    if ($env:COREMAIL_RELEASE_GATE_TESTING -eq 'true' -or
+        $env:CI -eq 'true' -or
+        $env:GITHUB_ACTIONS -eq 'true') {
+        return $false
+    }
+    try {
+        if ([Console]::IsInputRedirected) { return $false }
+    }
+    catch { return $false }
+    return ($null -ne $Host -and $null -ne $Host.UI)
+}
+
+function Invoke-CoremailManualDirectoryMoveAssistance {
+    <#
+      Give a real Windows user a chance to release a handle or repair the
+      exact ACL without downloading/repacking the release.  The function never
+      deletes, copies, takes ownership, or recursively changes permissions.
+      It returns 'moved' when the user action made the atomic move succeed and
+      'versioned' when the user chooses the immutable-release fallback or the
+      process is non-interactive.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][string]$OperationLabel,
+        [switch]$AllowVersionedFallback
+    )
+
+    if (-not (Test-CoremailInteractivePromptAvailable)) {
+        Write-CoremailLifecycleLog (
+            "MANUAL MOVE ASSISTANCE SKIPPED operation=$OperationLabel; reason=noninteractive"
+        )
+        return 'versioned'
+    }
+
+    $sourcePath = [IO.Path]::GetFullPath($Source)
+    $destinationPath = [IO.Path]::GetFullPath($Destination)
+    $sidText = '<current-user-SID>'
+    try {
+        $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        if ($null -ne $currentSid) { $sidText = $currentSid.Value }
+    }
+    catch { }
+    Write-Host ''
+    Write-Warning (
+        "$OperationLabel still cannot access the exact existing directory. " +
+        'No files were deleted or overwritten.'
+    )
+    Write-Host "Source: $sourcePath"
+    Write-Host '请先关闭 Claude Code、Explorer 中打开该目录的窗口，以及可能正在扫描该目录的同步/索引程序。'
+    Write-Host '如果是 ACL 问题，请让管理员在管理员 PowerShell 中仅对上述目录授予当前用户 Modify：'
+    $grantText = '*' + $sidText + ':(OI)(CI)M'
+    Write-Host ('icacls.exe "{0}" /grant {1} /L /Q' -f $sourcePath, $grantText)
+    if ($AllowVersionedFallback) {
+        Write-Host '完成人工处理后按 R 重试；按 V 保留旧目录并直接启用新的不可变版本目录。'
+    }
+    else {
+        Write-Host '完成人工处理后按 R 重试；如果暂时无法处理，请退出并在关闭占用者后再次运行。'
+    }
+
+    for ($promptAttempt = 1; $promptAttempt -le 3; $promptAttempt++) {
+        try {
+            $promptText = if ($AllowVersionedFallback) {
+                "[$promptAttempt/3] 输入 R=重试，V=使用不可变版本"
+            }
+            else {
+                "[$promptAttempt/3] 输入 R=重试"
+            }
+            $choice = (Read-Host $promptText).Trim().ToLowerInvariant()
+        }
+        catch {
+            Write-CoremailLifecycleLog (
+                "MANUAL MOVE ASSISTANCE FALLBACK operation=$OperationLabel; reason=prompt-failed"
+            )
+            return 'versioned'
+        }
+        if ($AllowVersionedFallback -and $choice -eq 'v') {
+            Write-CoremailLifecycleLog (
+                "MANUAL MOVE ASSISTANCE FALLBACK operation=$OperationLabel; choice=versioned"
+            )
+            return 'versioned'
+        }
+        if ($choice -ne 'r') {
+            $validChoices = if ($AllowVersionedFallback) { 'R 或 V' } else { 'R' }
+            Write-Host "请输入 $validChoices。" -ForegroundColor Yellow
+            continue
+        }
+        try {
+            [IO.Directory]::Move($sourcePath, $destinationPath)
+            $sourceAfter = Test-CoremailDirectoryPresent -Path $sourcePath
+            $destinationAfter = Test-CoremailDirectoryPresent -Path $destinationPath
+            if (-not $sourceAfter -and $destinationAfter) {
+                Write-CoremailLifecycleLog (
+                    "MANUAL MOVE ASSISTANCE RECOVERED operation=$OperationLabel; destination=$destinationPath"
+                )
+                Write-Host "$OperationLabel 已在人工处理后完成。" -ForegroundColor Green
+                return 'moved'
+            }
+            throw (
+                "$OperationLabel returned an ambiguous postcondition after manual retry; " +
+                "sourcePresent=$sourceAfter; destinationPresent=$destinationAfter"
+            )
+        }
+        catch {
+            Write-Warning (
+                "$OperationLabel 仍未完成：$($_.Exception.Message)。" +
+                $(if ($AllowVersionedFallback) {
+                    ' 可继续释放占用后再次按 R，或按 V 继续。'
+                }
+                else {
+                    ' 可继续释放占用后再次按 R。'
+                })
+            )
+        }
+    }
+    Write-CoremailLifecycleLog (
+        "MANUAL MOVE ASSISTANCE FALLBACK operation=$OperationLabel; reason=retry-window-exhausted"
+    )
+    return 'versioned'
+}
+
 function Move-CoremailDirectoryAtomically {
     param(
         [Parameter(Mandatory = $true)][string]$Source,
@@ -903,7 +1028,8 @@ function Invoke-CoremailElevatedDirectoryMove {
         [Parameter(Mandatory = $true)][string]$Source,
         [Parameter(Mandatory = $true)][string]$Destination,
         [Parameter(Mandatory = $true)][string]$ExpectedVersion,
-        [switch]$DirectForVerifiedGate
+        [switch]$DirectForVerifiedGate,
+        [switch]$FailIfBlocked
     )
 
     $profilePath = [IO.Path]::GetFullPath($UserProfile).TrimEnd('\')
@@ -972,6 +1098,9 @@ function Invoke-CoremailElevatedDirectoryMove {
         }
     }
 
+    $diagnosticPath = Join-Path ([IO.Path]::GetTempPath()) (
+        'coremail-elevated-move-' + [guid]::NewGuid().ToString('N') + '.txt'
+    )
     $payload = [ordered]@{
         profile = $profilePath
         source = $sourcePath
@@ -979,6 +1108,7 @@ function Invoke-CoremailElevatedDirectoryMove {
         allowed_parents = $allowedParents
         expected_version = [string]$ExpectedVersion
         sid = [string]$sid.Value
+        diagnostic_path = $diagnosticPath
     }
     $payloadJson = $payload | ConvertTo-Json -Compress -Depth 4
     $payloadBase64 = [Convert]::ToBase64String(
@@ -994,6 +1124,11 @@ try {
     $profile = [IO.Path]::GetFullPath([string]$payload.profile).TrimEnd('\')
     $source = [IO.Path]::GetFullPath([string]$payload.source).TrimEnd('\')
     $destination = [IO.Path]::GetFullPath([string]$payload.destination).TrimEnd('\')
+    $diagnosticPath = [IO.Path]::GetFullPath([string]$payload.diagnostic_path)
+    $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+    if (-not $diagnosticPath.StartsWith($tempRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The elevated diagnostic path was outside the temporary directory.'
+    }
     $expectedSource = [IO.Path]::GetFullPath(
         (Join-Path $profile '.claude\skills\coremail-controller')
     ).TrimEnd('\')
@@ -1083,6 +1218,15 @@ try {
 }
 catch {
     $message = $_.Exception.Message
+    try {
+        $diagnosticEncoding = New-Object System.Text.UTF8Encoding($false)
+        [IO.File]::WriteAllText(
+            $diagnosticPath,
+            $message,
+            $diagnosticEncoding
+        )
+    }
+    catch { }
     [Console]::Error.WriteLine($message)
     exit 1
 }
@@ -1099,7 +1243,8 @@ catch {
         "ELEVATED DIRECTORY MOVE REQUESTED source=$sourcePath; destination=$destinationPath; version=$ExpectedVersion"
     )
     $elevatedExitCode = $null
-    if ($DirectForVerifiedGate) {
+    try {
+      if ($DirectForVerifiedGate) {
         # The hosted release orchestrator is already elevated.  This guarded
         # branch executes the exact encoded helper without another secure-
         # desktop prompt so CI can exercise its payload, manifest checks,
@@ -1124,8 +1269,8 @@ catch {
             $elevatedExitCode = $global:LASTEXITCODE
         }
         finally { $ErrorActionPreference = $directPreviousPreference }
-    }
-    else {
+      }
+      else {
         Write-Host 'The protected legacy package still cannot be moved by the current token. Windows will now request one UAC approval for the exact atomic move.' -ForegroundColor Yellow
         try {
             $elevatedProcess = Start-Process `
@@ -1153,15 +1298,15 @@ catch {
             $elevatedExitCode = $elevatedProcess.ExitCode
         }
         finally { $elevatedProcess.Dispose() }
-    }
-    $sourceAfterElevated = Test-Path -LiteralPath $sourcePath -PathType Container
-    $destinationAfterElevated = Test-Path -LiteralPath $destinationPath -PathType Container
-    if (-not $sourceAfterElevated -and $destinationAfterElevated) {
+      }
+      $sourceAfterElevated = Test-Path -LiteralPath $sourcePath -PathType Container
+      $destinationAfterElevated = Test-Path -LiteralPath $destinationPath -PathType Container
+      if (-not $sourceAfterElevated -and $destinationAfterElevated) {
         Write-Host 'The exact legacy package move completed under the approved UAC action.' -ForegroundColor Green
         Write-CoremailLifecycleLog 'ELEVATED DIRECTORY MOVE RECOVERED mode=system-powershell'
         return
-    }
-    if ($elevatedExitCode -ne 0) {
+      }
+      if ($elevatedExitCode -ne 0) {
         # Before allowing ordinary retries after a failed elevated attempt,
         # re-read the source identity.  A concurrent replacement must never
         # turn a transient access error into permission to move an unknown
@@ -1181,20 +1326,42 @@ catch {
                 $_.Exception.Message
             )
         }
+        $diagnostic = '<no child diagnostic>'
+        if (Test-Path -LiteralPath $diagnosticPath -PathType Leaf) {
+            try {
+                $diagnostic = ([IO.File]::ReadAllText($diagnosticPath)).Trim()
+            }
+            catch { $diagnostic = '<diagnostic unreadable>' }
+        }
+        if ([string]::IsNullOrWhiteSpace($diagnostic)) {
+            $diagnostic = '<no child diagnostic>'
+        }
         Write-Warning (
             "The elevated legacy package move did not complete (exit code ${elevatedExitCode}); " +
-            'the source is intact. The installer will continue its bounded retry window.'
+            "the source is intact. Child diagnostic: $diagnostic"
         )
         Write-CoremailLifecycleLog (
-            "ELEVATED DIRECTORY MOVE BLOCKED exit=$elevatedExitCode; source=$sourcePath; destination=$destinationPath"
+            "ELEVATED DIRECTORY MOVE BLOCKED exit=$elevatedExitCode; source=$sourcePath; destination=$destinationPath; diagnostic=$diagnostic"
         )
+        if ($FailIfBlocked) {
+            throw (
+                'The elevated legacy package move was blocked; the source remains intact. ' +
+                "Child diagnostic: $diagnostic"
+            )
+        }
         return
-    }
-    if ($sourceAfterElevated -or -not $destinationAfterElevated) {
+      }
+      if ($sourceAfterElevated -or -not $destinationAfterElevated) {
         throw 'The elevated move reported success but its source/destination postcondition was not met.'
+      }
+      Write-Host 'The exact legacy package move completed under the approved UAC action.' -ForegroundColor Green
+      Write-CoremailLifecycleLog 'ELEVATED DIRECTORY MOVE RECOVERED mode=system-powershell'
     }
-    Write-Host 'The exact legacy package move completed under the approved UAC action.' -ForegroundColor Green
-    Write-CoremailLifecycleLog 'ELEVATED DIRECTORY MOVE RECOVERED mode=system-powershell'
+    finally {
+        if (Test-Path -LiteralPath $diagnosticPath -PathType Leaf) {
+            Remove-Item -LiteralPath $diagnosticPath -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function Publish-CoremailFileAtomically {

@@ -90,9 +90,9 @@ INSTALL.cmd
 ```
 
 向导会先逐文件核对包内清单和 Windows 门禁元数据，固定 Python 运行时，在当前用户的
-`.claude\skills` 目录暂存并原子替换包，然后通过真实 Claude Code 执行用户级
-`mcp remove → mcp add → mcp get`，核对实际写入的 `.claude.json` 条目。包和用户 skill
-安装到：
+`.claude\skills` 目录暂存并原子发布包，然后通过真实 Claude Code 执行用户级
+`mcp remove → mcp add → mcp get`，核对实际写入的 `.claude.json` 条目。首次安装的包和用户
+skill 安装到：
 
 ```text
 %USERPROFILE%\.claude\skills\coremail-controller
@@ -100,23 +100,28 @@ INSTALL.cmd
 
 首次安装会先探测已有 Coremail 共享会话；探测成功则不询问密码，探测失败才进入
 IMAP/SMTP 配置。升级默认保留已有账号配置及 Windows 凭据。
-识别到旧 Coremail 包时，安装器会把它移动到以下目录，而不是覆盖或删除：
+识别到旧 Coremail 包时，安装器会优先把它移动到以下目录，而不是覆盖或删除：
 
 ```text
 %USERPROFILE%\.claude\plugin-backups
 ```
 
-备份刻意放在 `skills` 目录之外，避免 Claude Code 把旧版本再次加载为用户 skill。正常流程
-只在当前用户范围运行，不请求管理员权限，也不绕过机器的 PowerShell 执行策略。若
-检测到已撤回旧版本留下的
-`%USERPROFILE%\.claude\skills\coremail-controller` 无法由当前用户检查或改名时，安装器会
-仅针对这次精确迁移请求一次 UAC。受限助手先用 Windows 自带的 `icacls.exe` 给当前用户
-SID 增加该目录的可继承 `Modify`，再在同一提升进程中把它原子移动到本次生成的
-`plugin-backups`（卸载时为 `plugins-disabled`）。它保留原 ACL 和所有权，不递归、不重置、
-不接管所有权、不覆盖、不删除；随后普通用户进程复核源/目标状态。若目录仍被 Claude Code、
-资源管理器或安全/索引进程占用，窗口会明确提示关闭这些进程，源目录和邮件数据保持不变。
-取消授权或复核失败不会移动或覆盖内容；若授权已成功，新增的当前用户 ACE 会保留。企业
-策略禁止此兼容处理时，可用 `-NoLegacyPermissionRepair` 让流程直接安全停止。
+备份刻意放在 `skills` 目录之外，避免 Claude Code 把旧版本再次加载为用户 skill。若旧包
+正在被 Claude Code、资源管理器或安全软件占用，或其 ACL 在一次受限 UAC 尝试后仍不允许
+改名，交互式安装器会显示精确目录、当前用户 SID 和一条只针对该目录的人工处理提示；关闭
+占用者或由管理员修复 ACL 后输入 `R` 即可在同一个安装过程中重试，不需要重新打包或重新下载。
+也可以输入 `V`，让安装器保留旧目录并把新包发布到唯一的版本目录：
+
+```text
+%USERPROFILE%\.claude\coremail-releases\coremail-controller-<version>-<id>
+```
+
+随后只把用户级 MCP 指向这个新目录；旧 skill 目录原样保留，不覆盖、不删除、不递归复制。
+这与 intranet-browser-agent 的版本化运行时发布方式一致，客户端不需要先卸载正在使用的
+旧运行包。正常流程只在当前用户范围运行，不请求管理员权限，也不绕过机器的 PowerShell
+执行策略。只有精确旧目录的 ACL 兼容修复需要一次 UAC；失败原因会写入生命周期日志。
+无人值守运行时不会等待输入，而是直接使用上述版本目录路径。企业策略禁止此兼容处理时，
+`-NoLegacyPermissionRepair` 只跳过 UAC，仍可使用上述版本目录路径。
 
 安装、配置和卸载都会把不含密码的诊断日志写入 `%TEMP%\CoremailController`；窗口关闭
 后仍可排错。

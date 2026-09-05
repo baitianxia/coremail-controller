@@ -33,10 +33,16 @@ Get-Content .\coremail-controller-0.8.0-windows.zip.sha256
    并把密码写入 Windows 凭据管理器；
 6. 执行 MCP 离线冒烟测试，并尝试检查真实邮箱连接。
 
-安装和账号配置正常都在当前用户范围内。只有检测到已撤回旧版遗留的固定 Coremail 包目录
-无法由当前用户检查或改名时，才会出现一次 UAC：受限地给当前用户 SID 增加 `Modify`，并把已
-核验的旧目录原子移动到本次生成的隔离目录；不删除旧目录或邮件配置。若仍提示目录被占用，
-请先关闭 Claude Code、资源管理器及安全/索引进程再重试。升级时默认保留现有账号配置。
+安装和账号配置正常都在当前用户范围内。升级时如果旧 Coremail 包正在被 Claude Code、资源
+管理器或安全软件占用，安装器会先尝试一次受限 UAC 修复，然后显示精确目录和人工处理提示。
+关闭占用者或修复 ACL 后输入 `R` 可在同一次安装中重试；输入 `V` 则把新包发布到唯一的版本
+目录并让用户级 MCP 指向新包，旧目录原样保留。两种路径都不需要重新打包或重新下载：
+
+```text
+%USERPROFILE%\.claude\coremail-releases\coremail-controller-<version>-<id>
+```
+
+不删除旧目录或邮件配置。升级时默认保留现有账号配置。
 若设置了 `CLAUDE_CONFIG_DIR`，安装和卸载会沿用它，但只接受本机盘符绝对路径，拒绝相对、
 `~` 和 UNC 路径。
 失败或成功后都可在 `%TEMP%\CoremailController` 找到不含密码的诊断日志。
@@ -58,4 +64,6 @@ Get-Content .\coremail-controller-0.8.0-windows.zip.sha256
 ```
 
 重新配置账号可双击 `CONFIGURE-ACCOUNT.cmd`；移除用户级 MCP 并停用包可双击 `UNINSTALL.cmd`。
-卸载采用移动而非删除，不会删除账号配置和 Windows 凭据。
+卸载采用移动而非删除，不会删除账号配置和 Windows 凭据。若当前 MCP 使用的是版本化
+`coremail-releases`，卸载会停用该版本；升级时遗留的旧 skill 目录可能原样保留，不影响
+MCP 已被移除的结果。

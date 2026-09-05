@@ -149,13 +149,38 @@ function Assert-ConfigUnchanged {
     }
 }
 
+function Get-RegisteredPackageRoot {
+    if (-not (Test-Path -LiteralPath $claudeUserConfigPath -PathType Leaf)) {
+        throw "Claude user configuration is missing: $claudeUserConfigPath"
+    }
+    $payload = Get-Content -LiteralPath $claudeUserConfigPath -Raw | ConvertFrom-Json
+    $serversProperty = $payload.PSObject.Properties['mcpServers']
+    if ($null -eq $serversProperty -or $null -eq $serversProperty.Value) {
+        throw 'Claude user-scope MCP configuration is missing.'
+    }
+    $entryProperty = $serversProperty.Value.PSObject.Properties['coremail-controller']
+    if ($null -eq $entryProperty -or $null -eq $entryProperty.Value) {
+        throw 'Claude user-scope Coremail MCP entry is missing.'
+    }
+    $arguments = @($entryProperty.Value.args | ForEach-Object { [string]$_ })
+    $fileIndex = [Array]::IndexOf($arguments, '-File')
+    if ($fileIndex -lt 0 -or $fileIndex + 1 -ge $arguments.Count) {
+        throw 'Claude user-scope Coremail MCP entry has no -File launcher.'
+    }
+    $serverScript = [IO.Path]::GetFullPath($arguments[$fileIndex + 1])
+    return [IO.Path]::GetFullPath(
+        [IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($serverScript))
+    )
+}
+
 function Assert-UserMcpRegistered {
-    $registrar = Join-Path $targetRoot 'scripts\register_claude_user_mcp.py'
+    $activeRoot = Get-RegisteredPackageRoot
+    $registrar = Join-Path $activeRoot 'scripts\register_claude_user_mcp.py'
     & $PythonCommand -B -I $registrar verify `
         --server-name 'coremail-controller' `
         --user-config $claudeUserConfigPath `
         --powershell-executable $windowsPowerShell `
-        --server-script (Join-Path $targetRoot 'mcp\run-server.ps1')
+        --server-script (Join-Path $activeRoot 'mcp\run-server.ps1')
     $verifyExitCode = $LASTEXITCODE
     if ($verifyExitCode -ne 0) {
         throw "Claude user-scope MCP verification failed with exit code $verifyExitCode."
@@ -622,6 +647,70 @@ Invoke-WindowsPowerShellScript -ScriptPath $uninstaller -ScriptArguments @(
 )
 if (Test-Path -LiteralPath $targetRoot) {
     throw 'Idempotent uninstall unexpectedly recreated the active Coremail package directory.'
+}
+
+Write-Host "[$ScenarioName gate 12] Publishing an immutable release while the active skill is locked"
+Invoke-WindowsPowerShellScript -ScriptPath $installer -ScriptArguments @(
+    '-SkipConnectionCheck',
+    '-PythonExecutable', $PythonCommand,
+    '-ClaudeCommand', $ClaudeCommand,
+    '-LogPath', (Join-Path $RunnerTemp "IMMUTABLE-BASE-$ScenarioName.log")
+)
+if (-not (Test-Path -LiteralPath $targetRoot -PathType Container)) {
+    throw 'Immutable-release fixture did not create the fixed skill package.'
+}
+$lockedSkillFile = Join-Path $targetRoot 'SKILL.md'
+$lockedSkillStream = [IO.File]::Open(
+    $lockedSkillFile,
+    [IO.FileMode]::Open,
+    [IO.FileAccess]::Read,
+    [IO.FileShare]::Read
+)
+$immutableInstallLog = Join-Path $RunnerTemp "IMMUTABLE-UPGRADE-$ScenarioName.log"
+try {
+    Invoke-WindowsPowerShellScript -ScriptPath $installer -ScriptArguments @(
+        '-SkipConnectionCheck',
+        '-PythonExecutable', $PythonCommand,
+        '-ClaudeCommand', $ClaudeCommand,
+        '-LogPath', $immutableInstallLog
+    )
+}
+finally { $lockedSkillStream.Dispose() }
+if (-not (Test-Path -LiteralPath $targetRoot -PathType Container)) {
+    throw 'Immutable upgrade touched the locked legacy skill directory.'
+}
+$immutableActiveRoot = Get-RegisteredPackageRoot
+if ([string]::Equals(
+        [IO.Path]::GetFullPath($immutableActiveRoot).TrimEnd('\'),
+        [IO.Path]::GetFullPath($targetRoot).TrimEnd('\'),
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+    throw 'Locked-package upgrade incorrectly re-registered the fixed skill directory.'
+}
+if ($immutableActiveRoot -notmatch '\.claude\\coremail-releases\\coremail-controller-') {
+    throw "Locked-package upgrade did not use the immutable release root: $immutableActiveRoot"
+}
+$immutableInstallText = Get-Content -LiteralPath $immutableInstallLog -Raw
+if ($immutableInstallText -notmatch 'IMMUTABLE RELEASE ACTIVE' -or
+    $immutableInstallText -notmatch 'MANUAL MOVE ASSISTANCE SKIPPED') {
+    throw 'Immutable-release/manual-assistance activation evidence is missing from the install log.'
+}
+Assert-UserMcpRegistered
+Invoke-WindowsPowerShellScript -ScriptPath $uninstaller -ScriptArguments @(
+    '-ClaudeCommand', $ClaudeCommand,
+    '-LogPath', (Join-Path $RunnerTemp "IMMUTABLE-UNINSTALL-$ScenarioName.log")
+)
+Assert-UserMcpAbsent
+if (-not (Test-Path -LiteralPath $targetRoot -PathType Container)) {
+    throw 'Immutable-release uninstall removed the compatibility skill unexpectedly.'
+}
+$lockedSkillCleanup = Join-Path $targetRoot 'SKILL.md'
+Invoke-WindowsPowerShellScript -ScriptPath $uninstaller -ScriptArguments @(
+    '-ClaudeCommand', $ClaudeCommand,
+    '-LogPath', (Join-Path $RunnerTemp "IMMUTABLE-LEGACY-CLEANUP-$ScenarioName.log")
+)
+if (Test-Path -LiteralPath $lockedSkillCleanup) {
+    throw 'The final legacy compatibility cleanup did not move the fixed skill directory.'
 }
 
 Write-Host "Windows PowerShell 5.1 packaged lifecycle gate passed: $ScenarioName" -ForegroundColor Green

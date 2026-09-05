@@ -62,9 +62,11 @@ cannot reliably mark unread, save drafts, or carry Internet threading headers.
   the actual `.claude.json` entry, and restores a byte-for-byte backup on failure.
 - `INSTALL.cmd`, `CONFIGURE-ACCOUNT.cmd`, and `UNINSTALL.cmd`: user entry points.
 - `scripts/install.ps1`: validates a gated package, stages the package under the
-  current user's Claude directory, registers the user MCP, and runs account setup.
-- `scripts/uninstall.ps1`: removes the user MCP and moves the recognized package to
-  `plugins-disabled` without deleting it.
+  current user's Claude directory, publishes either the fixed skill package or an
+  immutable upgrade release, registers the user MCP, and runs account setup.
+- `scripts/uninstall.ps1`: removes the user MCP and moves the registered package to
+  `plugins-disabled` without deleting it; an older fixed skill left behind by an
+  immutable upgrade is treated as a compatibility skill and is not touched.
 - `scripts/windows-tool-discovery.ps1`: resolves native and npm Claude entry points
   without invoking a package manager or a command shell.
 - `scripts/windows-lifecycle-common.ps1`: path validation, native invocation,
@@ -220,12 +222,22 @@ installer.
 
 The package is copied to a unique staging directory below the current user's
 `.claude` root, validated, and published with same-volume `[IO.Directory]::Move`.
-Existing recognized packages are moved to `.claude\plugin-backups`, outside skill
-discovery; they are never overwritten or recursively deleted. A lifecycle lock
-serializes install/upgrade/uninstall. Directory moves retry only while source exists
-and destination is absent; ambiguous states stop without cleanup. A failed activation
-restores the prior package and user MCP configuration, and quarantines an uncommitted
-replacement for diagnosis.
+On a normal upgrade an accessible recognized package may be moved to
+`.claude\plugin-backups`, outside skill discovery; it is never overwritten or
+recursively deleted. If that live package is protected or held open after the
+bounded retry and one constrained UAC attempt, the interactive installer prints
+the exact path, current-user SID, and a narrowly scoped `icacls` example. The
+user can release the handle or repair the ACL and press `R` to retry in the same
+run, without rebuilding or downloading the package; pressing `V` (or running
+without an interactive console) leaves the old skill directory untouched and
+publishes the new verified package to a unique immutable directory under
+`.claude\coremail-releases`, then points the user-scope MCP entry at that release.
+This is the same versioned-release principle used by the intranet browser agent:
+an active client never has to unload its current runtime before an upgrade can
+complete. A lifecycle lock serializes install/upgrade/uninstall. Directory moves
+retry only while source exists and destination is absent; ambiguous states stop
+without cleanup. A failed activation restores the prior package and user MCP
+configuration, and quarantines an uncommitted replacement for diagnosis.
 
 The only elevation exception is a withdrawn package whose exact active directory
 cannot be inspected or renamed by the current user. After identity, path, and
@@ -244,19 +256,23 @@ directory (`plugin-backups` during upgrade or `plugins-disabled` during uninstal
 
 This avoids relying on a medium-integrity user token to rename a directory whose
 parent, integrity label, or inherited policy still denies `DELETE_CHILD`. The
-ordinary process verifies the source/destination postcondition and continues its
-bounded retry window if a process lock remains. If the move is still blocked,
-close Claude Code, Explorer, and security/indexing processes using the package and
-retry; the source and mailbox data remain intact. `-NoLegacyPermissionRepair`
-disables all automatic repair. The helper is never used for the `.claude` root,
-custom config roots, staging, backups other than the generated destination, account
-data, or arbitrary paths.
+ordinary process verifies the source/destination postcondition. If the elevated
+child reports that a lock or policy still blocks the move, the installer records
+the child diagnostic and offers the same-run manual recovery prompt; choosing the
+immutable release path (or running without a console) leaves the source and
+mailbox data intact without requiring a repackaged download. `-NoLegacyPermissionRepair` disables the UAC attempt, but the
+same non-destructive immutable-release fallback remains available. The helper is
+never used for the `.claude` root, custom config roots, staging, backups other than
+the generated destination, account data, or arbitrary paths.
 
 Uninstall first removes the user-scope `coremail-controller` entry transactionally,
-then moves the recognized package to `.claude\plugins-disabled`. If the move fails,
-the exact user configuration is restored. If the active package is absent, uninstall
-is idempotently successful without requiring Claude Code; an inaccessible existing
-package still requires verification and fails closed.
+using the package path recorded in that entry when an immutable upgrade release is
+active, then moves that recognized package to `.claude\plugins-disabled`. If an
+immutable release was active, an older fixed skill directory may remain as an
+untouched compatibility skill; it is not treated as an active MCP package. If the
+move fails, the exact user configuration is restored. If the active package is
+absent, uninstall is idempotently successful without requiring Claude Code; an
+inaccessible existing fixed skill still requires verification and fails closed.
 
 ## Runtime and release verification
 

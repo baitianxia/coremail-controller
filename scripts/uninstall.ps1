@@ -33,6 +33,9 @@ $lockStream = $null
 $lockPath = $null
 $snapshotDirectory = $null
 $targetRoot = $null
+$activeRoot = $null
+$registeredRoot = $null
+$legacyTargetRetained = $false
 $claudeUserConfigPath = $null
 $claudeUserConfigSnapshot = $null
 $claudeUserConfigMutationStarted = $false
@@ -73,6 +76,83 @@ function Get-RecognizedCoremailPackage {
         throw 'Refusing to move a package with an unexpected identity or missing version.'
     }
     return $manifest
+}
+
+function Get-CoremailRegisteredPackageRoot {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][string]$UserProfile,
+        [Parameter(Mandatory = $true)][string]$ClaudeRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+        return $null
+    }
+    try {
+        $payload = Get-Content -LiteralPath $ConfigPath -Raw -ErrorAction Stop |
+            ConvertFrom-Json
+        $serversProperty = $payload.PSObject.Properties['mcpServers']
+        if ($null -eq $serversProperty -or $null -eq $serversProperty.Value) {
+            return $null
+        }
+        $entryProperty = $serversProperty.Value.PSObject.Properties[$mcpServerName]
+        if ($null -eq $entryProperty -or $null -eq $entryProperty.Value) {
+            return $null
+        }
+        $argsProperty = $entryProperty.Value.PSObject.Properties['args']
+        if ($null -eq $argsProperty -or $null -eq $argsProperty.Value) {
+            return $null
+        }
+        $arguments = @($argsProperty.Value | ForEach-Object { [string]$_ })
+        $fileIndex = -1
+        for ($index = 0; $index -lt $arguments.Count; $index++) {
+            if ([string]::Equals($arguments[$index], '-File', [StringComparison]::OrdinalIgnoreCase)) {
+                $fileIndex = $index
+                break
+            }
+        }
+        if ($fileIndex -lt 0 -or $fileIndex + 1 -ge $arguments.Count) {
+            return $null
+        }
+        $serverScript = [IO.Path]::GetFullPath($arguments[$fileIndex + 1])
+        if ([IO.Path]::GetFileName($serverScript) -ine 'run-server.ps1' -or
+            [IO.Path]::GetFileName([IO.Path]::GetDirectoryName($serverScript)) -ine 'mcp') {
+            return $null
+        }
+        $candidate = [IO.Path]::GetFullPath(
+            [IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($serverScript))
+        ).TrimEnd('\')
+        $claudeRootPath = [IO.Path]::GetFullPath($ClaudeRoot).TrimEnd('\')
+        $targetPath = [IO.Path]::GetFullPath(
+            (Join-Path $claudeRootPath 'skills\coremail-controller')
+        ).TrimEnd('\')
+        $releasePath = [IO.Path]::GetFullPath(
+            (Join-Path $claudeRootPath 'coremail-releases')
+        ).TrimEnd('\')
+        $releasePrefix = $releasePath + '\'
+        $isKnownFixedTarget = [string]::Equals(
+            $candidate,
+            $targetPath,
+            [StringComparison]::OrdinalIgnoreCase
+        )
+        $isKnownImmutableRelease = $candidate.StartsWith(
+            $releasePrefix,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -and [IO.Path]::GetFileName($candidate) -match `
+            '^coremail-controller-\d+\.\d+\.\d+-[A-Za-z0-9-]+$'
+        if (-not $isKnownFixedTarget -and -not $isKnownImmutableRelease) {
+            return $null
+        }
+        [void](Assert-CoremailSafeClaudePath -UserProfile $UserProfile -Path $candidate)
+        if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
+            return $null
+        }
+        return $candidate
+    }
+    catch {
+        Write-CoremailLifecycleLog "WARNING registered Coremail package path could not be inspected: $($_.Exception.Message)"
+        return $null
+    }
 }
 
 function Invoke-CoremailUserMcpRemoval {
@@ -137,6 +217,7 @@ try {
     $claudeRoot = Join-Path $userProfile '.claude'
     $skillsRoot = Join-Path $claudeRoot 'skills'
     $targetRoot = Join-Path $skillsRoot 'coremail-controller'
+    $activeRoot = $targetRoot
     Write-CoremailLifecycleLog "UNINSTALL identity=$([Security.Principal.WindowsIdentity]::GetCurrent().Name); target=$targetRoot"
     [void](Assert-CoremailSafeClaudePath -UserProfile $userProfile -Path $skillsRoot)
 
@@ -150,7 +231,27 @@ try {
         if (-not (Test-CoremailAccessDeniedError -ErrorRecord $_)) { throw }
         $targetLookupDenied = $true
     }
-    if (-not $targetLookupDenied -and [string]::IsNullOrWhiteSpace([string]$targetEntry)) {
+    # Inspect a conservative candidate only to discover an immutable release
+    # when the fixed skill directory is absent.  The full resolver still runs
+    # after the absence check, so a malformed CLAUDE_CONFIG_DIR cannot turn an
+    # idempotent uninstall into a failure.
+    $candidateConfigRoot = $userProfile
+    if (-not [string]::IsNullOrWhiteSpace([string]$env:CLAUDE_CONFIG_DIR) -and
+        [string]$env:CLAUDE_CONFIG_DIR -match '^[A-Za-z]:[\\/]') {
+        $candidateConfigRoot = [IO.Path]::GetFullPath([string]$env:CLAUDE_CONFIG_DIR)
+    }
+    $candidateConfigPath = Join-Path $candidateConfigRoot '.claude.json'
+    $registeredRoot = Get-CoremailRegisteredPackageRoot `
+        -ConfigPath $candidateConfigPath `
+        -UserProfile $userProfile `
+        -ClaudeRoot $claudeRoot
+    if ($registeredRoot) {
+        $activeRoot = $registeredRoot
+        Write-CoremailLifecycleLog "UNINSTALL registered package root=$activeRoot"
+    }
+    if (-not $targetLookupDenied -and
+        [string]::IsNullOrWhiteSpace([string]$targetEntry) -and
+        -not $registeredRoot) {
         Write-Host 'Coremail Controller is not installed in the personal skills directory.'
         Write-Host "Diagnostic log: $LogPath"
         Write-CoremailLifecycleLog 'UNINSTALL no active Coremail package found'
@@ -158,9 +259,26 @@ try {
     }
 
     # Resolve the user MCP file only after confirming that there is an active
-    # package.  A stale/invalid CLAUDE_CONFIG_DIR must not turn an idempotent
-    # uninstall of an already absent package into a failure.
+    # package.  A stale/invalid CLAUDE_CONFIG_DIR is now a real error only when
+    # there is something to uninstall.
     $claudeUserConfigPath = Resolve-CoremailClaudeUserConfigPath -UserProfile $userProfile
+    if ($registeredRoot -and
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath($claudeUserConfigPath),
+            [IO.Path]::GetFullPath($candidateConfigPath),
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        $registeredRoot = Get-CoremailRegisteredPackageRoot `
+            -ConfigPath $claudeUserConfigPath `
+            -UserProfile $userProfile `
+            -ClaudeRoot $claudeRoot
+        if ($registeredRoot) {
+            $activeRoot = $registeredRoot
+        }
+        else {
+            $activeRoot = $targetRoot
+        }
+    }
 
     $claudeInvocation = Resolve-ClaudeCodeInvocation -ExplicitPath $ClaudeCommand
     if ($null -eq $claudeInvocation) {
@@ -171,36 +289,44 @@ try {
     [void](Assert-CoremailSafeClaudePath -UserProfile $userProfile -Path $lockPath)
     $lockStream = Enter-CoremailLifecycleLock -Path $lockPath
 
-    if ($targetLookupDenied) {
-        Invoke-LegacyPermissionRepair -UserProfile $userProfile -Root $targetRoot
-    }
-    try {
-        $targetEntry = Get-CoremailExactChildDirectory `
-            -Parent $skillsRoot `
-            -Name 'coremail-controller'
-        if ([string]::IsNullOrWhiteSpace([string]$targetEntry)) {
-            throw 'The Coremail package directory disappeared before identity verification.'
+    if ($activeRoot -eq $targetRoot) {
+        if ($targetLookupDenied) {
+            Invoke-LegacyPermissionRepair -UserProfile $userProfile -Root $targetRoot
         }
-        [void](Assert-CoremailSafeClaudePath -UserProfile $userProfile -Path $targetRoot)
-        $manifest = Get-RecognizedCoremailPackage -Root $targetRoot
-    }
-    catch {
-        if (-not (Test-CoremailAccessDeniedError -ErrorRecord $_)) { throw }
-        Invoke-LegacyPermissionRepair -UserProfile $userProfile -Root $targetRoot
-        $targetEntry = Get-CoremailExactChildDirectory `
-            -Parent $skillsRoot `
-            -Name 'coremail-controller'
-        if ([string]::IsNullOrWhiteSpace([string]$targetEntry)) {
-            throw 'The legacy Coremail package disappeared during permission repair.'
+        try {
+            $targetEntry = Get-CoremailExactChildDirectory `
+                -Parent $skillsRoot `
+                -Name 'coremail-controller'
+            if ([string]::IsNullOrWhiteSpace([string]$targetEntry)) {
+                throw 'The Coremail package directory disappeared before identity verification.'
+            }
+            [void](Assert-CoremailSafeClaudePath -UserProfile $userProfile -Path $targetRoot)
+            $manifest = Get-RecognizedCoremailPackage -Root $targetRoot
         }
-        [void](Assert-CoremailSafeClaudePath -UserProfile $userProfile -Path $targetRoot)
-        $manifest = Get-RecognizedCoremailPackage -Root $targetRoot
+        catch {
+            if (-not (Test-CoremailAccessDeniedError -ErrorRecord $_)) { throw }
+            Invoke-LegacyPermissionRepair -UserProfile $userProfile -Root $targetRoot
+            $targetEntry = Get-CoremailExactChildDirectory `
+                -Parent $skillsRoot `
+                -Name 'coremail-controller'
+            if ([string]::IsNullOrWhiteSpace([string]$targetEntry)) {
+                throw 'The legacy Coremail package disappeared during permission repair.'
+            }
+            [void](Assert-CoremailSafeClaudePath -UserProfile $userProfile -Path $targetRoot)
+            $manifest = Get-RecognizedCoremailPackage -Root $targetRoot
+        }
+    }
+    else {
+        [void](Assert-CoremailSafeClaudePath -UserProfile $userProfile -Path $activeRoot)
+        $manifest = Get-RecognizedCoremailPackage -Root $activeRoot
+        $legacyTargetRetained = (-not $targetLookupDenied -and
+            -not [string]::IsNullOrWhiteSpace([string]$targetEntry))
     }
 
     # Use the executable recorded by the installed descriptor.  Read it only
     # after any legacy ACL repair has restored access, and never silently switch
     # to a different Python from PATH.
-    $runtimePath = Join-Path $targetRoot 'mcp\python-runtime.json'
+    $runtimePath = Join-Path $activeRoot 'mcp\python-runtime.json'
     if (-not (Test-Path -LiteralPath $runtimePath -PathType Leaf)) {
         throw "The installed Python runtime descriptor is missing: $runtimePath"
     }
@@ -250,7 +376,7 @@ try {
     $claudeUserConfigMutationStarted = $true
     $registrarBackup = Join-Path $snapshotDirectory 'claude-user-config-registrar.backup'
     Invoke-CoremailUserMcpRemoval `
-        -Root $targetRoot `
+        -Root $activeRoot `
         -UserConfig $claudeUserConfigPath `
         -BackupPath $registrarBackup
 
@@ -262,12 +388,20 @@ try {
         [guid]::NewGuid().ToString('N').Substring(0, 8)
     )
     Move-CoremailDirectoryAtomically `
-        -Source $targetRoot `
+        -Source $activeRoot `
         -Destination $destination `
         -OperationLabel "Disabling the Coremail package for $([Security.Principal.WindowsIdentity]::GetCurrent().Name)" `
         -AccessDeniedRepair {
+            if ($activeRoot -ne $targetRoot) {
+                throw 'The active immutable Coremail release became unavailable; no legacy skill directory was changed.'
+            }
             if ($NoLegacyPermissionRepair) {
-                throw 'Automatic legacy permission repair was disabled; the protected package was not moved.'
+                $manualMoveResult = Invoke-CoremailManualDirectoryMoveAssistance `
+                    -Source $targetRoot `
+                    -Destination $destination `
+                    -OperationLabel 'Disabling the Coremail package'
+                if ($manualMoveResult -eq 'moved') { return }
+                throw 'Automatic legacy permission repair was disabled; the protected package was not moved. Close the holder or repair the exact ACL, then run UNINSTALL.cmd again.'
             }
             elseif (Test-CoremailReleaseGatePermissionRepairMode) {
                 Invoke-LegacyPermissionRepair -UserProfile $userProfile -Root $targetRoot
@@ -281,19 +415,39 @@ try {
                 throw 'The release gate encountered an unexpected production elevation path.'
             }
             else {
-                Invoke-CoremailElevatedDirectoryMove `
-                    -UserProfile $userProfile `
-                    -Source $targetRoot `
-                    -Destination $destination `
-                    -ExpectedVersion ([string]$manifest.version)
+                try {
+                    Invoke-CoremailElevatedDirectoryMove `
+                        -UserProfile $userProfile `
+                        -Source $targetRoot `
+                        -Destination $destination `
+                        -ExpectedVersion ([string]$manifest.version) `
+                        -FailIfBlocked
+                }
+                catch {
+                    $elevatedMoveError = $_
+                    $manualMoveResult = Invoke-CoremailManualDirectoryMoveAssistance `
+                        -Source $targetRoot `
+                        -Destination $destination `
+                        -OperationLabel 'Disabling the Coremail package'
+                    if ($manualMoveResult -eq 'moved') { return }
+                    throw (
+                        'The active Coremail package remains in use or protected. ' +
+                        'No package or mailbox data was deleted; close the holder or repair ' +
+                        'the exact ACL and run UNINSTALL.cmd again. ' +
+                        $elevatedMoveError.Exception.Message
+                    )
+                }
             }
         }
     $uninstallCommitted = $true
     $claudeUserConfigMutationStarted = $false
-    Write-CoremailLifecycleLog "UNINSTALL COMMITTED recovery=$destination; claudeVersion=$claudeVersionDisplay"
+    Write-CoremailLifecycleLog "UNINSTALL COMMITTED recovery=$destination; active=$activeRoot; legacy_retained=$legacyTargetRetained; claudeVersion=$claudeVersionDisplay"
 
     Write-Host 'Coremail Controller has been removed from Claude user scope and moved, not deleted.' -ForegroundColor Green
     Write-Host "Recovery location: $destination"
+    if ($legacyTargetRetained) {
+        Write-Host "The older skill directory was left intact at: $targetRoot"
+    }
     Write-Host 'Mailbox configuration and Windows Credential Manager entries were preserved.'
     Write-Host "Diagnostic log: $LogPath"
     exit 0
@@ -317,7 +471,7 @@ catch {
     }
     Write-Host ''
     Write-Host "Uninstall stopped safely: $($uninstallError.Exception.Message)" -ForegroundColor Red
-    Write-Host "The Coremail package directory remains at: $targetRoot"
+    Write-Host "The Coremail package directory remains at: $activeRoot"
     Write-Host "Diagnostic log: $LogPath"
     exit 1
 }

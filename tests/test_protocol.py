@@ -39,6 +39,8 @@ class ProtocolTests(unittest.TestCase):
         installer = (ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
         registrar = (ROOT / "scripts" / "register_claude_user_mcp.py").read_text(encoding="utf-8")
         self.assertIn("plugin-backups", installer)
+        self.assertIn("coremail-releases", installer)
+        self.assertIn("IMMUTABLE RELEASE ACTIVE", installer)
         self.assertNotIn("skills\\coremail-controller.backup", installer)
         self.assertIn("tests\\smoke-mcp.ps1", installer)
         self.assertIn("register_claude_user_mcp.py", installer)

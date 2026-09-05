@@ -2,12 +2,16 @@
 
 ## Unreleased
 
-- Harden legacy-package replacement when a withdrawn directory still returns
-  `ERROR_ACCESS_DENIED` after the initial user-scope retry attempts. The installer and
-  uninstaller now use a narrowly allowlisted, manifest-rechecking elevated move
-  helper after one UAC approval, verify the postcondition before continuing, and
-  report a concrete close-the-locking-processes recovery path. The Windows gate
-  executes the same encoded helper under its verified administrator token.
+- Align upgrades with the intranet-browser-agent's immutable versioned-release
+  strategy. If the legacy Coremail skill directory remains protected or open after
+  the one constrained UAC attempt, installation prints a same-run manual recovery
+  prompt (`R` to retry after closing the holder/repairing the exact ACL, `V` to
+  continue with the immutable path) instead of requiring a new package download.
+  If no console is available, it leaves the old directory untouched and publishes
+  the verified package under `.claude\coremail-releases\<version>-<id>`, then
+  registers the user-scope MCP against that new path. The elevated helper now
+  records its child diagnostic, so a real ACL or handle failure is no longer
+  reduced to an opaque exit code.
 
 ## 0.8.0 - 2026-09-05
 

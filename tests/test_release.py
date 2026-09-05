@@ -242,6 +242,11 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("expected_version", normalized_common)
         self.assertIn("completed-by-repair", normalized_common)
         self.assertIn("close claude code, explorer", normalized_common)
+        self.assertIn("diagnostic_path", normalized_common)
+        self.assertIn("failifblocked", normalized_common)
+        self.assertIn("invoke-coremailmanualdirectorymoveassistance", normalized_common)
+        self.assertIn("read-host", normalized_common)
+        self.assertIn("choice=versioned", normalized_common)
         self.assertNotIn(" /t ", normalized_common)
         self.assertNotIn("/reset", normalized_common)
         self.assertNotIn("takeown", normalized_common)
@@ -250,6 +255,7 @@ class ReleaseTests(unittest.TestCase):
         launcher = (ROOT / "mcp" / "run-server.ps1").read_text(encoding="utf-8")
         setup = (ROOT / "scripts" / "setup-account.ps1").read_text(encoding="utf-8")
         installer = (ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
+        uninstaller = (ROOT / "scripts" / "uninstall.ps1").read_text(encoding="utf-8")
         self.assertIn("python-runtime.json", launcher)
         self.assertIn("executable_sha256", launcher)
         self.assertIn("-B -I", launcher)
@@ -258,6 +264,13 @@ class ReleaseTests(unittest.TestCase):
         self.assertNotIn("COREMAIL_PYTHON", installer)
         self.assertIn("$claudeUserConfigSnapshot", installer)
         self.assertIn("Restore-CoremailFileSnapshot", installer)
+        self.assertIn("Get-CoremailImmutableReleasePath", installer)
+        self.assertIn("coremail-releases", installer)
+        self.assertIn("IMMUTABLE RELEASE ACTIVE", installer)
+        self.assertIn("manualMoveResult", installer)
+        self.assertIn("Get-CoremailRegisteredPackageRoot", uninstaller)
+        self.assertIn("legacyTargetRetained", uninstaller)
+        self.assertIn("manualMoveResult", uninstaller)
         self.assertIsNone(
             re.search(
                 r"(?im)smoke-mcp\.ps1[^\r\n]*\r?\n[ \t]*if\s*\(\$LASTEXITCODE",

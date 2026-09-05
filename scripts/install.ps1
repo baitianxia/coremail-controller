@@ -39,9 +39,13 @@ $lifecycleLockPath = $null
 $activationStageRoot = $null
 $activationPlugin = $null
 $targetRoot = $null
+$activeRoot = $null
 $backupRoot = $null
 $failedRoot = $null
 $targetContainsNewPlugin = $false
+$activeContainsNewPlugin = $false
+$legacyPackageRetained = $false
+$retainedLegacyPath = $null
 $activationCommitted = $false
 $claudeUserConfigPath = $null
 $claudeUserConfigSnapshot = $null
@@ -53,6 +57,8 @@ $pythonRuntime = $null
 $claudeInvocation = $null
 $claudeVersion = $null
 $existingPluginVersion = $null
+$legacyTargetAccessBlocked = $false
+$legacyTargetAccessError = $null
 $legacyPermissionRepairAttempted = $false
 
 function Write-Step {
@@ -122,16 +128,49 @@ function Get-ExistingPluginVersionWithLegacyRepair {
     }
     catch {
         if (-not (Test-CoremailAccessDeniedError -ErrorRecord $_)) { throw }
-        Invoke-LegacyPermissionRepair -UserProfile $UserProfile -Root $Root
-        $entry = Get-CoremailExactChildDirectory `
-            -Parent $SkillsRoot `
-            -Name 'coremail-controller'
-        if ([string]::IsNullOrWhiteSpace([string]$entry)) {
-            throw 'The legacy Coremail package directory disappeared during permission repair.'
+        try {
+            Invoke-LegacyPermissionRepair -UserProfile $UserProfile -Root $Root
         }
-        [void](Assert-CoremailSafeClaudePath -UserProfile $UserProfile -Path $Root)
-        $version = Test-ExistingPluginIdentity -Root $Root
-        return $version
+        catch {
+            # A denied legacy package is not permission to overwrite or delete
+            # an unknown directory.  Preserve it and let the staged package use
+            # the immutable-release path below; this keeps an ACL/UAC problem
+            # from forcing a new download.
+            $script:legacyTargetAccessBlocked = $true
+            $script:legacyTargetAccessError = $_.Exception.Message
+            Write-Warning (
+                'The existing Coremail package could not be inspected safely; ' +
+                "it will remain untouched and the new release will use an immutable path. $($_.Exception.Message)"
+            )
+            Write-CoremailLifecycleLog (
+                "LEGACY PACKAGE ACCESS BLOCKED path=$Root; error=$($_.Exception.Message)"
+            )
+            return $null
+        }
+        try {
+            $entry = Get-CoremailExactChildDirectory `
+                -Parent $SkillsRoot `
+                -Name 'coremail-controller'
+            if ([string]::IsNullOrWhiteSpace([string]$entry)) {
+                throw 'The legacy Coremail package directory disappeared during permission repair.'
+            }
+            [void](Assert-CoremailSafeClaudePath -UserProfile $UserProfile -Path $Root)
+            $version = Test-ExistingPluginIdentity -Root $Root
+            return $version
+        }
+        catch {
+            if (-not (Test-CoremailAccessDeniedError -ErrorRecord $_)) { throw }
+            $script:legacyTargetAccessBlocked = $true
+            $script:legacyTargetAccessError = $_.Exception.Message
+            Write-Warning (
+                'The existing Coremail package remains inaccessible after the ACL attempt; ' +
+                "it will remain untouched and the new release will use an immutable path. $($_.Exception.Message)"
+            )
+            Write-CoremailLifecycleLog (
+                "LEGACY PACKAGE ACCESS BLOCKED path=$Root; error=$($_.Exception.Message)"
+            )
+            return $null
+        }
     }
 }
 
@@ -144,6 +183,30 @@ function Copy-CoremailPluginTree {
     foreach ($item in (Get-ChildItem -LiteralPath $Source -Force -ErrorAction Stop)) {
         Copy-Item -LiteralPath $item.FullName -Destination $Destination -Recurse -Force
     }
+}
+
+function Get-CoremailImmutableReleasePath {
+    <#
+      Keep a verified upgrade package outside the Claude skill-discovery tree.
+      The old fixed skill directory may still be open by Claude Code, Explorer,
+      Defender, or an indexer.  Like intranet-browser-agent's versioned runtime
+      roots, this path is never an in-place replacement target.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$ClaudeRoot,
+        [Parameter(Mandatory = $true)][string]$UserProfile,
+        [Parameter(Mandatory = $true)][string]$Version
+    )
+
+    $releaseParent = Join-Path $ClaudeRoot 'coremail-releases'
+    [void](Assert-CoremailSafeClaudePath -UserProfile $UserProfile -Path $releaseParent)
+    New-Item -ItemType Directory -Path $releaseParent -Force | Out-Null
+    $releasePath = Join-Path $releaseParent (
+        'coremail-controller-' + $Version + '-' +
+        [guid]::NewGuid().ToString('N')
+    )
+    [void](Assert-CoremailSafeClaudePath -UserProfile $UserProfile -Path $releasePath)
+    return $releasePath
 }
 
 function Invoke-PinnedPython {
@@ -276,9 +339,10 @@ function Restore-ActivationTransaction {
             -BackupPath ([string]$runtimeSnapshot.BackupPath)
         Write-CoremailLifecycleLog 'ROLLBACK restored pinned Python descriptor'
     }
-    if ($targetContainsNewPlugin -and
-        (Test-Path -LiteralPath $targetRoot -PathType Container)) {
-        $failedDirectory = Join-Path (Split-Path -Parent (Split-Path -Parent $targetRoot)) 'plugin-failed'
+    if ($activeContainsNewPlugin -and
+        $activeRoot -and
+        (Test-Path -LiteralPath $activeRoot -PathType Container)) {
+        $failedDirectory = Join-Path $claudeRoot 'plugin-failed'
         [void](Assert-CoremailSafeClaudePath -UserProfile $userProfile -Path $failedDirectory)
         New-Item -ItemType Directory -Path $failedDirectory -Force | Out-Null
         $failedRoot = Join-Path $failedDirectory (
@@ -286,10 +350,10 @@ function Restore-ActivationTransaction {
             [guid]::NewGuid().ToString('N').Substring(0, 8)
         )
         Move-CoremailDirectoryAtomically `
-            -Source $targetRoot `
+            -Source $activeRoot `
             -Destination $failedRoot `
             -OperationLabel 'Quarantining the uncommitted Coremail package'
-        $targetContainsNewPlugin = $false
+        $activeContainsNewPlugin = $false
         Write-CoremailLifecycleLog "ROLLBACK quarantined uncommitted plugin at $failedRoot"
     }
     if ($backupRoot -and
@@ -317,6 +381,7 @@ try {
     $claudeRoot = Join-Path $userProfile '.claude'
     $skillsRoot = Join-Path $claudeRoot 'skills'
     $targetRoot = Join-Path $skillsRoot 'coremail-controller'
+    $activeRoot = $targetRoot
     $claudeUserConfigPath = Resolve-CoremailClaudeUserConfigPath -UserProfile $userProfile
     $sourceCanonical = $sourceRoot.TrimEnd('\')
     $targetCanonical = [IO.Path]::GetFullPath($targetRoot).TrimEnd('\')
@@ -447,7 +512,32 @@ try {
 
     Write-Step 3 'Publishing the Coremail package with recoverable same-volume directory moves'
     if (-not $runningFromTarget) {
-        if ($null -ne $existingPluginVersion) {
+        if ($legacyTargetAccessBlocked) {
+            # The fixed skill exists but its ACL/handle prevented even safe
+            # identity inspection.  Never guess its contents and never move
+            # it; publish the already-verified staged package independently.
+            $activeRoot = Get-CoremailImmutableReleasePath `
+                -ClaudeRoot $claudeRoot `
+                -UserProfile $userProfile `
+                -Version $sourceVersion
+            Move-CoremailDirectoryAtomically `
+                -Source $activationPlugin `
+                -Destination $activeRoot `
+                -OperationLabel 'Publishing the immutable Coremail release'
+            $activationPlugin = $null
+            $activeContainsNewPlugin = $true
+            $legacyPackageRetained = $true
+            $retainedLegacyPath = $targetRoot
+            Write-Warning (
+                'The previous Coremail package could not be inspected and was left intact. ' +
+                "The new release is active at $activeRoot."
+            )
+            Write-CoremailLifecycleLog (
+                "IMMUTABLE RELEASE ACTIVE path=$activeRoot; retained_legacy=$targetRoot; " +
+                "inspection_error=$legacyTargetAccessError"
+            )
+        }
+        elseif ($null -ne $existingPluginVersion) {
             $previousVersion = $existingPluginVersion
             $backupDirectory = Join-Path $claudeRoot 'plugin-backups'
             [void](Assert-CoremailSafeClaudePath `
@@ -458,63 +548,139 @@ try {
                 'coremail-controller-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' +
                 [guid]::NewGuid().ToString('N').Substring(0, 8)
             )
-            Move-CoremailDirectoryAtomically `
-                -Source $targetRoot `
-                -Destination $backupRoot `
-                -OperationLabel 'Archiving the previous Coremail package' `
-                -AccessDeniedRepair {
-                    if ($NoLegacyPermissionRepair) {
-                        throw 'Automatic legacy permission repair was disabled; the protected package was not moved.'
-                    }
-                    elseif (Test-CoremailReleaseGatePermissionRepairMode) {
-                        Invoke-LegacyPermissionRepair -UserProfile $userProfile -Root $targetRoot
-                        [void](Assert-CoremailSafeClaudePath -UserProfile $userProfile -Path $targetRoot)
-                        $versionAfterRepair = Test-ExistingPluginIdentity -Root $targetRoot
-                        if ($versionAfterRepair -ne $previousVersion) {
-                            throw 'The plugin identity changed while legacy permissions were repaired.'
+            try {
+                Move-CoremailDirectoryAtomically `
+                    -Source $targetRoot `
+                    -Destination $backupRoot `
+                    -OperationLabel 'Archiving the previous Coremail package' `
+                    -AccessDeniedRepair {
+                        if ($NoLegacyPermissionRepair) {
+                            $manualMoveResult = Invoke-CoremailManualDirectoryMoveAssistance `
+                                -Source $targetRoot `
+                                -Destination $backupRoot `
+                                -OperationLabel 'Archiving the previous Coremail package' `
+                                -AllowVersionedFallback
+                            if ($manualMoveResult -eq 'moved') { return }
+                            throw 'Automatic legacy permission repair was disabled; the protected package was not moved. The immutable-release fallback was selected.'
+                        }
+                        elseif (Test-CoremailReleaseGatePermissionRepairMode) {
+                            Invoke-LegacyPermissionRepair -UserProfile $userProfile -Root $targetRoot
+                            [void](Assert-CoremailSafeClaudePath -UserProfile $userProfile -Path $targetRoot)
+                            $versionAfterRepair = Test-ExistingPluginIdentity -Root $targetRoot
+                            if ($versionAfterRepair -ne $previousVersion) {
+                                throw 'The plugin identity changed while legacy permissions were repaired.'
+                            }
+                        }
+                        elseif ($env:COREMAIL_RELEASE_GATE_TESTING -eq 'true') {
+                            $manualMoveResult = Invoke-CoremailManualDirectoryMoveAssistance `
+                                -Source $targetRoot `
+                                -Destination $backupRoot `
+                                -OperationLabel 'Archiving the previous Coremail package' `
+                                -AllowVersionedFallback
+                            if ($manualMoveResult -eq 'moved') { return }
+                            throw 'The release gate selected the immutable-release fallback after the non-interactive manual-assistance check.'
+                        }
+                        else {
+                            # A protected/locked active directory must not block
+                            # the new release.  It gets one narrowly scoped UAC
+                            # opportunity, then gives the person at the console
+                            # a chance to close the holder or repair the exact
+                            # ACL.  This avoids making a repackaged download
+                            # necessary just because Windows kept a handle open.
+                            try {
+                                Invoke-CoremailElevatedDirectoryMove `
+                                    -UserProfile $userProfile `
+                                    -Source $targetRoot `
+                                    -Destination $backupRoot `
+                                    -ExpectedVersion $previousVersion `
+                                    -FailIfBlocked
+                            }
+                            catch {
+                                $elevatedMoveError = $_
+                                $manualMoveResult = Invoke-CoremailManualDirectoryMoveAssistance `
+                                    -Source $targetRoot `
+                                    -Destination $backupRoot `
+                                    -OperationLabel 'Archiving the previous Coremail package' `
+                                    -AllowVersionedFallback
+                                if ($manualMoveResult -eq 'moved') { return }
+                                throw (
+                                    'The previous Coremail package remains in use or protected; ' +
+                                    'the immutable-release fallback was selected. ' +
+                                    $elevatedMoveError.Exception.Message
+                                )
+                            }
                         }
                     }
-                    elseif ($env:COREMAIL_RELEASE_GATE_TESTING -eq 'true') {
-                        throw 'The release gate encountered an unexpected production elevation path.'
-                    }
-                    else {
-                        Invoke-CoremailElevatedDirectoryMove `
-                            -UserProfile $userProfile `
-                            -Source $targetRoot `
-                            -Destination $backupRoot `
-                            -ExpectedVersion $previousVersion
-                    }
+                Write-Host "Previous Coremail package version $previousVersion preserved at: $backupRoot"
+                $activeRoot = $targetRoot
+                $targetContainsNewPlugin = $false
+            }
+            catch {
+                $archiveError = $_
+                $sourceStillPresent = Test-CoremailDirectoryPresent -Path $targetRoot
+                $backupWasCreated = Test-CoremailDirectoryPresent -Path $backupRoot
+                if (-not $sourceStillPresent -or $backupWasCreated) {
+                    throw $archiveError
                 }
-            Write-Host "Previous Coremail package version $previousVersion preserved at: $backupRoot"
-        }
-        try {
-            Move-CoremailDirectoryAtomically `
-                -Source $activationPlugin `
-                -Destination $targetRoot `
-                -OperationLabel 'Publishing the new Coremail package'
-            $activationPlugin = $null
-            $targetContainsNewPlugin = $true
-        }
-        catch {
-            $publishError = $_
-            if ((Test-Path -LiteralPath $targetRoot) -or
-                ($activationPlugin -and -not (Test-Path -LiteralPath $activationPlugin))) {
-                $preserveActivationStage = $true
-            }
-            if ($backupRoot -and
-                (Test-Path -LiteralPath $backupRoot -PathType Container) -and
-                -not (Test-Path -LiteralPath $targetRoot)) {
+                # This is the key upgrade path used by the sibling browser
+                # agent: preserve the live/locked version and publish a new,
+                # immutable version directory.  No old package is deleted,
+                # overwritten, or recursively copied.
+                $activeRoot = Get-CoremailImmutableReleasePath `
+                    -ClaudeRoot $claudeRoot `
+                    -UserProfile $userProfile `
+                    -Version $sourceVersion
                 Move-CoremailDirectoryAtomically `
-                    -Source $backupRoot `
-                    -Destination $targetRoot `
-                    -OperationLabel 'Restoring the previous Coremail package after publication failure'
+                    -Source $activationPlugin `
+                    -Destination $activeRoot `
+                    -OperationLabel 'Publishing the immutable Coremail release'
+                $activationPlugin = $null
+                $activeContainsNewPlugin = $true
+                $legacyPackageRetained = $true
+                $retainedLegacyPath = $targetRoot
                 $backupRoot = $null
+                Write-Warning (
+                    'The previous Coremail package is still in use or protected. ' +
+                    "It was left intact at $targetRoot; the new release is active at $activeRoot."
+                )
+                Write-CoremailLifecycleLog (
+                    "IMMUTABLE RELEASE ACTIVE path=$activeRoot; retained_legacy=$targetRoot; " +
+                    "archive_error=$($archiveError.Exception.Message)"
+                )
             }
-            throw $publishError
+        }
+        if (-not $activeContainsNewPlugin) {
+            try {
+                Move-CoremailDirectoryAtomically `
+                    -Source $activationPlugin `
+                    -Destination $targetRoot `
+                    -OperationLabel 'Publishing the new Coremail package'
+                $activationPlugin = $null
+                $targetContainsNewPlugin = $true
+                $activeContainsNewPlugin = $true
+                $activeRoot = $targetRoot
+            }
+            catch {
+                $publishError = $_
+                if ((Test-Path -LiteralPath $targetRoot) -or
+                    ($activationPlugin -and -not (Test-Path -LiteralPath $activationPlugin))) {
+                    $preserveActivationStage = $true
+                }
+                if ($backupRoot -and
+                    (Test-Path -LiteralPath $backupRoot -PathType Container) -and
+                    -not (Test-Path -LiteralPath $targetRoot)) {
+                    Move-CoremailDirectoryAtomically `
+                        -Source $backupRoot `
+                        -Destination $targetRoot `
+                        -OperationLabel 'Restoring the previous Coremail package after publication failure'
+                    $backupRoot = $null
+                }
+                throw $publishError
+            }
         }
     }
-    Assert-CoremailRelease -Root $targetRoot -AllowPythonRuntime
-    & (Join-Path $targetRoot 'tests\smoke-mcp.ps1') -IgnoreAccountConfiguration
+    Assert-CoremailRelease -Root $activeRoot -AllowPythonRuntime
+    & (Join-Path $activeRoot 'tests\smoke-mcp.ps1') -IgnoreAccountConfiguration
     if (-not $?) { throw 'Published MCP smoke test failed.' }
 
     Write-Step 4 'Registering and verifying the Coremail MCP in Claude user scope'
@@ -529,7 +695,7 @@ try {
     $registrationBackup = Join-Path $activationStageRoot 'claude-user-config-registrar.backup'
     Invoke-CoremailUserMcpRegistration `
         -Operation register `
-        -Root $targetRoot `
+        -Root $activeRoot `
         -UserConfig $claudeUserConfigPath `
         -BackupPath $registrationBackup
     $activationCommitted = $true
@@ -548,14 +714,14 @@ try {
         -Path $configPath `
         -Label 'Coremail account configuration')
     if ($Reconfigure -or -not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
-        & (Join-Path $targetRoot 'scripts\setup-account.ps1') -LogPath $LogPath
+        & (Join-Path $activeRoot 'scripts\setup-account.ps1') -LogPath $LogPath
     }
     else {
         Write-Host "Existing non-secret account configuration preserved: $configPath"
     }
 
     Write-Step 6 'Verifying the installed MCP server and writing the result'
-    $smokeTest = Join-Path $targetRoot 'tests\smoke-mcp.ps1'
+    $smokeTest = Join-Path $activeRoot 'tests\smoke-mcp.ps1'
     & $smokeTest
     if (-not $?) { throw 'Installed MCP smoke test failed.' }
     $connectionVerified = $false
@@ -583,7 +749,8 @@ try {
 Coremail Controller installation
 
 Version: $sourceVersion
-Package and user skill: $targetRoot
+MCP package: $activeRoot
+User skill: $targetRoot
 Claude MCP server: $mcpServerName (user scope; registered and verified)
 Claude user MCP configuration: $claudeUserConfigPath
 Python: $($pythonRuntime.executable)
@@ -591,6 +758,8 @@ Python SHA-256: $($pythonRuntime.executable_sha256)
 Configuration: $configPath
 Live connection: $connectionText
 Previous plugin backup: $backupRoot
+Legacy package retained in place: $legacyPackageRetained
+Retained legacy path: $retainedLegacyPath
 Lifecycle log: $LogPath
 
 Restart Claude Code if it was already running, or run /reload-plugins when available.
@@ -613,7 +782,8 @@ catch {
     $installError = $_
     Write-CoremailLifecycleFailure -ErrorRecord $installError -Context 'installation'
     if (-not $activationCommitted -and
-        ($claudeUserConfigMutationStarted -or $runtimeMutationStarted -or $targetContainsNewPlugin -or $backupRoot)) {
+        ($claudeUserConfigMutationStarted -or $runtimeMutationStarted -or
+        $activeContainsNewPlugin -or $backupRoot)) {
         try { Restore-ActivationTransaction -OriginalMessage $installError.Exception.Message }
         catch {
             $rollbackError = $_
@@ -630,7 +800,7 @@ catch {
     Write-Host ''
     Write-Host "Setup stopped safely: $($installError.Exception.Message)" -ForegroundColor Red
     if ($activationCommitted) {
-        Write-Host "The verified Coremail package remains installed at $targetRoot; mailbox setup may be incomplete."
+        Write-Host "The verified Coremail package remains installed at $activeRoot; mailbox setup may be incomplete."
     }
     elseif ($failedRoot) {
         Write-Host "The rejected new Coremail package was preserved for diagnosis at: $failedRoot"
