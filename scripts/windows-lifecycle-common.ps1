@@ -64,7 +64,8 @@ function Invoke-CoremailExternalChecked {
         [string[]]$Prefix = @(),
         [string[]]$Arguments = @(),
         [string]$CapturePath = '',
-        [string]$Label = 'external command'
+        [string]$Label = 'external command',
+        [switch]$QuietOnSuccess
     )
 
     $output = @()
@@ -93,11 +94,11 @@ function Invoke-CoremailExternalChecked {
     }
     $lines = @($output | ForEach-Object { [string]$_ })
     foreach ($line in $lines) {
-        Write-Host $line
+        if (-not $QuietOnSuccess -or $exitCode -ne 0) { Write-Host $line }
         Write-CoremailLifecycleLog "NATIVE STDOUT label=$Label; $line"
     }
     foreach ($line in @($errorOutput | ForEach-Object { [string]$_ })) {
-        Write-Host $line
+        if (-not $QuietOnSuccess -or $exitCode -ne 0) { Write-Host $line }
         Write-CoremailLifecycleLog "NATIVE STDERR label=$Label; $line"
     }
     if (-not [string]::IsNullOrWhiteSpace($CapturePath)) {
@@ -118,7 +119,8 @@ function Invoke-CoremailClaudeChecked {
         [Parameter(Mandatory = $true)][object]$Invocation,
         [Parameter(Mandatory = $true)][string[]]$Arguments,
         [string]$CapturePath = '',
-        [string]$Label = 'Claude Code'
+        [string]$Label = 'Claude Code',
+        [switch]$QuietOnSuccess
     )
     $autoUpdaterWasPresent = Test-Path -LiteralPath 'Env:DISABLE_AUTOUPDATER'
     $updatesWerePresent = Test-Path -LiteralPath 'Env:DISABLE_UPDATES'
@@ -128,7 +130,8 @@ function Invoke-CoremailClaudeChecked {
         $env:DISABLE_AUTOUPDATER = '1'
         $env:DISABLE_UPDATES = '1'
         Invoke-CoremailExternalChecked -Executable ([string]$Invocation.Executable) `
-            -Prefix @($Invocation.Prefix) -Arguments $Arguments -CapturePath $CapturePath -Label $Label
+            -Prefix @($Invocation.Prefix) -Arguments $Arguments -CapturePath $CapturePath -Label $Label `
+            -QuietOnSuccess:$QuietOnSuccess
     }
     finally {
         if ($autoUpdaterWasPresent) { $env:DISABLE_AUTOUPDATER = $previousAutoUpdater }
@@ -148,7 +151,7 @@ function Get-CoremailClaudeVersion {
     )
     try {
         Invoke-CoremailClaudeChecked -Invocation $Invocation -Arguments @('--version') `
-            -CapturePath $capturePath -Label $Label
+            -CapturePath $capturePath -Label $Label -QuietOnSuccess
         $versionText = [IO.File]::ReadAllText($capturePath)
     }
     finally {

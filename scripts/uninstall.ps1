@@ -121,7 +121,8 @@ try {
     $claudeInvocation = Resolve-ClaudeCodeInvocation -ExplicitPath $ClaudeCommand
     if ($null -eq $claudeInvocation) { throw 'Claude Code was not found; the user MCP entry was not changed.' }
     $claudeVersion = Get-CoremailClaudeVersion -Invocation $claudeInvocation -Label 'Claude Code version probe'
-    Invoke-CoremailClaudeChecked -Invocation $claudeInvocation -Arguments @('mcp', '--help') -Label 'Claude MCP capability probe'
+    Invoke-CoremailClaudeChecked -Invocation $claudeInvocation -Arguments @('mcp', '--help') `
+        -Label 'Claude MCP capability probe' -QuietOnSuccess
 
     $snapshotDirectory = Join-Path ([IO.Path]::GetTempPath()) ('coremail-uninstall-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $snapshotDirectory -Force | Out-Null

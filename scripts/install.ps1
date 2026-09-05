@@ -226,7 +226,8 @@ try {
     $claudeVersionDisplay = '<unreported>'
     if ($null -ne $claudeVersion.Version) { $claudeVersionDisplay = [string]$claudeVersion.Version }
     elseif ($claudeVersion.Text) { $claudeVersionDisplay = [string]$claudeVersion.Text }
-    Invoke-CoremailClaudeChecked -Invocation $claudeInvocation -Arguments @('mcp', '--help') -Label 'Claude MCP capability probe'
+    Invoke-CoremailClaudeChecked -Invocation $claudeInvocation -Arguments @('mcp', '--help') `
+        -Label 'Claude MCP capability probe' -QuietOnSuccess
     Write-Host "Coremail package version: $sourceVersion"
     Write-Host "Pinned Python: $($pythonRuntime.executable) ($($pythonRuntime.version), $($pythonRuntime.pointer_bits)-bit)"
     Write-Host "Claude Code: $($claudeInvocation.CommandPath) ($($claudeInvocation.Kind), $claudeVersionDisplay); user MCP config: $claudeUserConfigPath"

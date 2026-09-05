@@ -97,7 +97,7 @@ or passes arguments through `cmd.exe`.
 Before any MCP configuration mutation it:
 
 1. records the informational Claude version output;
-2. runs `claude mcp --help` as a capability probe; and
+2. runs `claude mcp --help` as a capability probe, keeping successful probe output in the diagnostic log rather than flooding the interactive console; and
 3. verifies the gated package and the local Python runtime.
 
 The version number is informational. Capability, not a hard-coded Claude

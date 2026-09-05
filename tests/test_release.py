@@ -149,10 +149,14 @@ class ReleaseTests(unittest.TestCase):
 
     def test_old_claude_is_supported_by_capability_not_version_floor(self) -> None:
         installer = (ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
+        uninstaller = (ROOT / "scripts" / "uninstall.ps1").read_text(encoding="utf-8")
         common = (ROOT / "scripts" / "windows-lifecycle-common.ps1").read_text(encoding="utf-8")
         self.assertNotIn("Assert-CoremailClaudeMinimumVersion", installer + common)
         self.assertNotIn("2.1.157", installer + common)
         self.assertIn("mcp', '--help'", installer)
+        self.assertIn("[switch]$QuietOnSuccess", common)
+        self.assertIn("-QuietOnSuccess", installer)
+        self.assertIn("-QuietOnSuccess", uninstaller)
         self.assertIn("register_claude_user_mcp.py", installer)
 
     def test_release_refuses_to_overwrite_by_default(self) -> None:
