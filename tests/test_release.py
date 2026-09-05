@@ -383,6 +383,10 @@ Write-Output 'PASS'
         self.assertNotIn("2\\.1\\.157 or newer", normalized)
 
         lifecycle_normalized = " ".join(lifecycle.lower().split())
+        self.assertIn(
+            "$claudeuserconfigpath = join-path $userprofile '.claude.json'",
+            lifecycle_normalized,
+        )
         for required in (
             "expectedidentitysid",
             "windowsbuiltinrole]::administrator",

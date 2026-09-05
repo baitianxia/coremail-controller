@@ -75,7 +75,7 @@ if (-not [string]::IsNullOrWhiteSpace($localAppData)) { $env:LOCALAPPDATA = $loc
 
 $claudeRoot = Join-Path $userProfile '.claude'
 $targetRoot = Join-Path $claudeRoot 'skills\coremail-controller'
-$claudeUserConfigPath = Join-Path $claudeRoot '.claude.json'
+$claudeUserConfigPath = Join-Path $userProfile '.claude.json'
 $configDirectory = Join-Path $appData 'ClaudeCode\Coremail'
 $configPath = Join-Path $configDirectory 'config.json'
 $installer = Join-Path $PluginRoot 'scripts\install.ps1'
