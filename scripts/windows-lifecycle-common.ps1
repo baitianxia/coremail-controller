@@ -415,27 +415,21 @@ function Test-CoremailInteractivePromptAvailable {
     # The hosted release gate and redirected automation must never block on
     # Read-Host.  A normal INSTALL.cmd/UNINSTALL.cmd console remains eligible
     # for the short, user-controlled recovery prompt below.
-    if ($env:COREMAIL_RELEASE_GATE_TESTING -eq 'true' -or
-        $env:CI -eq 'true' -or
-        $env:GITHUB_ACTIONS -eq 'true') {
-        return $false
-    }
+    if ($env:COREMAIL_RELEASE_GATE_TESTING -eq 'true') { return $false }
+    if ($env:CI -eq 'true') { return $false }
+    if ($env:GITHUB_ACTIONS -eq 'true') { return $false }
     try {
-        if ([Console]::IsInputRedirected) { return $false }
+        $inputRedirected = [Console]::IsInputRedirected
+        if ($inputRedirected) { return $false }
     }
     catch { return $false }
-    return ($null -ne $Host -and $null -ne $Host.UI)
+    if ($null -eq $Host) { return $false }
+    $hostUi = $Host.UI
+    if ($null -eq $hostUi) { return $false }
+    return $true
 }
 
 function Invoke-CoremailManualDirectoryMoveAssistance {
-    <#
-      Give a real Windows user a chance to release a handle or repair the
-      exact ACL without downloading/repacking the release.  The function never
-      deletes, copies, takes ownership, or recursively changes permissions.
-      It returns 'moved' when the user action made the atomic move succeed and
-      'versioned' when the user chooses the immutable-release fallback or the
-      process is non-interactive.
-    #>
     param(
         [Parameter(Mandatory = $true)][string]$Source,
         [Parameter(Mandatory = $true)][string]$Destination,
@@ -444,9 +438,7 @@ function Invoke-CoremailManualDirectoryMoveAssistance {
     )
 
     if (-not (Test-CoremailInteractivePromptAvailable)) {
-        Write-CoremailLifecycleLog (
-            "MANUAL MOVE ASSISTANCE SKIPPED operation=$OperationLabel; reason=noninteractive"
-        )
+        Write-CoremailLifecycleLog "MANUAL MOVE ASSISTANCE SKIPPED operation=$OperationLabel; reason=noninteractive"
         return 'versioned'
     }
 
@@ -454,15 +446,15 @@ function Invoke-CoremailManualDirectoryMoveAssistance {
     $destinationPath = [IO.Path]::GetFullPath($Destination)
     $sidText = '<current-user-SID>'
     try {
-        $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
-        if ($null -ne $currentSid) { $sidText = $currentSid.Value }
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        if ($null -ne $identity) {
+            $identitySid = $identity.User
+            if ($null -ne $identitySid) { $sidText = [string]$identitySid.Value }
+        }
     }
     catch { }
     Write-Host ''
-    Write-Warning (
-        "$OperationLabel still cannot access the exact existing directory. " +
-        'No files were deleted or overwritten.'
-    )
+    Write-Warning "$OperationLabel still cannot access the exact existing directory. No files were deleted or overwritten."
     Write-Host "Source: $sourcePath"
     Write-Host '请先关闭 Claude Code、Explorer 中打开该目录的窗口，以及可能正在扫描该目录的同步/索引程序。'
     Write-Host '如果是 ACL 问题，请让管理员在管理员 PowerShell 中仅对上述目录授予当前用户 Modify：'
@@ -484,15 +476,11 @@ function Invoke-CoremailManualDirectoryMoveAssistance {
             $choice = (Read-Host $promptText).Trim().ToLowerInvariant()
         }
         catch {
-            Write-CoremailLifecycleLog (
-                "MANUAL MOVE ASSISTANCE FALLBACK operation=$OperationLabel; reason=prompt-failed"
-            )
+            Write-CoremailLifecycleLog "MANUAL MOVE ASSISTANCE FALLBACK operation=$OperationLabel; reason=prompt-failed"
             return 'versioned'
         }
-        if ($AllowVersionedFallback -and $choice -eq 'v') {
-            Write-CoremailLifecycleLog (
-                "MANUAL MOVE ASSISTANCE FALLBACK operation=$OperationLabel; choice=versioned"
-            )
+        if ($AllowVersionedFallback -and ($choice -eq 'v')) {
+            Write-CoremailLifecycleLog "MANUAL MOVE ASSISTANCE FALLBACK operation=$OperationLabel; choice=versioned"
             return 'versioned'
         }
         if ($choice -ne 'r') {
@@ -506,16 +494,13 @@ function Invoke-CoremailManualDirectoryMoveAssistance {
             $sourceAfter = Test-CoremailDirectoryPresent -Path $sourcePath
             $destinationAfter = Test-CoremailDirectoryPresent -Path $destinationPath
             if (-not $sourceAfter -and $destinationAfter) {
-                Write-CoremailLifecycleLog (
-                    "MANUAL MOVE ASSISTANCE RECOVERED operation=$OperationLabel; destination=$destinationPath"
-                )
+                Write-CoremailLifecycleLog "MANUAL MOVE ASSISTANCE RECOVERED operation=$OperationLabel; destination=$destinationPath"
                 Write-Host "$OperationLabel 已在人工处理后完成。" -ForegroundColor Green
                 return 'moved'
             }
-            $ambiguousMessage = (
-                "$OperationLabel returned an ambiguous postcondition after manual retry; " +
-                "sourcePresent=$sourceAfter; destinationPresent=$destinationAfter"
-            )
+            $ambiguousMessage = "$OperationLabel returned an ambiguous postcondition after manual retry"
+            $ambiguousMessage = $ambiguousMessage + "; sourcePresent=" + [string]$sourceAfter
+            $ambiguousMessage = $ambiguousMessage + "; destinationPresent=" + [string]$destinationAfter
             throw $ambiguousMessage
         }
         catch {
@@ -523,15 +508,10 @@ function Invoke-CoremailManualDirectoryMoveAssistance {
             if ($AllowVersionedFallback) {
                 $manualRetryHint = ' 可继续释放占用后再次按 R，或按 V 继续。'
             }
-            Write-Warning (
-                "$OperationLabel 仍未完成：$($_.Exception.Message)。" +
-                $manualRetryHint
-            )
+            Write-Warning ("$OperationLabel 仍未完成：" + $_.Exception.Message + "。" + $manualRetryHint)
         }
     }
-    Write-CoremailLifecycleLog (
-        "MANUAL MOVE ASSISTANCE FALLBACK operation=$OperationLabel; reason=retry-window-exhausted"
-    )
+    Write-CoremailLifecycleLog "MANUAL MOVE ASSISTANCE FALLBACK operation=$OperationLabel; reason=retry-window-exhausted"
     return 'versioned'
 }
 
