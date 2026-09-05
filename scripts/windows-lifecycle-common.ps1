@@ -477,11 +477,9 @@ function Invoke-CoremailManualDirectoryMoveAssistance {
 
     for ($promptAttempt = 1; $promptAttempt -le 3; $promptAttempt++) {
         try {
-            $promptText = if ($AllowVersionedFallback) {
-                "[$promptAttempt/3] 输入 R=重试，V=使用不可变版本"
-            }
-            else {
-                "[$promptAttempt/3] 输入 R=重试"
+            $promptText = "[$promptAttempt/3] 输入 R=重试"
+            if ($AllowVersionedFallback) {
+                $promptText = "[$promptAttempt/3] 输入 R=重试，V=使用不可变版本"
             }
             $choice = (Read-Host $promptText).Trim().ToLowerInvariant()
         }
@@ -498,7 +496,8 @@ function Invoke-CoremailManualDirectoryMoveAssistance {
             return 'versioned'
         }
         if ($choice -ne 'r') {
-            $validChoices = if ($AllowVersionedFallback) { 'R 或 V' } else { 'R' }
+            $validChoices = 'R'
+            if ($AllowVersionedFallback) { $validChoices = 'R 或 V' }
             Write-Host "请输入 $validChoices。" -ForegroundColor Yellow
             continue
         }
@@ -513,10 +512,11 @@ function Invoke-CoremailManualDirectoryMoveAssistance {
                 Write-Host "$OperationLabel 已在人工处理后完成。" -ForegroundColor Green
                 return 'moved'
             }
-            throw (
+            $ambiguousMessage = (
                 "$OperationLabel returned an ambiguous postcondition after manual retry; " +
                 "sourcePresent=$sourceAfter; destinationPresent=$destinationAfter"
             )
+            throw $ambiguousMessage
         }
         catch {
             $manualRetryHint = ' 可继续释放占用后再次按 R。'
