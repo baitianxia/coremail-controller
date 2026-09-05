@@ -365,6 +365,10 @@ Write-Output 'PASS'
         self.assertEqual(2, normalized.count("& $orchestrator"))
         self.assertIn("claude 2.1.84 user-scope registration", normalized)
         self.assertIn("register_claude_user_mcp.py", normalized)
+        self.assertIn(
+            "if (-not $?) { throw 'source mcp smoke test failed.' }",
+            normalized,
+        )
         self.assertIn("actions/download-artifact@v8", normalized)
         self.assertIn("needs: windows-powershell-51", normalized)
         self.assertLess(

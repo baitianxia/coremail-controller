@@ -441,6 +441,7 @@ try {
             -OutputPath (Join-Path $activationPlugin 'mcp\python-runtime.json')
         Assert-CoremailRelease -Root $activationPlugin -AllowPythonRuntime
         & (Join-Path $activationPlugin 'tests\smoke-mcp.ps1') -IgnoreAccountConfiguration
+        if (-not $?) { throw 'Staged MCP smoke test failed.' }
         Write-CoremailLifecycleLog 'STAGED Coremail package validated; Claude plugin validation is not required for user-scope MCP registration'
     }
 
@@ -499,6 +500,7 @@ try {
     }
     Assert-CoremailRelease -Root $targetRoot -AllowPythonRuntime
     & (Join-Path $targetRoot 'tests\smoke-mcp.ps1') -IgnoreAccountConfiguration
+    if (-not $?) { throw 'Published MCP smoke test failed.' }
 
     Write-Step 4 'Registering and verifying the Coremail MCP in Claude user scope'
     # Snapshot the exact user configuration before invoking Claude.  The
@@ -540,10 +542,12 @@ try {
     Write-Step 6 'Verifying the installed MCP server and writing the result'
     $smokeTest = Join-Path $targetRoot 'tests\smoke-mcp.ps1'
     & $smokeTest
+    if (-not $?) { throw 'Installed MCP smoke test failed.' }
     $connectionVerified = $false
     if (-not $SkipConnectionCheck -and (Test-Path -LiteralPath $configPath -PathType Leaf)) {
         try {
             & $smokeTest -TimeoutMilliseconds 60000 -CheckConnection
+            if (-not $?) { throw 'Live Coremail connection smoke test failed.' }
             $connectionVerified = $true
         }
         catch {

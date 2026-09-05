@@ -131,7 +131,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $pythonCommand = (Get-Command python.exe -ErrorAction Stop).Source
           & .\tests\smoke-mcp.ps1 -IgnoreAccountConfiguration -PythonExecutable $pythonCommand
-          if ($LASTEXITCODE -ne 0) { throw 'Source MCP smoke test failed.' }
+          # smoke-mcp.ps1 is a PowerShell script, not a native executable. Its
+          # success must be checked with `$?`; `$LASTEXITCODE` can still hold a
+          # stale value from a previous native command in the runner process.
+          if (-not $?) { throw 'Source MCP smoke test failed.' }
           $sourceRoot = (Get-Location).Path
           $registrar = Join-Path $sourceRoot 'scripts\register_claude_user_mcp.py'
           & $pythonCommand -B -I $registrar self-test

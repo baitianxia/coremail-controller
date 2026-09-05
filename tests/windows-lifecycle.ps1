@@ -223,6 +223,7 @@ Write-Host "[gate 2/11][$ScenarioName] Verifying package integrity, MCP capabili
 if ($LASTEXITCODE -ne 0) { throw 'Packaged internal integrity verification failed.' }
 & (Join-Path $PluginRoot 'tests\smoke-mcp.ps1') `
     -IgnoreAccountConfiguration -PythonExecutable $PythonCommand
+if (-not $?) { throw 'Packaged source MCP smoke test failed.' }
 Invoke-ExactClaude -Arguments @('--version')
 Invoke-ExactClaude -Arguments @('mcp', '--help')
 if ($ScenarioName -eq 'npm') {
@@ -347,6 +348,7 @@ if ([string]$runtime.executable_sha256 -ine
 Assert-UserMcpRegistered
 Assert-UserConfigCustomSetting
 & (Join-Path $targetRoot 'tests\smoke-mcp.ps1')
+if (-not $?) { throw 'Installed MCP smoke test failed.' }
 if ((Get-Content -LiteralPath $installLog -Raw) -notmatch 'INSTALLATION COMMITTED') {
     throw 'Persistent install log does not contain the commit marker.'
 }

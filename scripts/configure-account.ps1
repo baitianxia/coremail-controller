@@ -49,9 +49,11 @@ try {
 
     & $setupScript -LogPath $LogPath
     & $smokeTest
+    if (-not $?) { throw 'Installed MCP smoke test failed.' }
     if (-not $SkipConnectionCheck) {
         try {
             & $smokeTest -TimeoutMilliseconds 60000 -CheckConnection
+            if (-not $?) { throw 'Live Coremail connection smoke test failed.' }
         }
         catch {
             Write-Warning "Account settings were saved, but the live connection check did not pass: $($_.Exception.Message)"
