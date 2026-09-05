@@ -283,10 +283,15 @@ function Resolve-CoremailClaudeUserConfigPath {
     $configRoot = $profilePath
     if (-not [string]::IsNullOrWhiteSpace([string]$env:CLAUDE_CONFIG_DIR)) {
         $raw = [string]$env:CLAUDE_CONFIG_DIR
-        if ($raw.StartsWith('~') -or $raw.StartsWith('\\') -or
-            -not [IO.Path]::IsPathRooted($raw) -or
+        if ($raw.StartsWith('~')) {
+            throw 'CLAUDE_CONFIG_DIR must be a local absolute path; ~ paths are not supported.'
+        }
+        if ($raw.StartsWith('\\')) {
+            throw 'CLAUDE_CONFIG_DIR must be a local absolute path; UNC paths are not supported.'
+        }
+        if (-not [IO.Path]::IsPathRooted($raw) -or
             $raw -notmatch '^[A-Za-z]:[\\/]') {
-            throw 'CLAUDE_CONFIG_DIR must be a local absolute path; ~ and UNC paths are not supported.'
+            throw 'CLAUDE_CONFIG_DIR must be a local absolute path; relative paths are not supported.'
         }
         try {
             $configRoot = [IO.Path]::GetFullPath($raw)
