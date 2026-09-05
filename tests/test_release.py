@@ -359,10 +359,18 @@ Write-Output 'PASS'
             [shell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
             check=False,
             capture_output=True,
-            text=True,
+            # Windows PowerShell can emit its native stream in the active OEM
+            # code page.  Read bytes here so the test itself cannot fail in
+            # Python's background reader before it can report the probe's
+            # actual exit status.  The assertions below only depend on ASCII
+            # markers; diagnostic text is decoded lossily for the failure
+            # message.
+            text=False,
         )
-        self.assertEqual(0, completed.returncode, msg=completed.stderr + completed.stdout)
-        self.assertIn("PASS", completed.stdout)
+        stdout = (completed.stdout or b"").decode("utf-8", errors="replace")
+        stderr = (completed.stderr or b"").decode("utf-8", errors="replace")
+        self.assertEqual(0, completed.returncode, msg=stderr + stdout)
+        self.assertIn("PASS", stdout)
 
     def test_windows_gate_mentions_exact_legacy_fixture_as_supported(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "windows-release-gate.yml").read_text(
