@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 
 Set-StrictMode -Version 2.0
 
@@ -469,9 +469,9 @@ function Invoke-CoremailManualDirectoryMoveAssistance {
 
     for ($promptAttempt = 1; $promptAttempt -le 3; $promptAttempt++) {
         try {
-            $promptText = "[$promptAttempt/3] 输入 R=重试"
+            $promptText = "[$promptAttempt/3] R=retry"
             if ($AllowVersionedFallback) {
-                $promptText = "[$promptAttempt/3] 输入 R=重试，V=使用不可变版本"
+                $promptText = "[$promptAttempt/3] R=retry, V=versioned"
             }
             $choice = (Read-Host $promptText).Trim().ToLowerInvariant()
         }
@@ -486,7 +486,7 @@ function Invoke-CoremailManualDirectoryMoveAssistance {
         if ($choice -ne 'r') {
             $validChoices = 'R'
             if ($AllowVersionedFallback) { $validChoices = 'R 或 V' }
-            Write-Host "请输入 $validChoices。" -ForegroundColor Yellow
+            Write-Host "Enter $validChoices." -ForegroundColor Yellow
             continue
         }
         try {
@@ -495,7 +495,7 @@ function Invoke-CoremailManualDirectoryMoveAssistance {
             $destinationAfter = Test-CoremailDirectoryPresent -Path $destinationPath
             if (-not $sourceAfter -and $destinationAfter) {
                 Write-CoremailLifecycleLog "MANUAL MOVE ASSISTANCE RECOVERED operation=$OperationLabel; destination=$destinationPath"
-                Write-Host "$OperationLabel 已在人工处理后完成。" -ForegroundColor Green
+                Write-Host "$OperationLabel completed after manual assistance." -ForegroundColor Green
                 return 'moved'
             }
             $ambiguousMessage = "$OperationLabel returned an ambiguous postcondition after manual retry"
@@ -508,7 +508,7 @@ function Invoke-CoremailManualDirectoryMoveAssistance {
             if ($AllowVersionedFallback) {
                 $manualRetryHint = ' 可继续释放占用后再次按 R，或按 V 继续。'
             }
-            Write-Warning ("$OperationLabel 仍未完成：" + $_.Exception.Message + "。" + $manualRetryHint)
+            Write-Warning ("$OperationLabel is still blocked: " + $_.Exception.Message + "." + $manualRetryHint)
         }
     }
     Write-CoremailLifecycleLog "MANUAL MOVE ASSISTANCE FALLBACK operation=$OperationLabel; reason=retry-window-exhausted"
@@ -609,10 +609,10 @@ function Move-CoremailDirectoryAtomically {
                 continue
             }
             if ($attempt -ge $MaximumAttempts) {
-                $repairHint = if ($accessDeniedRepairAttempted) {
-                    ' An access repair was attempted; if the error persists, close Claude Code, Explorer, and any security/indexing process using this directory, then retry.'
+                $repairHint = ''
+                if ($accessDeniedRepairAttempted) {
+                    $repairHint = ' An access repair was attempted; if the error persists, close Claude Code, Explorer, and any security/indexing process using this directory, then retry.'
                 }
-                else { '' }
                 throw (
                     "$OperationLabel remained blocked after $MaximumAttempts attempts. " +
                     "The source remains intact and the destination was not created. " +
