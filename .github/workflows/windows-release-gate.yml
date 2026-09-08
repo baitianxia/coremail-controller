@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: coremail-windows-release-${{ github.ref }}
+  group: mail-windows-release-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -37,6 +37,31 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: ${{ env.CLAUDE_NPM_NODE_VERSION }}
+
+      - name: Initialize Windows gate evidence
+        shell: powershell
+        run: |
+          $evidenceRoot = Join-Path $env:RUNNER_TEMP 'mail-release-evidence'
+          if (Test-Path -LiteralPath $evidenceRoot) {
+            Remove-Item -LiteralPath $evidenceRoot -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $evidenceRoot -Force | Out-Null
+          $started = [ordered]@{
+            schema_version = 1
+            package = 'mail-mcp-server'
+            source_commit = $env:GITHUB_SHA
+            runner_os = $env:RUNNER_OS
+            runner_arch = $env:RUNNER_ARCH
+            powershell = $PSVersionTable.PSVersion.ToString()
+            started_at_utc = [DateTime]::UtcNow.ToString('o')
+          }
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          [IO.File]::WriteAllText(
+            (Join-Path $evidenceRoot 'gate-start.json'),
+            ($started | ConvertTo-Json -Depth 6),
+            $utf8
+          )
+          "MAIL_RELEASE_EVIDENCE_DIR=$evidenceRoot" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Run offline unit tests
         shell: powershell
@@ -86,7 +111,7 @@ jobs:
             throw "Expected native Claude $env:CLAUDE_CODE_VERSION; found $nativeVersion"
           }
 
-          $npmRoot = Join-Path $env:RUNNER_TEMP 'coremail-npm-claude'
+          $npmRoot = Join-Path $env:RUNNER_TEMP 'mail-npm-claude'
           npm.cmd install --global --prefix $npmRoot `
             "@anthropic-ai/claude-code@$env:CLAUDE_CODE_VERSION"
           if ($LASTEXITCODE -ne 0) { throw 'The CI-only npm Claude fixture failed to install.' }
@@ -104,7 +129,7 @@ jobs:
           if ($nodeExitCode -ne 0 -or $nodeVersion -ne "v$env:CLAUDE_NPM_NODE_VERSION") {
             throw "Expected npm Node v$env:CLAUDE_NPM_NODE_VERSION; found $nodeVersion"
           }
-          $legacyNpmRoot = Join-Path $env:RUNNER_TEMP 'coremail-npm-claude-legacy'
+          $legacyNpmRoot = Join-Path $env:RUNNER_TEMP 'mail-npm-claude-legacy'
           npm.cmd install --global --prefix $legacyNpmRoot `
             "@anthropic-ai/claude-code@$env:CLAUDE_LEGACY_CODE_VERSION"
           if ($LASTEXITCODE -ne 0) { throw 'The CI-only legacy npm Claude fixture failed to install.' }
@@ -170,7 +195,7 @@ jobs:
           $registrarArguments = @(
             '-B', '-I', $registrar, 'register',
             '--claude-executable', [string]$legacyInvocation.Executable,
-            '--server-name', 'coremail-controller',
+            '--server-name', 'mail-mcp',
             '--user-config', $probeConfig,
             '--backup', $probeBackup,
             '--powershell-executable', $windowsPowerShell,
@@ -186,7 +211,7 @@ jobs:
             & $pythonCommand @registrarArguments
             if ($LASTEXITCODE -ne 0) { throw 'Claude 2.1.84 user-scope registration failed.' }
             & $pythonCommand -B -I $registrar verify `
-              --server-name 'coremail-controller' `
+              --server-name 'mail-mcp' `
               --user-config $probeConfig `
               --powershell-executable $windowsPowerShell `
               --server-script (Join-Path $sourceRoot 'mcp\run-server.ps1')
@@ -194,7 +219,7 @@ jobs:
             $removeArguments = @(
               '-B', '-I', $registrar, 'unregister',
               '--claude-executable', [string]$legacyInvocation.Executable,
-              '--server-name', 'coremail-controller',
+              '--server-name', 'mail-mcp',
               '--user-config', $probeConfig,
               '--backup', $removeBackup
             )
@@ -207,8 +232,8 @@ jobs:
               $probePayload = Get-Content -LiteralPath $probeConfig -Raw | ConvertFrom-Json
               $probeServers = $probePayload.PSObject.Properties['mcpServers']
               if ($null -ne $probeServers -and
-                  $null -ne $probeServers.Value.PSObject.Properties['coremail-controller']) {
-                throw 'Claude 2.1.84 removal left the Coremail user entry behind.'
+                  $null -ne $probeServers.Value.PSObject.Properties['mail-mcp']) {
+                throw 'Claude 2.1.84 removal left the mail user entry behind.'
               }
             }
           }
@@ -220,16 +245,45 @@ jobs:
       - name: Build and exercise the exact packaged Windows artifact
         shell: powershell
         run: |
-          $candidateRoot = Join-Path $env:RUNNER_TEMP 'coremail-release-gated'
-          python -B .\scripts\build-release.py `
+          $candidateRoot = Join-Path $env:RUNNER_TEMP 'mail-release-gated'
+          $runtimeBundle = Join-Path $env:RUNNER_TEMP 'mail-python-runtime'
+          $evidenceRoot = [IO.Path]::GetFullPath($env:MAIL_RELEASE_EVIDENCE_DIR)
+          $releaseEvidence = Join-Path $evidenceRoot 'release'
+          New-Item -ItemType Directory -Path $releaseEvidence -Force | Out-Null
+          $pythonCommand = (Get-Command python.exe -ErrorAction Stop).Source
+          $pythonHome = Split-Path -Parent $pythonCommand
+          New-Item -ItemType Directory -Path $runtimeBundle -Force | Out-Null
+          # The online publisher runner may stage the approved setup-python
+          # installation into the package. The target installer never performs
+          # this copy, installs Python, or reaches the network.
+          Get-ChildItem -LiteralPath $pythonHome -Force | Copy-Item -Destination $runtimeBundle -Recurse -Force
+          # Keep the archive deterministic and fail closed in the builder: a
+          # setup-python home can acquire bytecode caches while the preceding
+          # source checks run on the hosted worker.
+          $runtimeCacheNames = @('__pycache__', '.pytest_cache', '.mypy_cache', '.tox')
+          $runtimeCaches = @(Get-ChildItem -LiteralPath $runtimeBundle -Directory -Recurse -Force |
+            Where-Object { $runtimeCacheNames -contains $_.Name } |
+            Sort-Object FullName -Descending)
+          foreach ($cache in $runtimeCaches) {
+            Remove-Item -LiteralPath $cache.FullName -Recurse -Force -ErrorAction Stop
+          }
+          $runtimeVersion = ((& $pythonCommand -B -I -c "import platform; print(platform.python_version())" 2>&1) -join "`n").Trim()
+          $runtimeVersionExitCode = $LASTEXITCODE
+          if ($runtimeVersionExitCode -ne 0 -or $runtimeVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Unable to determine the staged Python runtime version: $runtimeVersion"
+          }
+          & $pythonCommand -B .\scripts\build-release.py `
             --output-dir $candidateRoot `
             --windows-gate `
-            --source-commit $env:GITHUB_SHA
+            --source-commit $env:GITHUB_SHA `
+            --runtime-dir $runtimeBundle `
+            --runtime-version $runtimeVersion `
+            --runtime-source 'actions/setup-python Windows x64 runtime'
           if ($LASTEXITCODE -ne 0) { throw 'Windows-gated archive construction failed.' }
 
           $archives = @(Get-ChildItem -LiteralPath $candidateRoot -Filter '*.zip' -File)
           if ($archives.Count -ne 1 -or
-              $archives[0].Name -ne 'coremail-controller-0.9.0-windows.zip') {
+              $archives[0].Name -ne 'mail-mcp-server-0.9.0-windows-x64.zip') {
             throw 'Expected exactly the versioned gated ZIP.'
           }
           $archive = $archives[0]
@@ -240,41 +294,100 @@ jobs:
             throw 'Release candidate checksum sidecar does not match the ZIP.'
           }
 
-          $extractRoot = Join-Path $env:RUNNER_TEMP 'coremail-release-extracted'
+          $extractRoot = Join-Path $env:RUNNER_TEMP 'mail-release-extracted'
           Expand-Archive -LiteralPath $archive.FullName -DestinationPath $extractRoot
           $pluginRoots = @(Get-ChildItem -LiteralPath $extractRoot -Directory)
           if ($pluginRoots.Count -ne 1) { throw 'The release ZIP must contain exactly one plugin root.' }
           $pluginRoot = $pluginRoots[0].FullName
-          python -B (Join-Path $pluginRoot 'scripts\verify-release.py') `
+          $bundledPythonCommand = Join-Path $pluginRoot 'payload\runtime\python.exe'
+          if (-not (Test-Path -LiteralPath $bundledPythonCommand -PathType Leaf)) {
+            throw 'The extracted package does not expose its bundled Python runtime.'
+          }
+          & $bundledPythonCommand -B -I (Join-Path $pluginRoot 'scripts\verify-release.py') `
             $pluginRoot --require-windows-gate
           if ($LASTEXITCODE -ne 0) { throw 'Extracted internal integrity verification failed.' }
 
-          $pythonCommand = (Get-Command python.exe -ErrorAction Stop).Source
-          $orchestrator = Join-Path $pluginRoot 'tests\run-windows-release-gate.ps1'
+          $releaseManifestPath = Join-Path $pluginRoot 'release-manifest.json'
+          $runtimeManifestPath = Join-Path $pluginRoot 'payload\runtime\runtime-manifest.json'
+          $sbomPath = Join-Path $pluginRoot 'payload\sbom.json'
+          Copy-Item -LiteralPath $releaseManifestPath -Destination (Join-Path $releaseEvidence 'release-manifest.json') -Force
+          Copy-Item -LiteralPath (Join-Path $pluginRoot 'SHA256SUMS.txt') -Destination (Join-Path $releaseEvidence 'SHA256SUMS.txt') -Force
+          Copy-Item -LiteralPath $runtimeManifestPath -Destination (Join-Path $releaseEvidence 'runtime-manifest.json') -Force
+          Copy-Item -LiteralPath $sbomPath -Destination (Join-Path $releaseEvidence 'sbom.json') -Force
+          $evidenceSidecarPath = Join-Path $releaseEvidence ($archive.Name + '.sha256')
+          Copy-Item -LiteralPath $sidecarPath -Destination $evidenceSidecarPath -Force
+          $releaseManifest = Get-Content -LiteralPath $releaseManifestPath -Raw | ConvertFrom-Json
+          $runtimeLicenseRelative = [string]$releaseManifest.runtime.license_relative_path
+          if ([string]::IsNullOrWhiteSpace($runtimeLicenseRelative)) {
+            throw 'Windows-gated release has no runtime license evidence path.'
+          }
+          $runtimeLicensePath = Join-Path $pluginRoot ($runtimeLicenseRelative.Replace('/', '\'))
+          if (-not (Test-Path -LiteralPath $runtimeLicensePath -PathType Leaf)) {
+            throw "Windows-gated runtime license evidence is missing: $runtimeLicenseRelative"
+          }
+          Copy-Item -LiteralPath $runtimeLicensePath -Destination (Join-Path $releaseEvidence 'runtime-LICENSE.txt') -Force
+          $buildEvidence = [ordered]@{
+            schema_version = 1
+            package = 'mail-mcp-server'
+            source_commit = $env:GITHUB_SHA
+            archive = $archive.Name
+            archive_sha256 = $testedArchiveHash.ToLowerInvariant()
+            runtime_source = [string]$releaseManifest.runtime.source
+            runtime_version = [string]$releaseManifest.runtime.version
+            runtime_executable_sha256 = [string]$releaseManifest.runtime.executable_sha256
+            runtime_license = $runtimeLicenseRelative
+            powershell = $PSVersionTable.PSVersion.ToString()
+            python = $runtimeVersion
+            claude_native = $env:CLAUDE_CODE_VERSION
+            claude_npm = $env:CLAUDE_CODE_VERSION
+            claude_legacy_npm = $env:CLAUDE_LEGACY_CODE_VERSION
+            node = $env:CLAUDE_NPM_NODE_VERSION
+          }
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          [IO.File]::WriteAllText(
+            (Join-Path $releaseEvidence 'build-evidence.json'),
+            ($buildEvidence | ConvertTo-Json -Depth 8),
+            $utf8
+          )
+
+          $orchestrator = Join-Path $PWD 'tests\run-windows-release-gate.ps1'
+          $lifecycleScript = Join-Path $PWD 'tests\windows-lifecycle.ps1'
           & $orchestrator `
-            -PluginRoot $pluginRoot `
-            -PythonCommand $pythonCommand `
-            -ClaudeCommand $env:NATIVE_CLAUDE `
-            -ScenarioName native
+              -PluginRoot $pluginRoot `
+              -PythonCommand $bundledPythonCommand `
+              -ClaudeCommand $env:NATIVE_CLAUDE `
+              -LifecycleScript $lifecycleScript `
+              -EvidenceDirectory (Join-Path $evidenceRoot 'native') `
+              -ScenarioName native
           & $orchestrator `
-            -PluginRoot $pluginRoot `
-            -PythonCommand $pythonCommand `
-            -ClaudeCommand $env:NPM_CLAUDE `
-            -NodeCommand $env:NPM_NODE `
-            -ScenarioName npm
+              -PluginRoot $pluginRoot `
+              -PythonCommand $bundledPythonCommand `
+              -ClaudeCommand $env:NPM_CLAUDE `
+              -NodeCommand $env:NPM_NODE `
+              -LifecycleScript $lifecycleScript `
+              -EvidenceDirectory (Join-Path $evidenceRoot 'npm') `
+              -ScenarioName npm
 
           $uploadArchiveHash = (Get-FileHash -LiteralPath $archive.FullName -Algorithm SHA256).Hash
           if ($uploadArchiveHash -ine $testedArchiveHash) {
             throw 'The release candidate ZIP changed after lifecycle testing.'
           }
-          "COREMAIL_RELEASE_DIR=$candidateRoot" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "MAIL_RELEASE_DIR=$candidateRoot" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Upload gated release
         uses: actions/upload-artifact@v7
         with:
-          name: coremail-controller-windows-gated
-          path: ${{ env.COREMAIL_RELEASE_DIR }}
+          name: mail-mcp-server-windows-gated
+          path: ${{ env.MAIL_RELEASE_DIR }}
           if-no-files-found: error
+
+      - name: Upload Windows gate evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: mail-mcp-server-windows-gate-evidence
+          path: ${{ runner.temp }}/mail-release-evidence
+          if-no-files-found: warn
 
   publish-gated-files:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
@@ -293,14 +406,14 @@ jobs:
       - name: Download the gated artifact from this run
         uses: actions/download-artifact@v8
         with:
-          name: coremail-controller-windows-gated
-          path: ${{ runner.temp }}/coremail-gated-release
+          name: mail-mcp-server-windows-gated
+          path: ${{ runner.temp }}/mail-gated-release
 
       - name: Verify and publish the exact gated files
         shell: bash
         run: |
           set -euo pipefail
-          release_dir="${RUNNER_TEMP}/coremail-gated-release"
+          release_dir="${RUNNER_TEMP}/mail-gated-release"
           shopt -s nullglob
           archives=("${release_dir}"/*.zip)
           sidecars=("${release_dir}"/*.zip.sha256)
@@ -314,14 +427,14 @@ jobs:
             echo 'The gated ZIP and checksum sidecar names do not match.' >&2
             exit 1
           fi
-          if [[ ! "${archive_name}" =~ ^coremail-controller-([0-9]+\.[0-9]+\.[0-9]+)-windows\.zip$ ]]; then
+          if [[ ! "${archive_name}" =~ ^mail-mcp-server-([0-9]+\.[0-9]+\.[0-9]+)-windows-x64\.zip$ ]]; then
             echo 'The gated ZIP name does not contain a supported release version.' >&2
             exit 1
           fi
           release_version="${BASH_REMATCH[1]}"
           (cd "${release_dir}" && sha256sum -c "${sidecar_name}")
 
-          extract_dir="${RUNNER_TEMP}/coremail-publish-verify"
+          extract_dir="${RUNNER_TEMP}/mail-publish-verify"
           python -B -m zipfile -e "${archives[0]}" "${extract_dir}"
           plugin_root="$(find "${extract_dir}" -mindepth 1 -maxdepth 1 -type d -print -quit)"
           python -B "${plugin_root}/scripts/verify-release.py" "${plugin_root}" --require-windows-gate

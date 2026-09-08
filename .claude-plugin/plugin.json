@@ -1,6 +1,7 @@
 {
-  "name": "coremail-controller",
-  "description": "Interface-first Coremail mailbox access with a secure IMAP/SMTP fallback.",
+  "name": "mail-mcp-server",
+  "displayName": "邮件助手",
+  "description": "通用邮件助手：通过安全 IMAP/SMTP 或 Windows Simple MAPI provider 提供无界面邮箱操作。",
   "version": "0.9.0",
   "author": {
     "name": "Local Claude Code integration"

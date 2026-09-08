@@ -41,7 +41,7 @@ class UserMcpRegistrationTests(unittest.TestCase):
             if user_config.exists()
             else {}
         )
-        payload.setdefault("mcpServers", {})["coremail-controller"] = {
+        payload.setdefault("mcpServers", {})["mail-mcp"] = {
             "type": "stdio",
             "command": str(powershell),
             "args": [
@@ -75,7 +75,7 @@ class UserMcpRegistrationTests(unittest.TestCase):
                 registration.register_user_mcp(
                     claude_executable="claude.exe",
                     claude_prefix=(),
-                    server_name="coremail-controller",
+                    server_name="mail-mcp",
                     powershell_executable=powershell,
                     server_script=server_script,
                     user_config=user_config,
@@ -85,7 +85,7 @@ class UserMcpRegistrationTests(unittest.TestCase):
 
             self.assertEqual(
                 [
-                    ("mcp", "remove", "coremail-controller", "--scope", "user"),
+                    ("mcp", "remove", "mail-mcp", "--scope", "user"),
                     (
                         "mcp",
                         "add",
@@ -93,7 +93,7 @@ class UserMcpRegistrationTests(unittest.TestCase):
                         "stdio",
                         "--scope",
                         "user",
-                        "coremail-controller",
+                        "mail-mcp",
                         "--",
                         str(powershell),
                         "-NoLogo",
@@ -102,7 +102,7 @@ class UserMcpRegistrationTests(unittest.TestCase):
                         "-File",
                         str(server_script),
                     ),
-                    ("mcp", "get", "coremail-controller"),
+                    ("mcp", "get", "mail-mcp"),
                 ],
                 calls,
             )
@@ -116,7 +116,7 @@ class UserMcpRegistrationTests(unittest.TestCase):
             results = iter(
                 (
                     subprocess.CompletedProcess(
-                        [], 1, "", "No user-scoped MCP server found with name: coremail-controller"
+                        [], 1, "", "No user-scoped MCP server found with name: mail-mcp"
                     ),
                     subprocess.CompletedProcess([], 0, "", "warning"),
                     subprocess.CompletedProcess([], 0, "server", ""),
@@ -133,7 +133,7 @@ class UserMcpRegistrationTests(unittest.TestCase):
                 registration.register_user_mcp(
                     claude_executable="claude.exe",
                     claude_prefix=(),
-                    server_name="coremail-controller",
+                    server_name="mail-mcp",
                     powershell_executable=powershell,
                     server_script=server_script,
                     user_config=user_config,
@@ -163,7 +163,7 @@ class UserMcpRegistrationTests(unittest.TestCase):
                         registration.register_user_mcp(
                             claude_executable="claude.exe",
                             claude_prefix=(),
-                            server_name="coremail-controller",
+                            server_name="mail-mcp",
                             powershell_executable=powershell,
                             server_script=server_script,
                             user_config=user_config,
@@ -183,7 +183,7 @@ class UserMcpRegistrationTests(unittest.TestCase):
             def wrong_entry_runner(_executable, _prefix, arguments, **_kwargs):
                 if arguments[1] == "add":
                     user_config.write_text(
-                        '{"mcpServers":{"coremail-controller":{"type":"stdio","command":"wrong.exe","args":[]}}}\n',
+                        '{"mcpServers":{"mail-mcp":{"type":"stdio","command":"wrong.exe","args":[]}}}\n',
                         encoding="utf-8",
                     )
                 return subprocess.CompletedProcess(arguments, 0, "", "")
@@ -197,7 +197,7 @@ class UserMcpRegistrationTests(unittest.TestCase):
                     registration.register_user_mcp(
                         claude_executable="claude.exe",
                         claude_prefix=(),
-                        server_name="coremail-controller",
+                        server_name="mail-mcp",
                         powershell_executable=powershell,
                         server_script=server_script,
                         user_config=user_config,
@@ -222,7 +222,7 @@ class UserMcpRegistrationTests(unittest.TestCase):
                     registration.register_user_mcp(
                         claude_executable="claude.exe",
                         claude_prefix=(),
-                        server_name="coremail-controller",
+                        server_name="mail-mcp",
                         powershell_executable=powershell,
                         server_script=server_script,
                         user_config=user_config,
@@ -243,7 +243,7 @@ class UserMcpRegistrationTests(unittest.TestCase):
                 calls.append(tuple(arguments))
                 if arguments[1] == "remove":
                     return subprocess.CompletedProcess(
-                        arguments, 1, "", "No MCP server found with name: coremail-controller"
+                        arguments, 1, "", "No MCP server found with name: mail-mcp"
                     )
                 raise AssertionError("get must not run after an absent remove")
 
@@ -251,7 +251,7 @@ class UserMcpRegistrationTests(unittest.TestCase):
                 registration.unregister_user_mcp(
                     claude_executable="claude.exe",
                     claude_prefix=(),
-                    server_name="coremail-controller",
+                    server_name="mail-mcp",
                     user_config=user_config,
                     backup=backup,
                     reporter=lambda _message: None,
@@ -269,7 +269,7 @@ class UserMcpRegistrationTests(unittest.TestCase):
             def runner(_executable, _prefix, arguments, **_kwargs):
                 if arguments[1] == "remove":
                     payload = json.loads(user_config.read_text(encoding="utf-8"))
-                    del payload["mcpServers"]["coremail-controller"]
+                    del payload["mcpServers"]["mail-mcp"]
                     user_config.write_text(json.dumps(payload), encoding="utf-8")
                     return subprocess.CompletedProcess(arguments, 0, "", "")
                 if arguments[1] == "get":
@@ -282,13 +282,13 @@ class UserMcpRegistrationTests(unittest.TestCase):
                 registration.unregister_user_mcp(
                     claude_executable="claude.exe",
                     claude_prefix=(),
-                    server_name="coremail-controller",
+                    server_name="mail-mcp",
                     user_config=user_config,
                     backup=backup,
                     reporter=lambda _message: None,
                 )
             self.assertNotIn(
-                "coremail-controller",
+                "mail-mcp",
                 json.loads(user_config.read_text(encoding="utf-8")).get(
                     "mcpServers", {}
                 ),
@@ -319,7 +319,7 @@ class UserMcpRegistrationTests(unittest.TestCase):
                     "--claude-prefix",
                     str(fake_cli),
                     "--server-name",
-                    "coremail-controller",
+                    "mail-mcp",
                     "--powershell-executable",
                     str(powershell),
                     "--server-script",
@@ -364,10 +364,10 @@ class UserMcpRegistrationTests(unittest.TestCase):
 
     def test_native_command_never_inserts_a_shell(self) -> None:
         command = registration._native_command(
-            r"C:\Tools\claude.exe", (), ("mcp", "get", "coremail-controller")
+            r"C:\Tools\claude.exe", (), ("mcp", "get", "mail-mcp")
         )
         self.assertEqual(
-            [r"C:\Tools\claude.exe", "mcp", "get", "coremail-controller"], command
+            [r"C:\Tools\claude.exe", "mcp", "get", "mail-mcp"], command
         )
         self.assertNotIn("cmd.exe", " ".join(command).lower())
 

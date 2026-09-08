@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "coremail-windows": {
+    "mail-mcp": {
       "type": "stdio",
       "command": "powershell.exe",
       "args": [

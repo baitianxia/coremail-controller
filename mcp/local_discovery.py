@@ -41,6 +41,7 @@ SECRET_KEY_RE = re.compile(
 EMAIL_RE = re.compile(r"(?i)\b[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,63}\b")
 URL_RE = re.compile(r"(?i)\b(?:https?|imaps?|smtps?)://[^\s\"'<>]{3,300}")
 MAX_FINDINGS = 200
+_MISSING = object()
 
 
 @dataclass
@@ -65,14 +66,11 @@ class ScanBudget:
 
 
 def _bounded_int_argument(value: Any, field: str, default: int, minimum: int, maximum: int) -> int:
-    if value is None:
+    if value is _MISSING:
         return default
-    if isinstance(value, bool):
+    if type(value) is not int:
         raise CoremailError(f"{field} must be an integer")
-    try:
-        number = int(value)
-    except (TypeError, ValueError) as exc:
-        raise CoremailError(f"{field} must be an integer") from exc
+    number = value
     if number < minimum or number > maximum:
         raise CoremailError(f"{field} must be between {minimum} and {maximum}")
     return number
@@ -423,10 +421,10 @@ def discover_local(arguments: Mapping[str, Any]) -> dict[str, Any]:
             Path(os.path.expandvars(os.path.expanduser(item))) for item in requested_roots
         )
 
-    max_files = _bounded_int_argument(arguments.get("max_files"), "max_files", 500, 1, 5000)
-    max_depth = _bounded_int_argument(arguments.get("max_depth"), "max_depth", 6, 1, 12)
+    max_files = _bounded_int_argument(arguments.get("max_files", _MISSING), "max_files", 500, 1, 5000)
+    max_depth = _bounded_int_argument(arguments.get("max_depth", _MISSING), "max_depth", 6, 1, 12)
     max_file_bytes = _bounded_int_argument(
-        arguments.get("max_file_bytes"),
+        arguments.get("max_file_bytes", _MISSING),
         "max_file_bytes",
         5 * 1024 * 1024,
         1024,
@@ -483,7 +481,7 @@ def discover_local(arguments: Mapping[str, Any]) -> dict[str, Any]:
 
     if not roots:
         warnings.append(
-            "No standard Coremail directories were found. Supply the account storage directory explicitly in roots."
+            "No standard mail-provider directories were found. Supply the account storage directory explicitly in roots."
         )
     if budget.files_seen >= budget.max_files:
         warnings.append("The file scan reached max_files and may be incomplete.")
@@ -491,7 +489,7 @@ def discover_local(arguments: Mapping[str, Any]) -> dict[str, Any]:
         warnings.append("Configuration findings were truncated at the safety limit.")
 
     return {
-        "coremail_ui_automation_used": False,
+        "mail_ui_automation_used": False,
         "read_only": True,
         "roots_scanned": [str(root) for root in roots],
         "deep": deep,

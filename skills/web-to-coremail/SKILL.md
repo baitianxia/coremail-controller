@@ -1,19 +1,19 @@
 ---
-name: web-to-coremail
-description: Research public web content with a separately configured browser MCP, then compose a Coremail draft or prepare an email while preserving source, prompt-injection, privacy, and explicit-send boundaries. Use when a user asks to browse, research, compare, or summarize web information and email the result through Coremail.
+name: web-to-mail
+description: Research public web content with a separately configured browser MCP, then compose a mail draft or prepare an email through the Coremail provider while preserving source, prompt-injection, privacy, and explicit-send boundaries.
 ---
 
-# Public web research to Coremail
+# Public web research to mail
 
 Orchestrate two independent services. Use the already configured browser MCP for
-public-web research and the bundled `coremail_*` MCP tools for mailbox actions. Do
+public-web research and the bundled `mail_*` MCP tools for mailbox actions. Do
 not install, configure, wrap, or merge the browser service, and do not attempt to
 make one MCP server call the other.
 
 ## Hard boundaries
 
-- Never use the browser MCP to open, log in to, read, or operate Coremail webmail.
-- Never launch or control the Coremail desktop application.
+- Never use the browser MCP to open, log in to, read, or operate mail webmail.
+- Never launch or control a mail desktop application.
 - Keep browser cookies, session state, credentials, downloaded profiles, and tokens
   out of Coremail tool arguments and message content.
 - Do not send email bodies, mailbox content, local discovery output, recipient lists,
@@ -28,7 +28,7 @@ make one MCP server call the other.
 
 If the existing browser MCP is unavailable, say that web research is unavailable
 and point to `${CLAUDE_PLUGIN_ROOT}/docs/browser-orchestration.md`. Do not substitute
-Coremail webmail, desktop automation, or a newly installed browser package.
+mail webmail, desktop automation, or a newly installed browser package.
 
 If the user asks for strict, complete, or security-grade isolation, do not use both
 MCP servers in this session. Require the two-session, human-reviewed handoff defined
@@ -50,11 +50,11 @@ one shared model context provide complete isolation.
 5. Compose a plain-text message with source URLs when appropriate. Do not attach a
    browser download unless the user explicitly requested that exact file and its path
    is inside an authorized attachment root.
-6. Call `coremail_prepare_message`. Show the immutable prepared summary together
+6. Call `mail_prepare_message`. Show the immutable prepared summary together
    with the source list used to create it.
-7. For a draft, call `coremail_save_draft` only after the user requested a saved
+7. For a draft, call `mail_save_draft` only after the user requested a saved
    draft and only when `imap_smtp` is active. For sending, require the user to say
-   exactly `确认发送`, then call `coremail_send_prepared` with the token and that
+   exactly `确认发送`, then call `mail_send_prepared` with the token and that
    phrase.
 
 If any source, recipient, subject, body, or attachment changes after preparation,

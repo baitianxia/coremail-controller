@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 
 [CmdletBinding()]
 param(
@@ -20,6 +20,7 @@ param(
     [string]$CredentialTarget,
     [Security.SecureString]$Password,
     [switch]$NonInteractive,
+    [switch]$LifecycleLockAlreadyHeld,
     [ValidateSet('none', 'after_credential_write', 'before_config_publish')]
     [string]$TestFailurePoint = 'none',
     [string]$LogPath = ''
@@ -29,7 +30,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
-    throw 'Coremail account setup is intended for Windows.'
+    throw 'Mail account setup is intended for Windows.'
 }
 
 $pluginRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
@@ -37,13 +38,13 @@ $commonScript = Join-Path $PSScriptRoot 'windows-lifecycle-common.ps1'
 $credentialScript = Join-Path $PSScriptRoot 'windows-credential.ps1'
 if (-not (Test-Path -LiteralPath $commonScript -PathType Leaf) -or
     -not (Test-Path -LiteralPath $credentialScript -PathType Leaf)) {
-    throw 'Coremail account transaction support is missing.'
+    throw 'Mail account transaction support is missing.'
 }
 . $commonScript
 . $credentialScript
 
 if ([string]::IsNullOrWhiteSpace($LogPath)) {
-    $logDirectory = Join-Path ([IO.Path]::GetTempPath()) 'CoremailController'
+    $logDirectory = Join-Path ([Environment]::GetFolderPath('UserProfile')) 'mail-mcp-server\logs'
     $LogPath = Join-Path $logDirectory (
         'CONFIGURE-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' +
         [guid]::NewGuid().ToString('N').Substring(0, 8) + '.log'
@@ -55,6 +56,10 @@ $stagedConfigPath = $null
 $newCredentialWritten = $false
 $configCommitted = $false
 $ownsPassword = $false
+$lifecycleLockPath = $null
+$lifecycleLockStream = $null
+$userProfile = $null
+$mailRoot = $null
 
 function Read-RequiredValue {
     param([string]$Current, [string]$Prompt)
@@ -74,12 +79,23 @@ function Get-PinnedPythonRuntime {
     if (-not (Test-Path -LiteralPath $descriptorPath -PathType Leaf)) {
         throw 'The pinned Python runtime descriptor is missing. Run INSTALL.cmd before configuring an account.'
     }
+    $descriptorItem = Get-Item -LiteralPath $descriptorPath -Force -ErrorAction Stop
+    if (($descriptorItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'The pinned Python runtime descriptor is a link or junction.'
+    }
     try { $runtime = Get-Content -LiteralPath $descriptorPath -Raw | ConvertFrom-Json }
     catch { throw "The pinned Python runtime descriptor is invalid: $($_.Exception.Message)" }
-    if ([int]$runtime.schema_version -ne 1) {
-        throw 'The pinned Python runtime descriptor schema is unsupported.'
+    if ([int]$runtime.schema_version -ne 1 -or [string]$runtime.kind -ne 'python' -or
+        -not [bool]$runtime.bundled -or [int]$runtime.pointer_bits -ne 64 -or
+        [string]$runtime.version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+        throw 'The pinned Python runtime descriptor does not describe a bundled 64-bit runtime.'
     }
+    $expectedExecutable = [IO.Path]::GetFullPath((Join-Path $pluginRoot 'payload\runtime\python.exe'))
     $executable = [IO.Path]::GetFullPath([string]$runtime.executable)
+    if (-not [string]::Equals($executable, $expectedExecutable, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The pinned Python runtime descriptor does not point to the bundled payload/runtime/python.exe.'
+    }
+    [void](Assert-CoremailSafeDescendantPath -Root $pluginRoot -Path $executable -Label 'bundled Python executable')
     if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
         throw "The pinned Python executable is unavailable: $executable"
     }
@@ -187,8 +203,18 @@ function Test-CoremailSharedMapiSession {
 }
 
 try {
-    if ($TestFailurePoint -ne 'none' -and $env:COREMAIL_RELEASE_GATE_TESTING -ne 'true') {
+    if ($TestFailurePoint -ne 'none' -and $env:MAIL_RELEASE_GATE_TESTING -ne 'true') {
         throw 'Account failure injection is restricted to the Windows release gate.'
+    }
+    $userProfile = [Environment]::GetFolderPath('UserProfile')
+    if ([string]::IsNullOrWhiteSpace($userProfile)) { throw 'The current Windows user profile directory could not be resolved.' }
+    [void](Assert-CoremailSafeLocalPath -Path $userProfile -Label 'user profile')
+    $mailRoot = Join-Path $userProfile 'mail-mcp-server'
+    $lifecycleLockPath = Join-Path $mailRoot '.lifecycle.lock'
+    [void](Assert-CoremailSafeDescendantPath -Root $userProfile -Path $mailRoot -Label 'mail lifecycle root')
+    [void](Assert-CoremailSafeDescendantPath -Root $userProfile -Path $lifecycleLockPath -Label 'mail lifecycle lock')
+    if (-not $LifecycleLockAlreadyHeld) {
+        $lifecycleLockStream = Enter-CoremailLifecycleLock -Path $lifecycleLockPath
     }
     $script:PinnedPython = Get-PinnedPythonRuntime
     Write-CoremailLifecycleLog "ACCOUNT TRANSACTION started transport=$Transport"
@@ -292,7 +318,7 @@ try {
         $ImapHost = Read-RequiredValue -Current $ImapHost -Prompt 'IMAP server hostname'
         $SmtpHost = Read-RequiredValue -Current $SmtpHost -Prompt 'SMTP server hostname'
         if ([string]::IsNullOrWhiteSpace($CredentialTarget)) {
-            $CredentialTarget = 'ClaudeCode.Coremail:' + $Username + ':' + [guid]::NewGuid().ToString('N')
+            $CredentialTarget = 'MailMcp.Coremail:' + $Username + ':' + [guid]::NewGuid().ToString('N')
         }
         if ($CredentialTarget.Contains("`r") -or $CredentialTarget.Contains("`n") -or
             $CredentialTarget.Length -gt 1024) {
@@ -303,18 +329,21 @@ try {
         }
     }
 
-    $appData = [Environment]::GetFolderPath('ApplicationData')
-    $userProfile = [Environment]::GetFolderPath('UserProfile')
-    if ([string]::IsNullOrWhiteSpace($appData)) { $appData = Join-Path $userProfile 'AppData\Roaming' }
-    $configDirectory = Join-Path $appData 'ClaudeCode\Coremail'
-    $configPath = Join-Path $configDirectory 'config.json'
+    $configDirectory = Join-Path $mailRoot 'config'
+    $configPath = Join-Path $configDirectory 'settings.json'
     [void](Assert-CoremailSafeDescendantPath `
-        -Root $appData `
+        -Root $userProfile `
         -Path $configPath `
-        -Label 'Coremail account configuration')
+        -Label 'mail account configuration')
     New-Item -ItemType Directory -Path $configDirectory -Force | Out-Null
 
+    $rollbackDirectory = Join-Path $mailRoot 'rollback'
+    [void](Assert-CoremailSafeDescendantPath -Root $userProfile -Path $rollbackDirectory -Label 'mail rollback directory')
+    New-Item -ItemType Directory -Path $rollbackDirectory -Force | Out-Null
+
     $config = [ordered]@{
+        schema_version = 1
+        provider = 'coremail'
         transport = $Transport
         username = $Username
         allowed_from = @($AllowedFrom)
@@ -346,8 +375,10 @@ try {
         -Label 'Staged account configuration validation'
 
     if (Test-Path -LiteralPath $configPath -PathType Leaf) {
-        $backupPath = $configPath + '.backup-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' +
-            [guid]::NewGuid().ToString('N').Substring(0, 8)
+        $backupPath = Join-Path $rollbackDirectory (
+            'settings-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' +
+            [guid]::NewGuid().ToString('N').Substring(0, 8) + '.backup'
+        )
         [IO.File]::Copy($configPath, $backupPath, $false)
         Write-Host "Previous non-secret configuration backed up to: $backupPath"
         Write-CoremailLifecycleLog "ACCOUNT CONFIG BACKUP path=$backupPath"
@@ -356,7 +387,7 @@ try {
     if ($Transport -eq 'imap_smtp') {
         if ($null -eq $Password) {
             if ($NonInteractive) { throw 'Password is required in non-interactive IMAP/SMTP setup.' }
-            $Password = Read-Host 'Windows domain/Coremail or client-specific password (stored in Windows Credential Manager)' -AsSecureString
+            $Password = Read-Host '邮箱或域密码（仅存入 Windows Credential Manager）' -AsSecureString
             $ownsPassword = $true
         }
         if ($Password.Length -eq 0) { throw 'The password must not be empty.' }
@@ -377,18 +408,18 @@ try {
     Write-CoremailLifecycleLog 'ACCOUNT CONFIGURATION COMMITTED'
 
     Write-Host ''
-    Write-Host 'Coremail account configuration saved.' -ForegroundColor Green
+    Write-Host 'Mail account configuration saved.' -ForegroundColor Green
     Write-Host "Transport: $Transport"
     Write-Host "Non-secret settings: $configPath"
     if ($Transport -eq 'windows_simple_mapi') {
-        Write-Host 'Authentication: existing Coremail shared Simple MAPI session (no password copied or stored).'
+        Write-Host 'Authentication: existing provider shared Simple MAPI session (no password copied or stored).'
     }
     else {
         Write-Host "Password location: Windows Credential Manager target '$CredentialTarget'"
     }
     Write-Host "Diagnostic log: $LogPath"
-    Write-Host 'Restart Claude Code, then call coremail_check_connection.'
-    Write-Host 'The connector never starts, clicks, captures, or types into the Coremail interface.'
+    Write-Host 'Restart Claude Code, then call mail_config_reload and mail_check_connection.'
+    Write-Host 'The connector never starts, clicks, captures, or types into a mail-client interface.'
 }
 catch {
     $accountError = $_
@@ -411,4 +442,5 @@ finally {
         Remove-Item -LiteralPath $stagedConfigPath -Force -ErrorAction SilentlyContinue
     }
     if ($ownsPassword -and $null -ne $Password) { $Password.Dispose() }
+    Exit-CoremailLifecycleLock -Stream $lifecycleLockStream -Path $lifecycleLockPath
 }

@@ -86,9 +86,12 @@ $startInfo.RedirectStandardError = $true
 $startInfo.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $startInfo.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
 if ($IgnoreAccountConfiguration) {
-    $startInfo.EnvironmentVariables['APPDATA'] = Join-Path (
+    $isolatedProfile = Join-Path (
         [IO.Path]::GetTempPath()
-    ) ('coremail-smoke-' + [guid]::NewGuid().ToString('N'))
+    ) ('mail-smoke-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $isolatedProfile -Force | Out-Null
+    $startInfo.EnvironmentVariables['USERPROFILE'] = $isolatedProfile
+    $startInfo.EnvironmentVariables['CLAUDE_PROJECT_DIR'] = $isolatedProfile
 }
 
 $process = New-Object System.Diagnostics.Process
@@ -104,7 +107,7 @@ try {
         params = [ordered]@{
             protocolVersion = '2024-11-05'
             capabilities = [ordered]@{}
-            clientInfo = [ordered]@{ name = 'coremail-smoke-test'; version = '0.9.0' }
+            clientInfo = [ordered]@{ name = 'mail-smoke-test'; version = '0.9.0' }
         }
     })))
     $process.StandardInput.Flush()
@@ -113,7 +116,7 @@ try {
     $initializeResult = Get-OptionalJsonProperty -Value $initialize -Name 'result'
     $serverInfo = Get-OptionalJsonProperty -Value $initializeResult -Name 'serverInfo'
     $initializeServerName = Get-OptionalJsonProperty -Value $serverInfo -Name 'name'
-    if ($initializeId -ne 1 -or $initializeServerName -ne 'coremail-headless') {
+    if ($initializeId -ne 1 -or $initializeServerName -ne 'mail-mcp-server') {
         $responseId = if ($null -ne $initializeId) { [string]$initializeId } else { '<missing>' }
         $serverName = if ($null -ne $initializeServerName) { [string]$initializeServerName } else { '<missing>' }
         $initializeError = Get-OptionalJsonProperty -Value $initialize -Name 'error'
@@ -139,16 +142,19 @@ try {
     $toolList = Read-ServerResponse -Process $process -Timeout $TimeoutMilliseconds
     $toolNames = @($toolList.result.tools | ForEach-Object { $_.name })
     $expectedTools = @(
-        'coremail_connection_status',
-        'coremail_discover_local',
-        'coremail_check_connection',
-        'coremail_list_folders',
-        'coremail_search',
-        'coremail_get_message',
-        'coremail_set_seen',
-        'coremail_prepare_message',
-        'coremail_save_draft',
-        'coremail_send_prepared'
+        'mail_config_status',
+        'mail_configure',
+        'mail_config_reload',
+        'mail_connection_status',
+        'mail_discover_local',
+        'mail_check_connection',
+        'mail_list_folders',
+        'mail_search',
+        'mail_get_message',
+        'mail_set_seen',
+        'mail_prepare_message',
+        'mail_save_draft',
+        'mail_send_prepared'
     )
     foreach ($toolName in $expectedTools) {
         if ($toolName -notin $toolNames) { throw "Missing MCP tool: $toolName" }
@@ -159,7 +165,7 @@ try {
         id = 3
         method = 'tools/call'
         params = [ordered]@{
-            name = 'coremail_connection_status'
+            name = 'mail_connection_status'
             arguments = [ordered]@{}
         }
     })))
@@ -175,7 +181,7 @@ try {
             id = 4
             method = 'tools/call'
             params = [ordered]@{
-                name = 'coremail_check_connection'
+                name = 'mail_check_connection'
                 arguments = [ordered]@{}
             }
         })))
@@ -186,12 +192,12 @@ try {
         }
         if ($connection.result.isError) {
             $detail = [string]$connection.result.content[0].text
-            throw "The live Coremail connection check failed: $detail"
+            throw "The live mail connection check failed: $detail"
         }
-        Write-Host 'Live Coremail active-transport check passed.'
+        Write-Host 'Live mail transport check passed.'
     }
 
-    Write-Host "Headless MCP smoke test passed. Tools: $($toolNames.Count)"
+    Write-Host "Mail MCP smoke test passed. Tools: $($toolNames.Count)"
 }
 finally {
     try { $process.StandardInput.Close() } catch { }

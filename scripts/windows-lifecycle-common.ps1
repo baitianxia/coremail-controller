@@ -13,8 +13,15 @@ function Initialize-CoremailLifecycleLog {
         $script:CoremailLifecycleLogPath = $null
         return
     }
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    # Log paths are supplied by the top-level .cmd entries before the main
+    # lifecycle code has established its state directories.  Validate the
+    # existing chain first so a pre-created junction cannot redirect the very
+    # first write outside the mail assistant root.
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        [void](Assert-CoremailSafeLocalPath -Path $fullPath -Label 'lifecycle log')
+    }
     try {
-        $fullPath = [IO.Path]::GetFullPath($Path)
         $parent = Split-Path -Parent $fullPath
         if (-not [string]::IsNullOrWhiteSpace($parent)) {
             New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
@@ -72,7 +79,7 @@ function Invoke-CoremailExternalChecked {
     $errorOutput = @()
     $exitCode = $null
     $nativeErrorPath = Join-Path ([IO.Path]::GetTempPath()) (
-        'coremail-native-stderr-' + [guid]::NewGuid().ToString('N') + '.log'
+        'mail-native-stderr-' + [guid]::NewGuid().ToString('N') + '.log'
     )
     $previousPreference = $ErrorActionPreference
     try {
@@ -147,7 +154,7 @@ function Get-CoremailClaudeVersion {
         [string]$Label = 'Claude Code version probe'
     )
     $capturePath = Join-Path ([IO.Path]::GetTempPath()) (
-        'coremail-claude-version-' + [guid]::NewGuid().ToString('N') + '.txt'
+        'mail-claude-version-' + [guid]::NewGuid().ToString('N') + '.txt'
     )
     try {
         Invoke-CoremailClaudeChecked -Invocation $Invocation -Arguments @('--version') `
@@ -207,7 +214,7 @@ function Resolve-CoremailClaudeUserConfigPath {
     }
     catch { throw 'The current Windows user profile path is invalid.' }
     if ($profilePath -notmatch '^[A-Za-z]:\\') {
-        throw 'Coremail Controller requires a local-drive Windows user profile.'
+        throw 'Mail assistant requires a local-drive Windows user profile.'
     }
     $configRoot = $profilePath
     if (-not [string]::IsNullOrWhiteSpace([string]$env:CLAUDE_CONFIG_DIR)) {
@@ -370,12 +377,15 @@ function Move-CoremailDirectoryAtomically {
 function Enter-CoremailLifecycleLock {
     param([Parameter(Mandatory = $true)][string]$Path)
     $fullPath = [IO.Path]::GetFullPath($Path)
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        [void](Assert-CoremailSafeLocalPath -Path $fullPath -Label 'lifecycle lock')
+    }
     $parent = Split-Path -Parent $fullPath
     New-Item -ItemType Directory -Path $parent -Force | Out-Null
     try {
         $stream = [IO.File]::Open($fullPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
     }
-    catch { throw 'Another Coremail Controller lifecycle operation is already running for this Windows user.' }
+    catch { throw 'Another mail assistant lifecycle operation is already running for this Windows user.' }
     Write-CoremailLifecycleLog "LIFECYCLE LOCK ACQUIRED path=$fullPath"
     return $stream
 }

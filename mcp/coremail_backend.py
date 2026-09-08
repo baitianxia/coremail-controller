@@ -8,6 +8,7 @@ import html
 import imaplib
 import ipaddress
 import json
+import math
 import mimetypes
 import os
 import re
@@ -40,12 +41,19 @@ from windows_mapi import (
 )
 
 SERVER_VERSION = "0.9.0"
+PACKAGE_NAME = "mail-mcp-server"
+DISPLAY_NAME = "邮件助手"
+MCP_SERVER_NAME = "mail-mcp"
+CONFIG_SCHEMA_VERSION = 1
+CONFIG_PROVIDER = "coremail"
 DEFAULT_TOKEN_TTL_SECONDS = 15 * 60
 DEFAULT_MAX_MESSAGE_BYTES = 10 * 1024 * 1024
 DEFAULT_MAX_BODY_CHARS = 50_000
 DEFAULT_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 DEFAULT_MAX_RECIPIENTS = 100
 ROOT_CONFIG_FIELDS = {
+    "schema_version",
+    "provider",
     "transport",
     "username",
     "credential_target",
@@ -64,6 +72,7 @@ ROOT_CONFIG_FIELDS = {
     "timeout_seconds",
 }
 ENDPOINT_CONFIG_FIELDS = {"host", "port", "security"}
+_MISSING = object()
 
 
 class CoremailError(RuntimeError):
@@ -120,10 +129,17 @@ class Settings:
     max_attachment_bytes: int
     max_recipients: int
     timeout_seconds: float
+    # Defaults keep the internal dataclass convenient for adapter tests and
+    # callers that construct an in-memory settings object. File-backed config
+    # parsing still requires these fields explicitly.
+    schema_version: int = CONFIG_SCHEMA_VERSION
+    provider: str = CONFIG_PROVIDER
 
     def public_summary(self) -> dict[str, Any]:
         result: dict[str, Any] = {
             "config_path": str(self.config_path),
+            "schema_version": self.schema_version,
+            "provider": self.provider,
             "transport": self.transport,
             "username": self.username,
             "credential_target": self.credential_target,
@@ -154,19 +170,99 @@ class Settings:
         return result
 
 
+def _settings_fingerprint(settings: Settings) -> str:
+    """Return a stable, non-secret identity for the active mail settings.
+
+    A prepared message is a user review of both its contents and the transport
+    that will submit it.  Keep the fingerprint limited to parsed, non-secret
+    settings; the password itself lives outside this process in Credential
+    Manager and is deliberately never represented here.
+    """
+
+    def endpoint_value(endpoint: Endpoint | None) -> dict[str, Any] | None:
+        if endpoint is None:
+            return None
+        return {"host": endpoint.host, "port": endpoint.port, "security": endpoint.security}
+
+    payload = {
+        "config_path": str(settings.config_path),
+        "schema_version": settings.schema_version,
+        "provider": settings.provider,
+        "transport": settings.transport,
+        "username": settings.username,
+        "credential_target": settings.credential_target,
+        "imap": endpoint_value(settings.imap),
+        "smtp": endpoint_value(settings.smtp),
+        "allowed_from": list(settings.allowed_from),
+        "drafts_folder": settings.drafts_folder,
+        "sent_folder": settings.sent_folder,
+        "sent_copy_mode": settings.sent_copy_mode,
+        "ca_file": str(settings.ca_file) if settings.ca_file else None,
+        "attachment_roots": [str(path) for path in settings.attachment_roots],
+        "max_message_bytes": settings.max_message_bytes,
+        "max_body_chars": settings.max_body_chars,
+        "max_attachment_bytes": settings.max_attachment_bytes,
+        "max_recipients": settings.max_recipients,
+        "timeout_seconds": settings.timeout_seconds,
+    }
+    encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("ascii")).hexdigest()
+
+
 def default_config_path(environ: Mapping[str, str] | None = None) -> Path:
     env = os.environ if environ is None else environ
-    appdata = env.get("APPDATA", "").strip()
-    base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
-    return (base / "ClaudeCode" / "Coremail" / "config.json").resolve()
+    user_profile = env.get("USERPROFILE", "").strip()
+    base = Path(user_profile) if user_profile else Path.home()
+    # Preserve the final path lexically on Windows so a reparse point cannot be
+    # silently resolved to an external file before the ownership check runs.
+    # POSIX development hosts retain their normal canonical path behavior (for
+    # example, macOS's /var compatibility link).
+    candidate = Path(os.path.abspath(str(base / "mail-mcp-server" / "config" / "settings.json")))
+    return candidate if os.name == "nt" else candidate.resolve()
+
+
+def _assert_default_config_path_safe(path: Path, environ: Mapping[str, str]) -> None:
+    """Reject Windows links/junctions in the user-owned settings path."""
+    if os.name != "nt":
+        return
+    profile = environ.get("USERPROFILE", "").strip() or str(Path.home())
+    profile_path = Path(os.path.abspath(profile))
+    expected = profile_path / "mail-mcp-server" / "config" / "settings.json"
+    lexical = Path(os.path.abspath(str(path)))
+    # Windows paths are case-insensitive.  ``os.path.normcase`` follows the
+    # host Python's path flavour, which is easy to monkey-patch incorrectly in
+    # cross-platform tests, so normalize separators and case explicitly here.
+    def windows_key(value: Path) -> str:
+        return str(value).replace("/", "\\").rstrip("\\").casefold()
+
+    if windows_key(lexical) != windows_key(expected):
+        raise ConfigError("mail configuration path is outside the managed user directory")
+    cursor = lexical
+    while True:
+        try:
+            metadata = cursor.lstat()
+        except FileNotFoundError:
+            metadata = None
+        except OSError as exc:
+            raise ConfigError(f"cannot inspect mail configuration path: {cursor}") from exc
+        if metadata is not None and (
+            cursor.is_symlink() or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
+        ):
+            raise ConfigError(f"mail configuration path traverses an unsupported link or junction: {cursor}")
+        if windows_key(cursor) == windows_key(profile_path):
+            break
+        parent = cursor.parent
+        if parent == cursor:
+            raise ConfigError("mail configuration path escaped the user profile")
+        cursor = parent
 
 
 def _required_text(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"Missing or empty configuration field: {field}")
     text = value.strip()
-    if "\r" in text or "\n" in text:
-        raise ConfigError(f"Configuration field contains a newline: {field}")
+    if any(ord(character) < 32 or ord(character) == 127 for character in text):
+        raise ConfigError(f"Configuration field contains a control character: {field}")
     return text
 
 
@@ -205,29 +301,32 @@ def _hostname(value: Any, field: str) -> str:
     return ascii_host
 
 
-def _positive_int(value: Any, field: str, default: int, maximum: int) -> int:
-    if value is None:
+def _positive_int(
+    value: Any,
+    field: str,
+    default: int,
+    maximum: int,
+    minimum: int = 1,
+) -> int:
+    if value is _MISSING:
         return default
-    if isinstance(value, bool):
+    # JSON schema integer values must remain integers.  ``int("993")`` and
+    # ``int(993.8)`` would silently change a caller's configuration and make
+    # the parser disagree with the MCP contract.
+    if type(value) is not int:
         raise ConfigError(f"Configuration field must be an integer: {field}")
-    try:
-        number = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ConfigError(f"Configuration field must be an integer: {field}") from exc
-    if number <= 0 or number > maximum:
+    number = value
+    if number < minimum or number > maximum:
         raise ConfigError(f"Configuration field is outside the supported range: {field}")
     return number
 
 
 def _bounded_tool_int(value: Any, field: str, default: int, minimum: int, maximum: int) -> int:
-    if value is None:
+    if value is _MISSING:
         return default
-    if isinstance(value, bool):
+    if type(value) is not int:
         raise CoremailError(f"{field} must be an integer")
-    try:
-        number = int(value)
-    except (TypeError, ValueError) as exc:
-        raise CoremailError(f"{field} must be an integer") from exc
+    number = value
     if number < minimum or number > maximum:
         raise CoremailError(f"{field} must be between {minimum} and {maximum}")
     return number
@@ -252,21 +351,40 @@ def load_settings(
     environ: Mapping[str, str] | None = None,
 ) -> Settings:
     env = os.environ if environ is None else environ
-    config_path = default_config_path(env) if path is None else Path(path).expanduser().resolve()
+    if path is None:
+        config_path = default_config_path(env)
+        _assert_default_config_path_safe(config_path, env)
+    else:
+        config_path = Path(path).expanduser().resolve()
     if not config_path.is_file():
         raise ConfigError(
-            f"Coremail account is not configured. Run scripts/setup-account.ps1. "
+            f"Mail account is not configured. Run scripts/setup-account.ps1 or CONFIGURE.cmd. "
             f"Expected non-secret settings at: {config_path}"
         )
     try:
         raw = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ConfigError(f"Cannot read Coremail configuration: {config_path}: {exc}") from exc
+        raise ConfigError(f"Cannot read mail configuration: {config_path}: {exc}") from exc
     if not isinstance(raw, dict):
-        raise ConfigError("Coremail configuration root must be a JSON object")
+        raise ConfigError("Mail configuration root must be a JSON object")
     _reject_unknown_fields(raw, "root", ROOT_CONFIG_FIELDS)
 
-    transport = str(raw.get("transport", "imap_smtp")).strip().lower()
+    if "schema_version" not in raw:
+        raise ConfigError("Missing or empty configuration field: schema_version")
+    schema_version = _positive_int(raw.get("schema_version", _MISSING), "schema_version", CONFIG_SCHEMA_VERSION, 10)
+    if schema_version != CONFIG_SCHEMA_VERSION:
+        raise ConfigError(f"schema_version must be {CONFIG_SCHEMA_VERSION}")
+    if "provider" not in raw:
+        raise ConfigError("Missing or empty configuration field: provider")
+    provider = _required_text(raw.get("provider"), "provider").lower()
+    if provider != CONFIG_PROVIDER:
+        raise ConfigError(f"provider must be '{CONFIG_PROVIDER}'")
+    transport_raw = raw.get("transport", "imap_smtp")
+    transport = (
+        _required_text(transport_raw, "transport").lower()
+        if "transport" in raw
+        else "imap_smtp"
+    )
     if transport not in {"imap_smtp", WINDOWS_MAPI_TRANSPORT}:
         raise ConfigError(
             f"transport must be 'imap_smtp' or '{WINDOWS_MAPI_TRANSPORT}'"
@@ -284,12 +402,12 @@ def load_settings(
 
         imap = Endpoint(
             host=_hostname(imap_raw.get("host"), "imap.host"),
-            port=_positive_int(imap_raw.get("port"), "imap.port", 993, 65535),
+            port=_positive_int(imap_raw.get("port", _MISSING), "imap.port", 993, 65535),
             security=_security(imap_raw.get("security"), "imap.security", "ssl"),
         )
         smtp = Endpoint(
             host=_hostname(smtp_raw.get("host"), "smtp.host"),
-            port=_positive_int(smtp_raw.get("port"), "smtp.port", 465, 65535),
+            port=_positive_int(smtp_raw.get("port", _MISSING), "smtp.port", 465, 65535),
             security=_security(smtp_raw.get("security"), "smtp.security", "ssl"),
         )
     elif imap_raw is not None or smtp_raw is not None:
@@ -298,19 +416,28 @@ def load_settings(
     allowed_from_raw = raw.get("allowed_from", [username])
     if not isinstance(allowed_from_raw, list) or not allowed_from_raw:
         raise ConfigError("allowed_from must be a non-empty JSON array")
+    if len(allowed_from_raw) > 20:
+        raise ConfigError("allowed_from must contain at most 20 entries")
     allowed_from = tuple(_required_text(item, "allowed_from[]").lower() for item in allowed_from_raw)
     if transport == WINDOWS_MAPI_TRANSPORT and allowed_from != (username.lower(),):
         raise ConfigError(
             f"allowed_from must contain only username for {WINDOWS_MAPI_TRANSPORT}"
         )
 
-    sent_copy_mode = str(raw.get("sent_copy_mode", "none")).strip().lower()
+    sent_copy_mode_raw = raw.get("sent_copy_mode", "none")
+    sent_copy_mode = (
+        _required_text(sent_copy_mode_raw, "sent_copy_mode").lower()
+        if "sent_copy_mode" in raw
+        else "none"
+    )
     if sent_copy_mode not in {"none", "append"}:
         raise ConfigError("sent_copy_mode must be 'none' or 'append'")
     if transport == WINDOWS_MAPI_TRANSPORT and sent_copy_mode != "none":
         raise ConfigError(f"sent_copy_mode must be 'none' for {WINDOWS_MAPI_TRANSPORT}")
 
     ca_file_raw = raw.get("ca_file")
+    if ca_file_raw is not None and not isinstance(ca_file_raw, str):
+        raise ConfigError("ca_file must be a string path")
     ca_file = _expand_path(ca_file_raw, config_path.parent) if isinstance(ca_file_raw, str) and ca_file_raw.strip() else None
     if ca_file is not None and not ca_file.is_file():
         raise ConfigError(f"Configured CA file does not exist: {ca_file}")
@@ -321,6 +448,8 @@ def load_settings(
     configured_roots = raw.get("attachment_roots", [])
     if not isinstance(configured_roots, list):
         raise ConfigError("attachment_roots must be a JSON array")
+    if len(configured_roots) > 20:
+        raise ConfigError("attachment_roots must contain at most 20 entries")
     for item in configured_roots:
         roots.append(_expand_path(_required_text(item, "attachment_roots[]"), config_path.parent))
     project_dir = env.get("CLAUDE_PROJECT_DIR", "").strip()
@@ -336,11 +465,11 @@ def load_settings(
 
     credential_target_raw = raw.get("credential_target")
     if transport == "imap_smtp":
-        credential_target = str(
-            credential_target_raw if credential_target_raw is not None else f"ClaudeCode.Coremail:{username}"
-        ).strip()
-        if not credential_target:
-            raise ConfigError("credential_target must not be empty")
+        credential_target = (
+            _required_text(credential_target_raw, "credential_target")
+            if credential_target_raw is not None
+            else f"MailMcp.Coremail:{username}"
+        )
     else:
         if credential_target_raw is not None:
             raise ConfigError(f"credential_target is not permitted for {WINDOWS_MAPI_TRANSPORT}")
@@ -355,15 +484,20 @@ def load_settings(
     if transport == WINDOWS_MAPI_TRANSPORT and (drafts_folder is not None or sent_folder is not None):
         raise ConfigError(f"drafts_folder and sent_folder are not permitted for {WINDOWS_MAPI_TRANSPORT}")
 
-    try:
-        timeout_seconds = float(raw.get("timeout_seconds", 20.0))
-    except (TypeError, ValueError) as exc:
-        raise ConfigError("timeout_seconds must be numeric") from exc
-    if timeout_seconds < 1 or timeout_seconds > 120:
+    timeout_raw = raw.get("timeout_seconds", _MISSING)
+    if timeout_raw is _MISSING:
+        timeout_seconds = 20.0
+    elif type(timeout_raw) not in {int, float}:
+        raise ConfigError("timeout_seconds must be numeric")
+    else:
+        timeout_seconds = float(timeout_raw)
+    if not math.isfinite(timeout_seconds) or timeout_seconds < 1 or timeout_seconds > 120:
         raise ConfigError("timeout_seconds must be between 1 and 120")
 
     return Settings(
         config_path=config_path,
+        schema_version=schema_version,
+        provider=provider,
         transport=transport,
         username=username,
         credential_target=credential_target,
@@ -376,16 +510,21 @@ def load_settings(
         ca_file=ca_file,
         attachment_roots=tuple(unique_roots),
         max_message_bytes=_positive_int(
-            raw.get("max_message_bytes"), "max_message_bytes", DEFAULT_MAX_MESSAGE_BYTES, 100 * 1024 * 1024
+            raw.get("max_message_bytes", _MISSING),
+            "max_message_bytes",
+            DEFAULT_MAX_MESSAGE_BYTES,
+            100 * 1024 * 1024,
+            1024,
         ),
-        max_body_chars=_positive_int(raw.get("max_body_chars"), "max_body_chars", DEFAULT_MAX_BODY_CHARS, 500_000),
+        max_body_chars=_positive_int(raw.get("max_body_chars", _MISSING), "max_body_chars", DEFAULT_MAX_BODY_CHARS, 500_000),
         max_attachment_bytes=_positive_int(
-            raw.get("max_attachment_bytes"),
+            raw.get("max_attachment_bytes", _MISSING),
             "max_attachment_bytes",
             DEFAULT_MAX_ATTACHMENT_BYTES,
             100 * 1024 * 1024,
+            1024,
         ),
-        max_recipients=_positive_int(raw.get("max_recipients"), "max_recipients", DEFAULT_MAX_RECIPIENTS, 500),
+        max_recipients=_positive_int(raw.get("max_recipients", _MISSING), "max_recipients", DEFAULT_MAX_RECIPIENTS, 500),
         timeout_seconds=timeout_seconds,
     )
 
@@ -451,7 +590,10 @@ def credential_available(settings: Settings) -> bool:
     try:
         password = get_password(settings)
         return bool(password)
-    except CredentialError:
+    except Exception:
+        # This is an offline status probe.  ctypes can surface platform-
+        # specific exceptions (including loader and argument errors) that do
+        # not share one stable base class across Python/Windows versions.
         return False
 
 
@@ -1249,6 +1391,7 @@ def prepare_message(settings: Settings, arguments: Mapping[str, Any]) -> Prepare
 class _PreparedEntry:
     message: PreparedMessage
     expires_at: float
+    settings_fingerprint: str | None = None
 
 
 class PreparedStore:
@@ -1262,32 +1405,47 @@ class PreparedStore:
         for token in expired:
             del self._entries[token]
 
-    def put(self, message: PreparedMessage) -> tuple[str, float]:
+    def put(
+        self,
+        message: PreparedMessage,
+        *,
+        settings_fingerprint: str | None = None,
+    ) -> tuple[str, float]:
         now = time.monotonic()
         token = secrets.token_urlsafe(32)
         expires_at = now + self._ttl_seconds
         with self._lock:
             self._cleanup(now)
-            self._entries[token] = _PreparedEntry(message=message, expires_at=expires_at)
+            self._entries[token] = _PreparedEntry(
+                message=message,
+                expires_at=expires_at,
+                settings_fingerprint=settings_fingerprint,
+            )
         return token, expires_at
 
-    def get(self, token: str) -> PreparedMessage:
+    def get_entry(self, token: str) -> _PreparedEntry:
         now = time.monotonic()
         with self._lock:
             self._cleanup(now)
             entry = self._entries.get(token)
             if entry is None:
                 raise PreparedMessageError("Prepared message token is missing, expired, consumed, or belongs to another session")
-            return entry.message
+            return entry
 
-    def take(self, token: str) -> PreparedMessage:
+    def get(self, token: str) -> PreparedMessage:
+        return self.get_entry(token).message
+
+    def take_entry(self, token: str) -> _PreparedEntry:
         now = time.monotonic()
         with self._lock:
             self._cleanup(now)
             entry = self._entries.pop(token, None)
             if entry is None:
                 raise PreparedMessageError("Prepared message token is missing, expired, consumed, or belongs to another session")
-            return entry.message
+            return entry
+
+    def take(self, token: str) -> PreparedMessage:
+        return self.take_entry(token).message
 
 
 def _verified_attachment_bytes(attachment: AttachmentSpec) -> bytes:
@@ -1455,11 +1613,48 @@ class CoremailBackend:
     ) -> None:
         self.store = store or PreparedStore()
         self._mapi_client = mapi_client
+        self._settings_cache: tuple[Path, tuple[int, int, int], Settings] | None = None
 
     def _mapi(self) -> SimpleMapiClient:
         if self._mapi_client is None:
             self._mapi_client = SimpleMapiClient()
         return self._mapi_client
+
+    def _load_settings(self, path: Path | None = None) -> Settings:
+        settings = load_settings(path)
+        if path is None:
+            try:
+                metadata = settings.config_path.stat()
+                signature = (
+                    int(getattr(metadata, "st_mtime_ns", int(metadata.st_mtime * 1_000_000_000))),
+                    int(metadata.st_size),
+                    int(getattr(metadata, "st_ino", 0)),
+                )
+            except OSError:
+                signature = (0, 0, 0)
+            cached = self._settings_cache
+            if (
+                cached is not None
+                and cached[0] == settings.config_path
+                and cached[1] == signature
+            ):
+                return cached[2]
+            self._settings_cache = (settings.config_path, signature, settings)
+        return settings
+
+    def _clear_settings_cache(self) -> None:
+        self._settings_cache = None
+
+    @staticmethod
+    def _assert_prepared_settings(entry: _PreparedEntry, settings: Settings) -> None:
+        """Keep a reviewed token tied to the settings used for its preview."""
+        if (
+            entry.settings_fingerprint is not None
+            and entry.settings_fingerprint != _settings_fingerprint(settings)
+        ):
+            raise PreparedMessageError(
+                "Mail configuration changed after the message was prepared; prepare the message again."
+            )
 
     @staticmethod
     def _raise_mapi(exc: WindowsMapiError) -> None:
@@ -1472,35 +1667,357 @@ class CoremailBackend:
             except WindowsMapiError:
                 pass
 
-    def connection_status(self) -> dict[str, Any]:
+    @staticmethod
+    def _missing_fields_from_error(message: str) -> list[str]:
+        result: list[str] = []
+        patterns = (
+            (r"Missing or empty configuration field: ([A-Za-z0-9_.-]+)", None),
+            (r"Configuration field must be an integer: ([A-Za-z0-9_.-]+)", None),
+            (r"Configuration field is outside the supported range: ([A-Za-z0-9_.-]+)", None),
+            (r"Invalid server hostname in ([A-Za-z0-9_.-]+)", None),
+            (r"([A-Za-z0-9_.-]+) must be a hostname or IP address", None),
+            (r"([A-Za-z0-9_.-]+) must be '(?:ssl|starttls)'", None),
+            (r"([A-Za-z0-9_.-]+) must be '?(?:imap_smtp|windows_simple_mapi)'?", None),
+            (r"([A-Za-z0-9_.-]+) must be '?(?:none|append)'?", None),
+            (r"([A-Za-z0-9_.-]+) must not be empty", None),
+            (r"([A-Za-z0-9_.-]+) must be between", None),
+            (r"([A-Za-z0-9_.-]+) must be a non-empty JSON array", None),
+            (r"([A-Za-z0-9_.-]+) must contain at most", None),
+            (r"([A-Za-z0-9_.-]+) is not permitted", None),
+            (r"Unknown configuration field\(s\)(?: in [A-Za-z0-9_.-]+)?:\s*([A-Za-z0-9_.-]+)", None),
+            (r"Configuration field contains a (?:newline|control character):\s*([A-Za-z0-9_.-]+)", None),
+            (r"([A-Za-z0-9_.-]+) must contain only", None),
+            (r"([A-Za-z0-9_.-]+) must be numeric", None),
+            (r"([A-Za-z0-9_.-]+) must be a non-empty", None),
+            (r"([A-Za-z0-9_.-]+) must be an integer", None),
+            (r"([A-Za-z0-9_.-]+) must be '(?:none|append)'", None),
+            (r"([A-Za-z0-9_.-]+) and [A-Za-z0-9_.-]+ configuration objects are required", "imap,smtp"),
+            (r"imap and smtp settings are not permitted", "imap,smtp"),
+            (r"drafts_folder and sent_folder are not permitted", "drafts_folder,sent_folder"),
+            (r"Configured CA file does not exist", "ca_file"),
+            (r"attachment_roots must be a JSON array", "attachment_roots"),
+            (r"must be 'coremail'", "provider"),
+            (r"schema_version must be 1", "schema_version"),
+            (r"Both imap and smtp configuration objects are required", "imap,smtp"),
+            (r"Mail configuration root must be a JSON object", "root"),
+        )
+        for pattern, fixed in patterns:
+            match = re.search(pattern, message)
+            if match:
+                value = fixed or match.group(1)
+                result.extend(value.split(","))
+        lowered = message.lower()
+        if not result and "not configured" in lowered:
+            result.extend(["schema_version", "provider", "username"])
+        return list(dict.fromkeys(item for item in result if item))
+
+    @staticmethod
+    def _config_missing_fields(path: Path) -> tuple[list[str], str | None, dict[str, Any] | None]:
+        """Collect actionable field names without ever returning field values."""
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            return ["root"], f"Cannot parse mail configuration: {path}: {exc}", None
+        except (OSError, UnicodeError) as exc:
+            return ["settings.json"], f"Cannot read mail configuration: {path}: {exc}", None
+        if not isinstance(raw, dict):
+            return ["root"], "Mail configuration root must be a JSON object", None
+        missing: list[str] = []
+        for field in ("schema_version", "provider", "username"):
+            value = raw.get(field)
+            if field not in raw or value is None or (isinstance(value, str) and not value.strip()):
+                missing.append(field)
+        if "transport" in raw and (
+            raw.get("transport") is None
+            or (isinstance(raw.get("transport"), str) and not raw["transport"].strip())
+        ):
+            missing.append("transport")
+        transport = str(raw.get("transport", "imap_smtp")).strip().lower()
+        if transport == "imap_smtp":
+            for field in ("imap", "smtp"):
+                if not isinstance(raw.get(field), dict):
+                    missing.append(field)
+                else:
+                    endpoint = raw[field]
+                    for child in ("host", "port", "security"):
+                        value = endpoint.get(child)
+                        if child not in endpoint or value is None or (
+                            isinstance(value, str) and not value.strip()
+                        ):
+                            missing.append(f"{field}.{child}")
+        return list(dict.fromkeys(missing)), None, raw
+
+    @staticmethod
+    def _config_root() -> Path:
         path = default_config_path()
-        interface = detect_coremail_mapi_registration()
-        if not path.is_file():
-            return {
-                "configured": False,
-                "config_path": str(path),
-                "client_interface": interface,
-                "next_step": "Run scripts/setup-account.ps1, then restart or reload the MCP server.",
-                "coremail_client_interface_selected": False,
-                "coremail_client_interface_used": False,
-                "coremail_ui_automation_used": False,
+        return path.parent if os.name == "nt" else path.parent.resolve()
+
+    @classmethod
+    def _validate_config_path(cls, path: Path) -> Path:
+        """Accept only the one documented user-owned settings path.
+
+        The MCP contract deliberately has one configuration location.  A
+        caller-supplied path is therefore useful only when it is the same path
+        with a different Windows case spelling; allowing arbitrary descendants
+        would make it possible to create a second, silently ignored account
+        configuration.
+        """
+        try:
+            # Keep a lexical copy for link checks.  Calling ``resolve`` first
+            # would erase a user-created symlink/junction from the path we need
+            # to protect.
+            lexical = Path(os.path.abspath(path.expanduser()))
+            resolved = lexical.resolve()
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ConfigError(f"config_path is not a valid local path: {path}") from exc
+        expected = default_config_path()
+        if os.name == "nt":
+            normalize_windows = lambda value: str(value).replace("/", "\\").rstrip("\\").casefold()
+            same_path = normalize_windows(lexical) == normalize_windows(expected)
+        else:
+            same_path = resolved == expected
+        if not same_path:
+            raise ConfigError(
+                f"config_path must be the managed mail settings path: {expected}"
+            )
+        # Windows junctions/reparse points can redirect a path outside the
+        # managed directory.  Inspect the lexical chain without following it;
+        # POSIX development hosts commonly expose /var through a compatibility
+        # symlink, so this stricter chain check is intentionally Windows-only.
+        if os.name == "nt":
+            _assert_default_config_path_safe(lexical, os.environ)
+            return lexical
+        return resolved
+
+    def config_status(self) -> dict[str, Any]:
+        path = default_config_path()
+        try:
+            interface = detect_coremail_mapi_registration()
+        except Exception:
+            # Status is an offline diagnostic boundary.  A broken registry or
+            # provider probe must not hide the configuration path and field
+            # hints that the caller needs to repair the account.
+            interface = {
+                "available": False,
+                "reason": "provider interface probe unavailable",
             }
-        settings = load_settings(path)
+        status: dict[str, Any] = {
+            "configured": False,
+            "config_path": str(path),
+            "schema_version": CONFIG_SCHEMA_VERSION,
+            "provider": CONFIG_PROVIDER,
+            "missing_fields": [],
+            "next_command": "Run CONFIGURE.cmd to create or update the mail configuration.",
+            "next_step": "Run CONFIGURE.cmd to create or update the mail configuration.",
+            "invalid_fields": [],
+            "client_interface": interface,
+            "mail_client_interface_selected": False,
+            "mail_client_interface_used": False,
+            "mail_ui_automation_used": False,
+        }
+        try:
+            _assert_default_config_path_safe(path, os.environ)
+        except ConfigError as exc:
+            status["error"] = str(exc)
+            status["missing_fields"] = ["settings.json"]
+            status["next_command"] = "Run CONFIGURE.cmd to recreate the managed settings file."
+            status["next_step"] = status["next_command"]
+            return status
+        if not path.is_file():
+            status["missing_fields"] = ["schema_version", "provider", "username"]
+            return status
+        missing, read_error, raw = self._config_missing_fields(path)
+        if read_error:
+            status["missing_fields"] = missing
+            status["invalid_fields"] = [field for field in missing if field not in {"settings.json"}]
+            status["error"] = read_error
+            status["next_command"] = "Run CONFIGURE.cmd, then reload the MCP server."
+            status["next_step"] = status["next_command"]
+            return status
+        if raw is not None:
+            if isinstance(raw.get("schema_version"), int) and not isinstance(raw.get("schema_version"), bool):
+                status["schema_version"] = raw["schema_version"]
+            if isinstance(raw.get("provider"), str) and raw["provider"].strip():
+                status["provider"] = raw["provider"].strip().lower()
+        if missing:
+            status["missing_fields"] = missing
+        try:
+            # Use the default-path branch so the same lexical reparse-point
+            # check is applied immediately before reading the file.
+            settings = self._load_settings()
+        except ConfigError as exc:
+            parsed_missing = self._missing_fields_from_error(str(exc))
+            status["missing_fields"] = list(dict.fromkeys(status["missing_fields"] + parsed_missing))
+            status["invalid_fields"] = parsed_missing
+            status["next_command"] = "Run CONFIGURE.cmd, then reload the MCP server."
+            status["next_step"] = status["next_command"]
+            status["error"] = str(exc)
+            return status
         return {
             "configured": True,
+            "config_path": str(settings.config_path),
+            "schema_version": settings.schema_version,
+            "provider": settings.provider,
+            "transport": settings.transport,
+            "credential_available": (
+                credential_available(settings) if settings.transport == "imap_smtp" else None
+            ),
+            "settings": settings.public_summary(),
+            "client_interface": interface,
+            "mail_client_interface_selected": settings.transport == WINDOWS_MAPI_TRANSPORT,
+            "mail_client_interface_used": False,
+            "mail_ui_automation_used": False,
+            "missing_fields": [],
+            "next_command": "Run mail_config_reload after changing settings.",
+            "next_step": "Run mail_config_reload after changing settings.",
+            "invalid_fields": [],
+        }
+
+    def configure(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        allowed_keys = {
+            "config_path", "schema_version", "provider", "transport", "username",
+            "credential_target", "imap", "smtp", "allowed_from", "drafts_folder",
+            "sent_folder", "sent_copy_mode", "ca_file", "attachment_roots",
+            "max_message_bytes", "max_body_chars", "max_attachment_bytes",
+            "max_recipients", "timeout_seconds",
+        }
+        unknown = sorted(str(key) for key in arguments if key not in allowed_keys)
+        if unknown:
+            raise ConfigError(f"Unknown configuration field(s): {', '.join(unknown)}")
+        path_value = arguments.get("config_path")
+        if path_value is not None and not isinstance(path_value, str):
+            raise ConfigError("config_path must be a string path")
+        if isinstance(path_value, str) and not path_value.strip():
+            raise ConfigError("config_path must not be empty")
+        config_path = self._validate_config_path(
+            Path(path_value) if isinstance(path_value, str) else default_config_path()
+        )
+        if os.name == "nt":
+            _assert_default_config_path_safe(config_path, os.environ)
+        if config_path.is_dir():
+            raise ConfigError(f"config_path must point to a JSON file: {config_path}")
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            _assert_default_config_path_safe(config_path, os.environ)
+        current: dict[str, Any] = {}
+        if config_path.is_file():
+            try:
+                current = json.loads(config_path.read_text(encoding="utf-8"))
+                if not isinstance(current, dict):
+                    current = {}
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                current = {}
+        current.setdefault("schema_version", CONFIG_SCHEMA_VERSION)
+        current.setdefault("provider", CONFIG_PROVIDER)
+        for key in (
+            "schema_version",
+            "provider",
+            "transport",
+            "username",
+            "credential_target",
+            "imap",
+            "smtp",
+            "allowed_from",
+            "drafts_folder",
+            "sent_folder",
+            "sent_copy_mode",
+            "ca_file",
+            "attachment_roots",
+            "max_message_bytes",
+            "max_body_chars",
+            "max_attachment_bytes",
+            "max_recipients",
+            "timeout_seconds",
+        ):
+            if key in arguments and arguments[key] is not None:
+                current[key] = arguments[key]
+
+        # ``mail_configure`` is a partial update, but transport changes also
+        # change which fields are legal.  A previous IMAP/SMTP configuration
+        # must not make a valid switch to Simple MAPI impossible merely because
+        # its old endpoint and credential metadata were merged into the staged
+        # document.  Drop only stale fields that were omitted by the caller;
+        # explicitly supplied incompatible values remain in the staged object
+        # and are rejected by the common parser, preserving typo detection.
+        requested_transport = current.get("transport", "imap_smtp")
+        if isinstance(requested_transport, str) and requested_transport.strip().lower() == WINDOWS_MAPI_TRANSPORT:
+            for key in (
+                "credential_target",
+                "imap",
+                "smtp",
+                "ca_file",
+                "drafts_folder",
+                "sent_folder",
+            ):
+                if key not in arguments or arguments[key] is None:
+                    current.pop(key, None)
+            if "sent_copy_mode" not in arguments:
+                current["sent_copy_mode"] = "none"
+            if "allowed_from" not in arguments:
+                username = current.get("username")
+                if isinstance(username, str) and username.strip():
+                    current["allowed_from"] = [username.strip()]
+        rendered = json.dumps(current, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+        staged_path = config_path.with_name(f".{config_path.name}.staged-{secrets.token_hex(8)}")
+        staged_path.write_text(rendered, encoding="utf-8")
+        try:
+            self._load_settings(staged_path)
+        finally:
+            staged_path.unlink(missing_ok=True)
+        replacement = config_path.with_name(f".{config_path.name}.tmp-{secrets.token_hex(8)}")
+        try:
+            replacement.write_text(rendered, encoding="utf-8")
+            if os.name == "nt":
+                _assert_default_config_path_safe(config_path, os.environ)
+            os.replace(replacement, config_path)
+        finally:
+            # Keep a failed atomic update from leaving a second settings file
+            # containing account metadata in the managed directory.
+            replacement.unlink(missing_ok=True)
+        try:
+            config_path.chmod(0o600)
+        except OSError:
+            pass
+        self._clear_settings_cache()
+        return self.config_status()
+
+    def reload_config(self) -> dict[str, Any]:
+        self._clear_settings_cache()
+        return self.config_status()
+
+    def mail_connection_status(self) -> dict[str, Any]:
+        # Reuse the structured, secret-free status path so malformed or unsafe
+        # configuration produces actionable field hints instead of an opaque
+        # tool error.  This method adds transport-specific labels only after a
+        # valid settings object is available.
+        status = self.config_status()
+        if not status.get("configured"):
+            status.setdefault(
+                "next_step",
+                status.get("next_command", "Run CONFIGURE.cmd, then reload the MCP server."),
+            )
+            return status
+        settings = self._load_settings()
+        interface = status.get("client_interface")
+        return {
+            "configured": True,
+            "config_path": str(settings.config_path),
+            "schema_version": settings.schema_version,
+            "provider": settings.provider,
+            "missing_fields": [],
             "active_transport": settings.transport,
             "credential_available": (
                 credential_available(settings) if settings.transport == "imap_smtp" else None
             ),
             "settings": settings.public_summary(),
             "client_interface": interface,
-            "coremail_client_interface_selected": settings.transport == WINDOWS_MAPI_TRANSPORT,
-            "coremail_client_interface_used": False,
-            "coremail_ui_automation_used": False,
+            "mail_client_interface_selected": settings.transport == WINDOWS_MAPI_TRANSPORT,
+            "mail_client_interface_used": False,
+            "mail_ui_automation_used": False,
         }
 
     def check_connection(self) -> dict[str, Any]:
-        settings = load_settings()
+        settings = self._load_settings()
         if settings.transport == WINDOWS_MAPI_TRANSPORT:
             try:
                 result = self._mapi().status()
@@ -1509,8 +2026,8 @@ class CoremailBackend:
             return {
                 **result,
                 "username": settings.username,
-                "coremail_client_interface_used": True,
-                "coremail_ui_automation_used": False,
+                "mail_client_interface_used": True,
+                "mail_ui_automation_used": False,
             }
 
         with imap_session(settings) as imap_client:
@@ -1527,12 +2044,17 @@ class CoremailBackend:
             "smtp": {"connected": True, "features": smtp_features},
             "username": settings.username,
             "tls_verification": True,
-            "coremail_client_interface_used": False,
-            "coremail_ui_automation_used": False,
+            "mail_client_interface_used": False,
+            "mail_ui_automation_used": False,
         }
 
+    # Internal callers that used the pre-generalization method name can keep
+    # using it; the MCP surface exposes only the mail_* name.
+    def connection_status(self) -> dict[str, Any]:
+        return self.mail_connection_status()
+
     def list_folders(self) -> dict[str, Any]:
-        settings = load_settings()
+        settings = self._load_settings()
         if settings.transport == WINDOWS_MAPI_TRANSPORT:
             try:
                 return self._mapi().list_folders()
@@ -1543,14 +2065,14 @@ class CoremailBackend:
         return {"folders": folders, "count": len(folders), "transport": "imap_smtp"}
 
     def search(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
-        settings = load_settings()
+        settings = self._load_settings()
         folder = arguments.get("folder", "INBOX")
         if not isinstance(folder, str):
             raise CoremailError("folder must be a string")
         query = arguments.get("query", {})
         if not isinstance(query, dict):
             raise CoremailError("query must be an object")
-        limit = _bounded_tool_int(arguments.get("limit"), "limit", 20, 1, 100)
+        limit = _bounded_tool_int(arguments.get("limit", _MISSING), "limit", 20, 1, 100)
         if settings.transport == WINDOWS_MAPI_TRANSPORT:
             try:
                 return self._mapi().search(folder=folder, query=query, limit=limit)
@@ -1561,14 +2083,14 @@ class CoremailBackend:
         return {**result, "transport": "imap_smtp"}
 
     def get_message(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
-        settings = load_settings()
+        settings = self._load_settings()
         folder = arguments.get("folder", "INBOX")
         if not isinstance(folder, str):
             raise CoremailError("folder must be a string")
         uid = str(arguments.get("uid", ""))
         uidvalidity = arguments.get("uidvalidity")
         requested_chars = _bounded_tool_int(
-            arguments.get("max_body_chars"),
+            arguments.get("max_body_chars", _MISSING),
             "max_body_chars",
             settings.max_body_chars,
             1,
@@ -1596,7 +2118,7 @@ class CoremailBackend:
         return {**result, "transport": "imap_smtp"}
 
     def set_seen(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
-        settings = load_settings()
+        settings = self._load_settings()
         folder = arguments.get("folder", "INBOX")
         if not isinstance(folder, str):
             raise CoremailError("folder must be a string")
@@ -1626,9 +2148,12 @@ class CoremailBackend:
         return {**result, "transport": "imap_smtp"}
 
     def prepare(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
-        settings = load_settings()
+        settings = self._load_settings()
         message = prepare_message(settings, arguments)
-        token, _ = self.store.put(message)
+        token, _ = self.store.put(
+            message,
+            settings_fingerprint=_settings_fingerprint(settings),
+        )
         return {
             "prepared_token": token,
             "expires_in_seconds": DEFAULT_TOKEN_TTL_SECONDS,
@@ -1638,15 +2163,16 @@ class CoremailBackend:
 
     def save_draft(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         token = str(arguments.get("prepared_token", ""))
-        settings = load_settings()
+        settings = self._load_settings()
+        entry = self.store.get_entry(token)
+        self._assert_prepared_settings(entry, settings)
         if settings.transport == WINDOWS_MAPI_TRANSPORT:
             # Reject before consuming the prepared token because no write attempt
             # can be made through this limited interface.
-            self.store.get(token)
             raise CoremailError(
                 "Saving drafts is not supported by Windows Simple MAPI; reconfigure imap_smtp to use Drafts"
             )
-        message = self.store.take(token)
+        message = self.store.take_entry(token).message
         return append_message(settings, message, kind="draft")
 
     def _send_mapi(self, settings: Settings, message: PreparedMessage) -> dict[str, Any]:
@@ -1688,13 +2214,15 @@ class CoremailBackend:
         confirmation = arguments.get("confirmation")
         if confirmation != "确认发送":
             raise PreparedMessageError("Exact confirmation phrase required: 确认发送")
-        settings = load_settings()
-        preview = self.store.get(token)
+        settings = self._load_settings()
+        entry = self.store.get_entry(token)
+        self._assert_prepared_settings(entry, settings)
+        preview = entry.message
         if settings.transport == WINDOWS_MAPI_TRANSPORT and (preview.in_reply_to or preview.references):
             raise PreparedMessageError(
                 "Windows Simple MAPI cannot preserve In-Reply-To or References; use imap_smtp for this reply"
             )
-        message = self.store.take(token)
+        message = self.store.take_entry(token).message
         if settings.transport == WINDOWS_MAPI_TRANSPORT:
             return self._send_mapi(settings, message)
         return send_message(settings, message)

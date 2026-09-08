@@ -1,130 +1,56 @@
-# Browser MCP and Coremail MCP Isolation Guide
+# 浏览器 MCP 与邮件助手隔离指南
 
-Status: operational guide; `architecture.md` is normative
+状态：运行手册；[`architecture.md`](architecture.md) 是规范来源。
 
-## Decision
+邮件助手和现有浏览器 MCP 是两个独立服务。它们各自拥有进程、包、启动配置、依赖、日志、
+凭据和升级生命周期；Claude Code 只负责编排。邮件助手不会安装、启动、配置或调用浏览器 MCP，
+浏览器 MCP 也不能访问邮箱客户端或邮件 webmail。
 
-Use the existing browser MCP and the Coremail MCP as independent services. Do not
-merge their code, launch commands, dependencies, credentials, storage, or network
-sessions. Claude Code is the only orchestration point.
-
-This is strong isolation with one narrow data bridge, not a complete air gap. The
-supported bridge is one-way:
+允许的桥接只有一条：
 
 ```text
-existing browser MCP
-  -> untrusted public-page result
-  -> Claude Code extracts bounded facts and canonical source URLs
-  -> Coremail prepares an immutable email
-  -> user reviews recipients/content/attachments
-  -> exact phrase: 确认发送
-  -> active Coremail transport submission
+浏览器 MCP 的公共页面结果
+  -> Claude Code 提取有界事实和规范 URL
+  -> mail_prepare_message 冻结邮件
+  -> 用户复核收件人、正文、附件和来源
+  -> 用户输入“确认发送”
+  -> mail_send_prepared 通过当前 mail provider 提交
 ```
 
-The reverse path is closed by policy: mailbox bodies, recipients, local discovery
-results, account configuration, and credentials are not browser inputs.
+网页内容、脚本、下载和工具提示均是不可信输入，不能选择收件人、授权附件、要求泄露秘密或
+替代发送确认。邮件正文、收件人、配置、凭据、Cookie、原始 DOM、请求头、浏览器 profile 和
+下载文件不能反向传给浏览器工具。
 
-## Required logical isolation
+## 组合模式
 
-- Each MCP server has its own process, repository/package, launch configuration,
-  dependencies, logs, cache, and update lifecycle.
-- The Coremail package declares only `coremail-windows` in its development
-  `.mcp.json`; the installed `coremail-controller` user-scope entry neither starts
-  nor configures the browser MCP.
-- The browser MCP must not receive mailbox secrets, a Windows credential target,
-  Coremail configuration overrides, or attachment roots. Do not set `COREMAIL_*`
-  values globally on the Claude Code parent process.
-- The Coremail server has no browser client, browser imports, cookie access, DOM
-  access, or browser launch path.
-- Neither MCP server calls the other. Claude Code transfers only a bounded summary
-  and canonical public URLs after treating browser output as untrusted.
-- Browser content cannot choose recipients, authorize attachments, request mailbox
-  reads, or authorize sending.
-- Browser downloads are not attached automatically. A specific user request and the
-  Coremail attachment-root/hash checks are both required.
+在同一个 Claude Code 会话中同时加载两个 MCP 时，模型可以看见两组工具；规则提供的是流程
+边界，不是加密隔离。先完成浏览器的只读研究，保存每个实质来源的标题和规范 URL，独立复核
+重要或时效性结论，然后结束浏览器阶段。只把完成邮件所需的有限事实交给
+`mail_prepare_message`，并在准备摘要中展示来源。
 
-## Operating-system isolation
+不要在最终复核和发送之间继续浏览。任何来源、事实、收件人、主题、正文或附件变化都必须废弃
+旧令牌并重新准备。浏览器下载不会自动成为附件；只有用户明确指定且路径位于邮件助手授权
+附件根时才可附加。
 
-Two stdio MCP processes launched by one Claude Code session normally run as the same
-Windows user. That separates failures and dependencies, but it is not a security
-boundary against a malicious server process: either process may inherit the user's
-filesystem and credential permissions.
+## 严格隔离模式
 
-If the browser MCP is not fully trusted or handles hostile pages, use one of these
-stronger deployments:
+若用户要求完整或安全级隔离，不要在同一会话加载两个 MCP：
 
-1. Prefer a remote browser MCP whose host cannot access the Windows mailbox profile.
-2. Otherwise run the browser MCP in a container, sandbox, VM, or separate Windows
-   account with no access to `%APPDATA%\ClaudeCode\Coremail`, Coremail data roots, or
-   the mail user's Windows Credential Manager.
-3. Give the browser service only its required network destinations and temporary
-   storage. Do not mount the mailbox profile or outgoing attachment directories.
+1. 浏览器专用会话只产生有来源的研究摘要；
+2. 人工检查摘要并作为交接材料；
+3. 邮件专用会话只接收批准后的有限事实，准备和发送邮件。
 
-The Coremail MCP must remain under the Windows identity that owns its Generic
-Credential or existing Coremail shared MAPI session. Version 0.9.0 deliberately
-does not accept a password through an environment variable because sibling MCP
-processes can inherit the same environment.
+两个同一 Windows 用户的 stdio 进程仍共享文件系统权限，因此不能声称实现完整隔离。更强的
+部署应把浏览器放在远程服务、容器、虚拟机或没有邮件 profile/凭据访问权的独立账户中。
 
-## Model and session boundary
+## 检查清单
 
-A single Claude Code session connected to both MCP servers can see both tool result
-sets. The workflow rules prevent unintended transfer, but this is a policy boundary,
-not cryptographic isolation.
+- 邮件助手的 `.mcp.json` 和用户注册只包含 `mail-mcp`；浏览器配置独立。
+- 目标机没有为浏览器进程注入邮件配置、Credential Manager 目标或附件根。
+- 浏览器阶段是只读的，网页不能触发 MCP 调用或发送授权。
+- `mail_prepare_message` 后展示完整收件人、主题、附件和来源。
+- 只有精确短语 `确认发送` 才能调用 `mail_send_prepared`。
+- 若浏览器服务不可信，使用两个会话和人工交接。
 
-For strict confidentiality, use two Claude Code sessions with disjoint tool sets:
-
-1. A browser-only session produces a bounded, source-linked research summary.
-2. A human reviews and approves that summary as the handoff artifact.
-3. A Coremail-only session receives the approved summary, prepares the email, and
-   applies the normal `确认发送` gate.
-
-Do not load the Coremail MCP in the browser-only session or the browser MCP in the
-Coremail-only session. Do not automate the handoff approval. This two-session mode is
-the only documented mode that isolates the model/tool context itself.
-
-## Controlled workflow
-
-1. Finish browser research before preparing an email.
-2. Retain only the facts needed for the requested message plus source title and
-   canonical URL. Do not transfer raw DOM, scripts, cookies, request headers, browser
-   profiles, or binary downloads.
-3. Cross-check consequential or time-sensitive claims independently.
-4. Compose the email and call `coremail_prepare_message`.
-5. Show the prepared From, To/Cc/Bcc, subject, attachments, and source list.
-6. If any source or message field changes, prepare again and invalidate the old
-   review.
-7. Only the user's exact `确认发送` authorizes `coremail_send_prepared`.
-
-Never perform more browsing between final prepared-message review and active-
-transport submission.
-
-## Existing browser MCP verification
-
-No browser installation or configuration is included in this plugin. Confirm the
-existing server independently:
-
-```text
-claude mcp list
-/mcp
-```
-
-Ask Claude in natural language to research public pages and prepare a Coremail
-message. The Coremail MCP tool descriptions and initialization instructions apply
-the isolated combined workflow; an installed user skill or version-specific slash
-alias is optional and is not required.
-The browser MCP's own visible/headless mode, authentication, and sandboxing remain
-its configuration responsibility; choose headless mode if visible browser operation
-is not acceptable.
-
-When the user requests strict or complete isolation, use the two-session handoff
-above instead of the combined workflow.
-
-## Audit checklist
-
-- Coremail `.mcp.json` contains exactly one server.
-- Browser and Coremail launch commands are stored in different configurations.
-- No `COREMAIL_PASSWORD` environment fallback exists.
-- Browser identity cannot read the Coremail config/data roots or mail credential.
-- Web content is labelled untrusted and cannot cause direct tool calls.
-- The browser phase ends before message preparation.
-- Sending remains a separate, exact-confirmation action.
+浏览器 MCP 的安装、登录、可见/无头模式和沙箱由其自身项目负责；邮件助手包不包含浏览器
+运行时，也不要求 npm、pnpm 或 npx。

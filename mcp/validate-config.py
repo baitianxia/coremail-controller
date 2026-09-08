@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate a staged Coremail configuration without opening a connection."""
+"""Validate a staged mail configuration without opening a connection."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def main() -> int:
 
         load_settings(config)
     except Exception as exc:  # boundary: convert validation failures to a stable exit
-        print(f"Invalid Coremail configuration: {exc}", file=sys.stderr)
+        print(f"Invalid mail configuration: {exc}", file=sys.stderr)
         return 2
     return 0
 

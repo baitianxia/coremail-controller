@@ -5,6 +5,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -26,6 +27,7 @@ from coremail_backend import (  # noqa: E402
     imap_utf7_decode,
     imap_utf7_encode,
     load_settings,
+    default_config_path,
     parse_message,
     prepare_message,
     select_folder,
@@ -78,12 +80,21 @@ def mapi_settings_for(directory: Path) -> Settings:
 
 
 class SettingsTests(unittest.TestCase):
+    def test_file_configuration_requires_explicit_schema_and_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            path = Path(raw_directory) / "config.json"
+            path.write_text(json.dumps({"username": "sender@example.com"}), encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, "schema_version"):
+                load_settings(path, environ={})
+
     def test_loads_non_secret_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
             directory = Path(raw_directory)
             config = {
+                "schema_version": 1,
+                "provider": "coremail",
                 "username": "sender@example.com",
-                "credential_target": "ClaudeCode.Coremail:sender@example.com",
+                "credential_target": "MailMcp.Coremail:sender@example.com",
                 "imap": {"host": "imap.example.com", "port": 993, "security": "ssl"},
                 "smtp": {"host": "smtp.example.com", "port": 587, "security": "starttls"},
                 "allowed_from": ["sender@example.com"],
@@ -98,6 +109,14 @@ class SettingsTests(unittest.TestCase):
             self.assertNotIn("password", json.dumps(summary).lower())
             self.assertEqual(summary["username"], "sender@example.com")
 
+    def test_default_config_path_is_project_owned(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            path = default_config_path({"USERPROFILE": raw_directory})
+            self.assertEqual(
+                Path(raw_directory).resolve() / "mail-mcp-server" / "config" / "settings.json",
+                path,
+            )
+
     def test_loads_password_free_simple_mapi_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
             directory = Path(raw_directory)
@@ -105,6 +124,8 @@ class SettingsTests(unittest.TestCase):
             path.write_text(
                 json.dumps(
                     {
+                        "schema_version": 1,
+                        "provider": "coremail",
                         "transport": "windows_simple_mapi",
                         "username": "sender@example.com",
                         "allowed_from": ["sender@example.com"],
@@ -124,6 +145,8 @@ class SettingsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_directory:
             directory = Path(raw_directory)
             base = {
+                "schema_version": 1,
+                "provider": "coremail",
                 "transport": "windows_simple_mapi",
                 "username": "sender@example.com",
                 "allowed_from": ["sender@example.com"],
@@ -149,6 +172,8 @@ class SettingsTests(unittest.TestCase):
             path.write_text(
                 json.dumps(
                     {
+                        "schema_version": 1,
+                        "provider": "coremail",
                         "username": "sender@example.com",
                         "imap": {"host": "imap.example.com", "port": 143, "security": "plain"},
                         "smtp": {"host": "smtp.example.com", "port": 465, "security": "ssl"},
@@ -159,10 +184,39 @@ class SettingsTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 load_settings(path, environ={})
 
+    def test_rejects_non_integer_json_limits_and_ports(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            base = {
+                "schema_version": 1,
+                "provider": "coremail",
+                "username": "sender@example.com",
+                "imap": {"host": "imap.example.com", "port": 993, "security": "ssl"},
+                "smtp": {"host": "smtp.example.com", "port": 465, "security": "ssl"},
+            }
+            path = directory / "config.json"
+            for field, value in (
+                ("schema_version", 1.0),
+                ("max_recipients", "100"),
+                ("timeout_seconds", "20"),
+            ):
+                candidate = dict(base)
+                candidate[field] = value
+                path.write_text(json.dumps(candidate), encoding="utf-8")
+                with self.assertRaises(ConfigError):
+                    load_settings(path, environ={})
+            candidate = dict(base)
+            candidate["imap"] = {**base["imap"], "port": 993.5}
+            path.write_text(json.dumps(candidate), encoding="utf-8")
+            with self.assertRaises(ConfigError):
+                load_settings(path, environ={})
+
     def test_rejects_secret_or_url_fields_in_non_secret_config(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
             directory = Path(raw_directory)
             base = {
+                "schema_version": 1,
+                "provider": "coremail",
                 "username": "sender@example.com",
                 "imap": {"host": "imap.example.com", "port": 993, "security": "ssl"},
                 "smtp": {"host": "smtp.example.com", "port": 465, "security": "ssl"},
@@ -171,12 +225,133 @@ class SettingsTests(unittest.TestCase):
             path.write_text(json.dumps({**base, "password": "must-not-be-here"}), encoding="utf-8")
             with self.assertRaises(ConfigError):
                 load_settings(path, environ={})
-
             base["imap"]["host"] = "imaps://user:secret@imap.example.com"
             path.write_text(json.dumps(base), encoding="utf-8")
             with self.assertRaises(ConfigError):
                 load_settings(path, environ={})
 
+    def test_config_status_and_configure_are_secret_free_and_reloadable(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            profile = Path(raw_directory)
+            backend = CoremailBackend()
+            with patch.dict("os.environ", {"USERPROFILE": str(profile)}, clear=False):
+                initial = backend.config_status()
+                self.assertFalse(initial["configured"])
+                self.assertEqual(
+                    (profile / "mail-mcp-server" / "config" / "settings.json").resolve(),
+                    Path(initial["config_path"]),
+                )
+                self.assertIn("username", initial["missing_fields"])
+                result = backend.configure(
+                    {
+                        "transport": "windows_simple_mapi",
+                        "username": "sender@example.com",
+                        "allowed_from": ["sender@example.com"],
+                        "attachment_roots": [],
+                    }
+                )
+                self.assertTrue(result["configured"])
+                self.assertEqual(result["provider"], "coremail")
+                self.assertEqual(result["missing_fields"], [])
+                content = (profile / "mail-mcp-server" / "config" / "settings.json").read_text()
+                self.assertNotIn("password", content.lower())
+                reloaded = backend.reload_config()
+                self.assertTrue(reloaded["configured"])
+                with self.assertRaises(ConfigError):
+                    backend.configure({"password": "secret"})
+                with self.assertRaises(ConfigError):
+                    backend.configure({"config_path": str(profile / "outside" / "settings.json")})
+
+    def test_configure_can_switch_from_imap_to_simple_mapi(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            profile = Path(raw_directory)
+            backend = CoremailBackend()
+            with patch.dict("os.environ", {"USERPROFILE": str(profile)}, clear=False):
+                backend.configure(
+                    {
+                        "transport": "imap_smtp",
+                        "username": "sender@example.com",
+                        "imap": {"host": "imap.example.com", "port": 993, "security": "ssl"},
+                        "smtp": {"host": "smtp.example.com", "port": 465, "security": "ssl"},
+                        "allowed_from": ["sender@example.com"],
+                        "credential_target": "MailMcp.Coremail:old",
+                        "sent_copy_mode": "append",
+                    }
+                )
+                result = backend.configure(
+                    {
+                        "transport": "windows_simple_mapi",
+                        "username": "sender@example.com",
+                    }
+                )
+                self.assertTrue(result["configured"])
+                self.assertEqual(result["transport"], "windows_simple_mapi")
+                raw = json.loads(
+                    (profile / "mail-mcp-server" / "config" / "settings.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                for stale_field in (
+                    "credential_target",
+                    "imap",
+                    "smtp",
+                    "ca_file",
+                    "drafts_folder",
+                    "sent_folder",
+                ):
+                    self.assertNotIn(stale_field, raw)
+                self.assertEqual(raw["sent_copy_mode"], "none")
+                self.assertEqual(raw["allowed_from"], ["sender@example.com"])
+
+    def test_config_status_reports_invalid_fields_and_next_step_without_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            profile = Path(raw_directory)
+            config_path = profile / "mail-mcp-server" / "config" / "settings.json"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "provider": "coremail",
+                        "transport": "unsupported",
+                        "username": "sender@example.com",
+                        "credential_target": "super-secret-target",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            backend = CoremailBackend()
+            with patch.dict("os.environ", {"USERPROFILE": str(profile)}, clear=False):
+                status = backend.config_status()
+            self.assertFalse(status["configured"])
+            self.assertIn("transport", status["missing_fields"])
+            self.assertIn("transport", status["invalid_fields"])
+            self.assertEqual(status["next_command"], status["next_step"])
+            self.assertNotIn("super-secret-target", json.dumps(status, ensure_ascii=False))
+
+    def test_missing_optional_transport_uses_documented_default(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            profile = Path(raw_directory)
+            config_path = profile / "mail-mcp-server" / "config" / "settings.json"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "provider": "coremail",
+                        "username": "sender@example.com",
+                        "imap": {"host": "imap.example.com", "port": 993, "security": "ssl"},
+                        "smtp": {"host": "smtp.example.com", "port": 465, "security": "ssl"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            backend = CoremailBackend()
+            with patch.dict("os.environ", {"USERPROFILE": str(profile)}, clear=False):
+                status = backend.config_status()
+            self.assertTrue(status["configured"])
+            self.assertEqual(status["transport"], "imap_smtp")
+            self.assertNotIn("transport", status["missing_fields"])
 
 class MailEncodingTests(unittest.TestCase):
     def test_modified_utf7_round_trip(self) -> None:
@@ -270,6 +445,35 @@ class PreparedMessageTests(unittest.TestCase):
             send.assert_called_once_with(settings, message)
             with self.assertRaises(PreparedMessageError):
                 backend.store.get(token)
+
+    def test_prepared_token_requires_the_reviewed_settings_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            original_settings = settings_for(directory)
+            changed_settings = replace(
+                original_settings,
+                username="other@example.com",
+                allowed_from=("other@example.com",),
+            )
+            backend = CoremailBackend()
+            with patch.object(
+                backend,
+                "_load_settings",
+                side_effect=[original_settings, changed_settings],
+            ):
+                prepared = backend.prepare(
+                    {"to": ["recipient@example.com"], "subject": "reviewed"}
+                )
+                token = prepared["prepared_token"]
+                with patch("coremail_backend.send_message") as send:
+                    with self.assertRaisesRegex(PreparedMessageError, "configuration changed"):
+                        backend.send_prepared(
+                            {"prepared_token": token, "confirmation": "确认发送"}
+                        )
+                send.assert_not_called()
+                # A stale review remains available so the caller can prepare a
+                # new message after consciously fixing the configuration.
+                self.assertIsNotNone(backend.store.get(token))
 
     def test_mapi_send_uses_verified_attachment_snapshot(self) -> None:
         class RecordingMapiClient:

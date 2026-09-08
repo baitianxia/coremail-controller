@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>邮件助手 Windows 快速开始</title>
+  <style>
+    body{font-family:"Microsoft YaHei",sans-serif;line-height:1.65;max-width:860px;margin:2rem auto;padding:0 1.2rem;color:#202124}
+    code{background:#f1f3f4;padding:.12rem .3rem;border-radius:.2rem} li{margin:.45rem 0}
+    .note{background:#eef6ff;border-left:4px solid #1a73e8;padding:.7rem 1rem}
+    .warn{background:#fff8e1;border-left:4px solid #f9ab00;padding:.7rem 1rem}
+  </style>
+</head>
+<body>
+  <h1>邮件助手：Windows 快速开始</h1>
+  <p>这是一个通过 MCP 提供邮箱读写能力的本地助手。Coremail 只作为可选邮件 provider；服务不会打开、点击或控制邮件客户端界面。</p>
+  <div class="note"><strong>最短路径：</strong>完整解压 ZIP → 双击 <code>INSTALL.cmd</code> → 重启 Claude Code → 先调用 <code>mail_config_status</code>。</div>
+  <h2>安装与升级</h2>
+  <ol>
+    <li>把 <code>mail-mcp-server-*-windows-x64.zip</code> 解压到新的普通目录，不要从压缩包预览窗口运行。</li>
+    <li>双击 <code>INSTALL.cmd</code>。首次安装和升级使用同一个入口；升级会保留配置并在新版本验证通过后原子切换。</li>
+    <li>安装失败会恢复原来的 MCP 注册和活动版本；新版本目录会保留供诊断。</li>
+  </ol>
+  <h2>首次配置和使用</h2>
+  <ol>
+    <li>双击 <code>CONFIGURE.cmd</code>，按提示选择 Windows Simple MAPI 或安全 IMAP/SMTP。密码只进入 Windows Credential Manager，不要粘贴到聊天。</li>
+    <li>需要查看文件时双击 <code>OPEN-CONFIG.cmd</code>。配置路径固定为 <code>%USERPROFILE%\mail-mcp-server\config\settings.json</code>。</li>
+    <li>重启 Claude Code，调用 <code>mail_config_status</code>、<code>mail_config_reload</code>，再调用 <code>mail_check_connection</code>。</li>
+    <li>发送邮件必须先准备并展示收件人、主题和附件；只有用户明确回复 <code>确认发送</code> 才能发送。</li>
+  </ol>
+  <h2>卸载、回滚和日志</h2>
+  <p>双击 <code>UNINSTALL.cmd</code> 只移除 <code>mail-mcp</code> 的 Claude 用户级注册，默认保留配置、版本、回滚记录和日志。重新安装任意已验证版本即可回滚；不要手动删除被占用的版本目录。</p>
+  <p>本工程的状态、锁、日志和版本都在 <code>%USERPROFILE%\mail-mcp-server\</code> 下。常见日志目录是 <code>%USERPROFILE%\mail-mcp-server\logs</code>。</p>
+  <div class="warn"><strong>执行策略提示：</strong>入口只对本次 PowerShell 子进程使用 <code>-ExecutionPolicy Bypass</code>，不会修改持久策略。若组织设置了 <code>MachinePolicy</code> 或 <code>UserPolicy</code>，请把 <code>Get-ExecutionPolicy -List</code> 和日志交给管理员。</div>
+  <p>完整说明请阅读同目录的 <code>README.md</code>。</p>
+</body>
+</html>

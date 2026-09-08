@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Transactionally register Coremail in Claude Code's user MCP scope.
+"""Transactionally register the mail assistant in Claude Code's user MCP scope.
 
-The Coremail package deliberately uses Claude Code's stable ``mcp`` command
+The mail package deliberately uses Claude Code's stable ``mcp`` command
 instead of the newer plugin inventory/enablement commands.  This keeps the
 mail server usable with older Claude Code releases (including 2.1.84) while
 still making the registration explicit, user-scoped, and reversible.
@@ -287,7 +287,7 @@ def _verify_entry(
             + ", ".join(sorted(unexpected))
         )
     if entry.get("type") not in {None, "stdio"}:
-        raise RegistrationError("Coremail user MCP transport is not stdio")
+        raise RegistrationError("Mail user MCP transport is not stdio")
     command = entry.get("command")
     arguments = entry.get("args")
     expected_arguments = [
@@ -319,7 +319,7 @@ def _verify_entry(
     environment = entry.get("env")
     if environment not in (None, {}):
         raise RegistrationError(
-            "Coremail user MCP registration must not inject environment secrets"
+            "Mail user MCP registration must not inject environment secrets"
         )
 
 
@@ -360,9 +360,9 @@ def _validate_inputs(
         if os.name == "nt" and powershell_executable.suffix.lower() != ".exe":
             raise RegistrationError("PowerShell executable must end in .exe")
     if server_script is not None:
-        _regular_file(server_script, "Coremail MCP launcher")
+        _regular_file(server_script, "mail MCP launcher")
         if server_script.suffix.lower() != ".ps1":
-            raise RegistrationError("Coremail MCP launcher must be a .ps1 file")
+            raise RegistrationError("mail MCP launcher must be a .ps1 file")
     _validate_config_path(user_config, "Claude user configuration")
     _validate_config_path(backup, "rollback backup")
     if backup.exists():
@@ -401,9 +401,9 @@ def register_user_mcp(
             environment=environment,
         )
         if remove_result.returncode == 0:
-            reporter("已清理旧的 Coremail 用户级 MCP 条目，正在注册新版本。")
+            reporter("已清理旧的邮件助手用户级 MCP 条目，正在注册新版本。")
         elif _is_missing_result(remove_result):
-            reporter("未发现旧的 Coremail 用户级 MCP 条目（首次安装正常），继续注册。")
+            reporter("未发现旧的邮件助手用户级 MCP 条目（首次安装正常），继续注册。")
         else:
             raise RegistrationError(
                 _redacted_failure("claude mcp remove", remove_result)
@@ -448,7 +448,7 @@ def register_user_mcp(
         )
         if get_result.returncode != 0:
             raise RegistrationError(_redacted_failure("claude mcp get", get_result))
-        reporter("Claude Code 用户级 Coremail MCP 注册、配置核对和读取验证已完成。")
+        reporter("Claude Code 用户级邮件助手 MCP 注册、配置核对和读取验证已完成。")
     except Exception as exc:
         try:
             _restore_user_config(user_config, backup, was_present=was_present)
@@ -497,7 +497,7 @@ def unregister_user_mcp(
             # requested entry is absent. Restore the original bytes in that
             # case so an idempotent uninstall has no side effect.
             _restore_user_config(user_config, backup, was_present=was_present)
-            reporter("未发现 Coremail 用户级 MCP 条目（已经是移除状态）。")
+            reporter("未发现邮件助手用户级 MCP 条目（已经是移除状态）。")
             return
 
         _verify_absent(user_config, server_name)
@@ -513,14 +513,14 @@ def unregister_user_mcp(
             # user-scope truth is the parsed config above; a successful get in
             # this case is harmless and must not make uninstall roll back.
             reporter(
-                "Claude Code 用户级 Coremail MCP 已移除；其他作用域的同名条目未修改。"
+                "Claude Code 用户级邮件助手 MCP 已移除；其他作用域的同名条目未修改。"
             )
         elif not _is_missing_result(get_result):
             raise RegistrationError(
                 "claude mcp get did not confirm that the user-scoped entry is absent"
             )
         else:
-            reporter("Claude Code 用户级 Coremail MCP 已移除并核对。")
+            reporter("Claude Code 用户级邮件助手 MCP 已移除并核对。")
     except Exception as exc:
         try:
             _restore_user_config(user_config, backup, was_present=was_present)
@@ -540,7 +540,7 @@ def verify_user_mcp(
 ) -> None:
     _validated_server_name(server_name)
     _regular_file(powershell_executable, "PowerShell executable")
-    _regular_file(server_script, "Coremail MCP launcher")
+    _regular_file(server_script, "mail MCP launcher")
     _validate_config_path(user_config, "Claude user configuration")
     _verify_entry(
         user_config,
@@ -627,7 +627,7 @@ _FAKE_CLAUDE_SOURCE = textwrap.dedent(
 
 def self_test() -> None:
     """Exercise the transaction and all failure rollback branches offline."""
-    with tempfile.TemporaryDirectory(prefix="coremail-user-mcp-self-test-") as value:
+    with tempfile.TemporaryDirectory(prefix="mail-user-mcp-self-test-") as value:
         root = Path(value)
         fake_cli = root / "fake_claude.py"
         fake_cli.write_text(_FAKE_CLAUDE_SOURCE, encoding="utf-8")
@@ -653,7 +653,7 @@ def self_test() -> None:
         register_user_mcp(
             claude_executable=sys.executable,
             claude_prefix=(str(fake_cli),),
-            server_name="coremail-controller",
+            server_name="mail-mcp",
             powershell_executable=powershell,
             server_script=server_script,
             user_config=user_config,
@@ -664,14 +664,14 @@ def self_test() -> None:
         if backup.read_bytes() != original:
             raise RegistrationError("existing config was not backed up byte-for-byte")
         verify_user_mcp(
-            server_name="coremail-controller",
+            server_name="mail-mcp",
             powershell_executable=powershell,
             server_script=server_script,
             user_config=user_config,
         )
         events_payload = [json.loads(line) for line in events.read_text().splitlines()]
         expected_prefix = [
-            ["mcp", "remove", "coremail-controller", "--scope", "user"],
+            ["mcp", "remove", "mail-mcp", "--scope", "user"],
             [
                 "mcp",
                 "add",
@@ -679,7 +679,7 @@ def self_test() -> None:
                 "stdio",
                 "--scope",
                 "user",
-                "coremail-controller",
+                "mail-mcp",
                 "--",
                 str(powershell),
                 "-NoLogo",
@@ -688,7 +688,7 @@ def self_test() -> None:
                 "-File",
                 str(server_script),
             ],
-            ["mcp", "get", "coremail-controller"],
+            ["mcp", "get", "mail-mcp"],
         ]
         if events_payload[:3] != expected_prefix:
             raise RegistrationError(
@@ -703,7 +703,7 @@ def self_test() -> None:
             register_user_mcp(
                 claude_executable=sys.executable,
                 claude_prefix=(str(fake_cli),),
-                server_name="coremail-controller",
+                server_name="mail-mcp",
                 powershell_executable=powershell,
                 server_script=server_script,
                 user_config=user_config,
@@ -725,7 +725,7 @@ def self_test() -> None:
             register_user_mcp(
                 claude_executable=sys.executable,
                 claude_prefix=(str(fake_cli),),
-                server_name="coremail-controller",
+                server_name="mail-mcp",
                 powershell_executable=powershell,
                 server_script=server_script,
                 user_config=user_config,
@@ -745,7 +745,7 @@ def self_test() -> None:
         register_user_mcp(
             claude_executable=sys.executable,
             claude_prefix=(str(fake_cli),),
-            server_name="coremail-controller",
+            server_name="mail-mcp",
             powershell_executable=powershell,
             server_script=server_script,
             user_config=user_config,
@@ -756,16 +756,16 @@ def self_test() -> None:
         unregister_user_mcp(
             claude_executable=sys.executable,
             claude_prefix=(str(fake_cli),),
-            server_name="coremail-controller",
+            server_name="mail-mcp",
             user_config=user_config,
             backup=root / "remove.bak",
             reporter=quiet,
             environment=environment,
         )
-        if user_config.exists() and "coremail-controller" in _read_config(user_config).get(
+        if user_config.exists() and "mail-mcp" in _read_config(user_config).get(
             "mcpServers", {}
         ):
-            raise RegistrationError("unregister left the Coremail entry behind")
+            raise RegistrationError("unregister left the mail assistant entry behind")
 
         if not any(item[:2] == ["mcp", "add"] for item in events_payload):
             raise RegistrationError("self-test did not execute claude mcp add")
@@ -806,7 +806,7 @@ def main() -> int:
     try:
         if arguments.command == "self-test":
             self_test()
-            print("COREMAIL CLAUDE USER MCP REGISTRATION SELF-TEST PASSED")
+            print("MAIL CLAUDE USER MCP REGISTRATION SELF-TEST PASSED")
         elif arguments.command == "register":
             register_user_mcp(
                 claude_executable=arguments.claude_executable,
@@ -832,7 +832,7 @@ def main() -> int:
                 server_script=arguments.server_script,
                 user_config=arguments.user_config,
             )
-            print("COREMAIL CLAUDE USER MCP REGISTRATION VERIFIED")
+            print("MAIL CLAUDE USER MCP REGISTRATION VERIFIED")
     except (OSError, RegistrationError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2

@@ -36,29 +36,23 @@ $env:TEMP = $RunnerTemp
 $env:TMP = $RunnerTemp
 $env:DISABLE_AUTOUPDATER = '1'
 $env:DISABLE_UPDATES = '1'
-$env:COREMAIL_RELEASE_GATE_TESTING = 'true'
-Remove-Item Env:COREMAIL_PYTHON -ErrorAction SilentlyContinue
+$env:MAIL_RELEASE_GATE_TESTING = 'true'
+Remove-Item Env:MAIL_PYTHON -ErrorAction SilentlyContinue
 Remove-Item Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
 
 $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $userProfile = [Environment]::GetFolderPath('UserProfile')
-$appData = [Environment]::GetFolderPath('ApplicationData')
-$localAppData = [Environment]::GetFolderPath('LocalApplicationData')
-if ([string]::IsNullOrWhiteSpace($userProfile) -or [string]::IsNullOrWhiteSpace($appData) -or [string]::IsNullOrWhiteSpace($localAppData)) {
-    throw 'Disposable user profile paths could not be resolved.'
-}
+if ([string]::IsNullOrWhiteSpace($userProfile)) { throw 'Disposable user profile path could not be resolved.' }
 $env:USERPROFILE = $userProfile
-$env:APPDATA = $appData
-$env:LOCALAPPDATA = $localAppData
 
 $claudeRoot = Join-Path $userProfile '.claude'
 $claudeUserConfigPath = Join-Path $userProfile '.claude.json'
-$configDirectory = Join-Path $appData 'ClaudeCode\Coremail'
-$configPath = Join-Path $configDirectory 'config.json'
-$agentRoot = Join-Path $localAppData 'CoremailController'
-$releaseRoot = Join-Path $agentRoot 'releases'
+$agentRoot = Join-Path $userProfile 'mail-mcp-server'
+$configDirectory = Join-Path $agentRoot 'config'
+$configPath = Join-Path $configDirectory 'settings.json'
+$releaseRoot = Join-Path $agentRoot 'versions'
 $lifecycleLockPath = Join-Path $agentRoot '.lifecycle.lock'
-$legacySkillRoot = Join-Path $claudeRoot 'skills\coremail-controller'
+$legacySkillRoot = Join-Path $claudeRoot 'skills\old-mail-provider'
 $installer = Join-Path $PluginRoot 'scripts\install.ps1'
 $uninstaller = Join-Path $PluginRoot 'scripts\uninstall.ps1'
 $commonScript = Join-Path $PluginRoot 'scripts\windows-lifecycle-common.ps1'
@@ -92,15 +86,15 @@ function Get-RegisteredPackageRoot {
     $payload = Get-Content -LiteralPath $claudeUserConfigPath -Raw | ConvertFrom-Json
     $servers = $payload.PSObject.Properties['mcpServers']
     if ($null -eq $servers -or $null -eq $servers.Value) { throw 'Claude user-scope MCP configuration is missing.' }
-    $entry = $servers.Value.PSObject.Properties['coremail-controller']
-    if ($null -eq $entry -or $null -eq $entry.Value) { throw 'Coremail user-scope MCP entry is missing.' }
+    $entry = $servers.Value.PSObject.Properties['mail-mcp']
+    if ($null -eq $entry -or $null -eq $entry.Value) { throw 'Mail user-scope MCP entry is missing.' }
     $arguments = @($entry.Value.args | ForEach-Object { [string]$_ })
     $fileIndex = [Array]::IndexOf($arguments, '-File')
-    if ($fileIndex -lt 0 -or $fileIndex + 1 -ge $arguments.Count) { throw 'Coremail user-scope MCP entry has no -File launcher.' }
+    if ($fileIndex -lt 0 -or $fileIndex + 1 -ge $arguments.Count) { throw 'Mail user-scope MCP entry has no -File launcher.' }
     $serverScript = [IO.Path]::GetFullPath($arguments[$fileIndex + 1])
     $root = [IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $serverScript)))
     if (-not $root.StartsWith(([IO.Path]::GetFullPath($releaseRoot)).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
-        throw "Registered runtime escaped the LocalAppData release root: $root"
+        throw "Registered runtime escaped the mail versions root: $root"
     }
     return $root
 }
@@ -117,7 +111,7 @@ function Assert-UserMcpRegistered {
     # the registered runtime root.  Without this, PowerShell returns an
     # Object[] containing the message and the path; a later Join-Path then
     # fails with the misleading "path's format is not supported" error.
-    & $PythonCommand -B -I $registrar verify --server-name 'coremail-controller' --user-config $claudeUserConfigPath `
+    & $PythonCommand -B -I $registrar verify --server-name 'mail-mcp' --user-config $claudeUserConfigPath `
         --powershell-executable $windowsPowerShell --server-script (Join-Path $root 'mcp\run-server.ps1') | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Claude user-scope MCP verification failed.' }
     return $root
@@ -127,8 +121,8 @@ function Assert-UserMcpAbsent {
     if (-not (Test-Path -LiteralPath $claudeUserConfigPath -PathType Leaf)) { return }
     $payload = Get-Content -LiteralPath $claudeUserConfigPath -Raw | ConvertFrom-Json
     $servers = $payload.PSObject.Properties['mcpServers']
-    if ($null -ne $servers -and $null -ne $servers.Value -and $null -ne $servers.Value.PSObject.Properties['coremail-controller']) {
-        throw 'Coremail user-scope MCP entry is still present.'
+    if ($null -ne $servers -and $null -ne $servers.Value -and $null -ne $servers.Value.PSObject.Properties['mail-mcp']) {
+        throw 'Mail user-scope MCP entry is still present.'
     }
 }
 
@@ -139,7 +133,7 @@ function Assert-ConfigUnchanged {
 }
 
 if ((Test-Path -LiteralPath $configPath) -or (Test-Path -LiteralPath $claudeUserConfigPath) -or (Test-Path -LiteralPath $agentRoot)) {
-    throw 'Disposable profile unexpectedly contains Coremail state.'
+    throw 'Disposable profile unexpectedly contains mail assistant state.'
 }
 
 Write-Host "[gate 1/10][$ScenarioName] Parse packaged PowerShell and compile Credential Manager helper"
@@ -164,7 +158,7 @@ if (-not $?) { throw 'Packaged MCP smoke test failed.' }
 
 Write-Host "[gate 3/10][$ScenarioName] Create mailbox fixture and unrelated Claude setting"
 New-Item -ItemType Directory -Path $configDirectory -Force | Out-Null
-$fixture = [ordered]@{ transport = 'windows_simple_mapi'; username = 'ci-fixture@example.invalid'; allowed_from = @('ci-fixture@example.invalid'); sent_copy_mode = 'none'; attachment_roots = @() }
+$fixture = [ordered]@{ schema_version = 1; provider = 'coremail'; transport = 'windows_simple_mapi'; username = 'ci-fixture@example.invalid'; allowed_from = @('ci-fixture@example.invalid'); sent_copy_mode = 'none'; attachment_roots = @() }
 [IO.File]::WriteAllText($configPath, ($fixture | ConvertTo-Json -Depth 8), $utf8)
 $fixtureHash = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
 New-Item -ItemType Directory -Path $claudeRoot -Force | Out-Null
@@ -172,7 +166,7 @@ New-Item -ItemType Directory -Path $claudeRoot -Force | Out-Null
 $userConfigHash = (Get-FileHash -LiteralPath $claudeUserConfigPath -Algorithm SHA256).Hash
 $env:CLAUDE_CONFIG_DIR = 'relative-custom-claude-root'
 try {
-    Invoke-WindowsPowerShellScript -ScriptPath $installer -ExpectFailure -ExpectedText 'absolute local-drive path' -ScriptArguments @('-SkipConnectionCheck', '-PythonExecutable', $PythonCommand, '-ClaudeCommand', $ClaudeCommand, '-LogPath', (Join-Path $RunnerTemp "CUSTOM-$ScenarioName.log"))
+    Invoke-WindowsPowerShellScript -ScriptPath $installer -ExpectFailure -ExpectedText 'absolute local-drive path' -ScriptArguments @('-SkipConnectionCheck', '-ClaudeCommand', $ClaudeCommand, '-LogPath', (Join-Path $RunnerTemp "CUSTOM-$ScenarioName.log"))
 }
 finally { Remove-Item Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue }
 if ((Test-Path -LiteralPath $agentRoot) -or (Get-FileHash -LiteralPath $claudeUserConfigPath -Algorithm SHA256).Hash -ne $userConfigHash) { throw 'Rejected custom Claude root changed state.' }
@@ -185,11 +179,11 @@ $legacyMarker = Join-Path $legacySkillRoot 'legacy-marker.txt'
 $legacyHash = (Get-FileHash -LiteralPath $legacyMarker -Algorithm SHA256).Hash
 $legacyStream = [IO.File]::Open($legacyMarker, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
 try {
-    Invoke-WindowsPowerShellScript -ScriptPath $installer -ScriptArguments @('-SkipConnectionCheck', '-PythonExecutable', $PythonCommand, '-ClaudeCommand', $ClaudeCommand, '-LogPath', (Join-Path $RunnerTemp "INSTALL-$ScenarioName.log"))
+    Invoke-WindowsPowerShellScript -ScriptPath $installer -ScriptArguments @('-SkipConnectionCheck', '-ClaudeCommand', $ClaudeCommand, '-LogPath', (Join-Path $RunnerTemp "INSTALL-$ScenarioName.log"))
 }
 finally { $legacyStream.Dispose() }
 $firstRoot = Assert-UserMcpRegistered
-if (-not $firstRoot.StartsWith(([IO.Path]::GetFullPath($releaseRoot)).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Installer did not publish below LocalAppData releases.' }
+if (-not $firstRoot.StartsWith(([IO.Path]::GetFullPath($releaseRoot)).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Installer did not publish below the mail versions directory.' }
 if (-not (Test-Path -LiteralPath (Join-Path $firstRoot 'mcp\python-runtime.json') -PathType Leaf)) { throw 'Pinned runtime descriptor is missing.' }
 Assert-ConfigUnchanged -ExpectedHash $fixtureHash
 if ((Get-FileHash -LiteralPath $legacyMarker -Algorithm SHA256).Hash -ne $legacyHash) { throw 'Installer modified the legacy Skill fixture.' }
@@ -198,7 +192,7 @@ Write-Host "[gate 5/10][$ScenarioName] Publish a new immutable release while the
 $lockedRuntimeFile = Join-Path $firstRoot 'README.md'
 $runtimeStream = [IO.File]::Open($lockedRuntimeFile, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
 try {
-    Invoke-WindowsPowerShellScript -ScriptPath $installer -ScriptArguments @('-SkipConnectionCheck', '-PythonExecutable', $PythonCommand, '-ClaudeCommand', $ClaudeCommand, '-LogPath', (Join-Path $RunnerTemp "REINSTALL-$ScenarioName.log"))
+    Invoke-WindowsPowerShellScript -ScriptPath $installer -ScriptArguments @('-SkipConnectionCheck', '-ClaudeCommand', $ClaudeCommand, '-LogPath', (Join-Path $RunnerTemp "REINSTALL-$ScenarioName.log"))
 }
 finally { $runtimeStream.Dispose() }
 $secondRoot = Assert-UserMcpRegistered
@@ -211,7 +205,7 @@ Write-Host "[gate 6/10][$ScenarioName] Prove lifecycle lock contention is fail-c
 $lockStream = [IO.File]::Open($lifecycleLockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
 $beforeContentHash = (Get-FileHash -LiteralPath $claudeUserConfigPath -Algorithm SHA256).Hash
 try {
-    Invoke-WindowsPowerShellScript -ScriptPath $installer -ExpectFailure -ExpectedText 'already running' -ScriptArguments @('-SkipConnectionCheck', '-PythonExecutable', $PythonCommand, '-ClaudeCommand', $ClaudeCommand, '-LogPath', (Join-Path $RunnerTemp "LOCK-$ScenarioName.log"))
+    Invoke-WindowsPowerShellScript -ScriptPath $installer -ExpectFailure -ExpectedText 'already running' -ScriptArguments @('-SkipConnectionCheck', '-ClaudeCommand', $ClaudeCommand, '-LogPath', (Join-Path $RunnerTemp "LOCK-$ScenarioName.log"))
 }
 finally { $lockStream.Dispose() }
 if ((Get-FileHash -LiteralPath $claudeUserConfigPath -Algorithm SHA256).Hash -ne $beforeContentHash) { throw 'Lock contention changed Claude configuration.' }
@@ -219,7 +213,7 @@ if ((Get-FileHash -LiteralPath $claudeUserConfigPath -Algorithm SHA256).Hash -ne
 Write-Host "[gate 7/10][$ScenarioName] Verify account transaction rollback"
 $credentialScript = Join-Path $secondRoot 'scripts\windows-credential.ps1'
 . $credentialScript
-$credentialTarget = 'ClaudeCode.Coremail:rollback@example.invalid:' + [guid]::NewGuid().ToString('N')
+$credentialTarget = 'MailMcp.Coremail:rollback@example.invalid:' + [guid]::NewGuid().ToString('N')
 $securePassword = ConvertTo-SecureString ('Gate9!' + [guid]::NewGuid().ToString('N')) -AsPlainText -Force
 try {
     try {
@@ -249,7 +243,7 @@ $registeredBeforeUninstall = Get-RegisteredPackageRoot
 $lockedServer = Join-Path $registeredBeforeUninstall 'mcp\server.py'
 $serverStream = [IO.File]::Open($lockedServer, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
 try {
-    Invoke-WindowsPowerShellScript -ScriptPath $uninstaller -ScriptArguments @('-PythonExecutable', $PythonCommand, '-ClaudeCommand', $ClaudeCommand, '-LogPath', (Join-Path $RunnerTemp "UNINSTALL-$ScenarioName.log"))
+    Invoke-WindowsPowerShellScript -ScriptPath $uninstaller -ScriptArguments @('-ClaudeCommand', $ClaudeCommand, '-LogPath', (Join-Path $RunnerTemp "UNINSTALL-$ScenarioName.log"))
 }
 finally { $serverStream.Dispose() }
 Assert-UserMcpAbsent
@@ -258,10 +252,10 @@ Assert-ConfigUnchanged -ExpectedHash $fixtureHash
 if ((Get-FileHash -LiteralPath $legacyMarker -Algorithm SHA256).Hash -ne $legacyHash) { throw 'Uninstall modified the legacy Skill fixture.' }
 
 Write-Host "[gate 10/10][$ScenarioName] Reinstall and idempotent removal"
-Invoke-WindowsPowerShellScript -ScriptPath $installer -ScriptArguments @('-SkipConnectionCheck', '-PythonExecutable', $PythonCommand, '-ClaudeCommand', $ClaudeCommand, '-LogPath', (Join-Path $RunnerTemp "FINAL-INSTALL-$ScenarioName.log"))
+Invoke-WindowsPowerShellScript -ScriptPath $installer -ScriptArguments @('-SkipConnectionCheck', '-ClaudeCommand', $ClaudeCommand, '-LogPath', (Join-Path $RunnerTemp "FINAL-INSTALL-$ScenarioName.log"))
 $finalRoot = Assert-UserMcpRegistered
 Assert-ConfigUnchanged -ExpectedHash $fixtureHash
-Invoke-WindowsPowerShellScript -ScriptPath (Join-Path $finalRoot 'scripts\uninstall.ps1') -ScriptArguments @('-PythonExecutable', $PythonCommand, '-ClaudeCommand', $ClaudeCommand, '-LogPath', (Join-Path $RunnerTemp "FINAL-UNINSTALL-$ScenarioName.log"))
+Invoke-WindowsPowerShellScript -ScriptPath (Join-Path $finalRoot 'scripts\uninstall.ps1') -ScriptArguments @('-ClaudeCommand', $ClaudeCommand, '-LogPath', (Join-Path $RunnerTemp "FINAL-UNINSTALL-$ScenarioName.log"))
 Assert-UserMcpAbsent
 if (-not (Test-Path -LiteralPath $finalRoot -PathType Container)) { throw 'Final uninstall deleted the immutable runtime.' }
 Assert-ConfigUnchanged -ExpectedHash $fixtureHash

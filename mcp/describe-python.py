@@ -30,6 +30,8 @@ def describe() -> dict[str, object]:
         raise RuntimeError(f"Python executable is not a regular file: {executable}")
     return {
         "schema_version": SCHEMA_VERSION,
+        "kind": "python",
+        "bundled": True,
         "executable": str(executable),
         "version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
         "version_info": [

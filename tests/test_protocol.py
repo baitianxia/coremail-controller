@@ -15,31 +15,33 @@ SERVER = ROOT / "mcp" / "server.py"
 class ProtocolTests(unittest.TestCase):
     def test_mcp_layout_is_portable_without_a_skill_install(self) -> None:
         manifest = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["name"], "coremail-controller")
+        self.assertEqual(manifest["name"], "mail-mcp-server")
+        self.assertEqual(manifest["displayName"], "邮件助手")
         self.assertEqual(manifest["version"], "0.9.0")
 
         user_skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
-        self.assertTrue(user_skill.startswith("---\nname: coremail-controller\n"))
+        self.assertTrue(user_skill.startswith("---\nname: mail-mcp-server\n"))
         self.assertIn("确认发送", user_skill)
 
         coremail_skill = (ROOT / "skills" / "coremail" / "SKILL.md").read_text(encoding="utf-8")
         browser_skill = (ROOT / "skills" / "web-to-coremail" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertTrue(coremail_skill.startswith("---\nname: coremail\n"))
-        self.assertTrue(browser_skill.startswith("---\nname: web-to-coremail\n"))
+        self.assertTrue(coremail_skill.startswith("---\nname: mail-provider-coremail\n"))
+        self.assertTrue(browser_skill.startswith("---\nname: web-to-mail\n"))
         mcp_config = json.loads((ROOT / ".mcp.json").read_text(encoding="utf-8"))
-        self.assertEqual(set(mcp_config["mcpServers"]), {"coremail-windows"})
-        server = mcp_config["mcpServers"]["coremail-windows"]
+        self.assertEqual(set(mcp_config["mcpServers"]), {"mail-mcp"})
+        server = mcp_config["mcpServers"]["mail-mcp"]
         self.assertEqual(server["command"].lower(), "powershell.exe")
         self.assertIn("${CLAUDE_PLUGIN_ROOT}/mcp/run-server.ps1", server["args"])
         self.assertNotIn("Bypass", server["args"])
         self.assertNotIn(str(ROOT), json.dumps(mcp_config))
-        for launcher in ("INSTALL.cmd", "CONFIGURE-ACCOUNT.cmd", "UNINSTALL.cmd"):
+        for launcher in ("INSTALL.cmd", "CONFIGURE.cmd", "OPEN-CONFIG.cmd", "UNINSTALL.cmd"):
             self.assertTrue((ROOT / launcher).is_file())
 
         installer = (ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
         registrar = (ROOT / "scripts" / "register_claude_user_mcp.py").read_text(encoding="utf-8")
-        self.assertIn("LocalAppData", installer)
-        self.assertIn("releases", installer)
+        self.assertIn("mail-mcp-server", installer)
+        self.assertIn("versions", installer)
+        self.assertIn("payload\\runtime\\python.exe", installer)
         self.assertNotIn(".claude\\skills", installer)
         self.assertNotIn("plugin-backups", installer)
         self.assertNotIn("RunAs", installer)
@@ -52,7 +54,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertNotIn("plugin list", installer.lower())
         launch_sources = installer + (ROOT / "INSTALL.cmd").read_text(encoding="utf-8")
         launch_sources += (ROOT / "tests" / "smoke-mcp.ps1").read_text(encoding="utf-8")
-        self.assertNotIn("ExecutionPolicy", launch_sources)
+        self.assertIn("ExecutionPolicy Bypass", launch_sources)
 
     def test_browser_orchestration_is_isolated_and_send_gated(self) -> None:
         browser_skill = (ROOT / "skills" / "web-to-coremail" / "SKILL.md").read_text(encoding="utf-8")
@@ -90,7 +92,7 @@ class ProtocolTests(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": 3,
                 "method": "tools/call",
-                "params": {"name": "coremail_connection_status", "arguments": {}},
+                "params": {"name": "mail_connection_status", "arguments": {}},
             },
         ]
         payload = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in requests)
@@ -105,18 +107,18 @@ class ProtocolTests(unittest.TestCase):
         )
         responses = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
         self.assertEqual([response["id"] for response in responses], [1, 2, 3])
-        self.assertEqual(responses[0]["result"]["serverInfo"]["name"], "coremail-headless")
+        self.assertEqual(responses[0]["result"]["serverInfo"]["name"], "mail-mcp-server")
         self.assertEqual(responses[0]["result"]["serverInfo"]["version"], "0.9.0")
         self.assertIn("确认发送", responses[0]["result"]["instructions"])
         names = {tool["name"] for tool in responses[1]["result"]["tools"]}
-        self.assertEqual(len(names), 10)
-        self.assertIn("coremail_discover_local", names)
-        self.assertIn("coremail_send_prepared", names)
+        self.assertEqual(len(names), 13)
+        self.assertIn("mail_discover_local", names)
+        self.assertIn("mail_send_prepared", names)
         self.assertFalse(any("click" in name or "screenshot" in name or "window" in name for name in names))
         status = json.loads(responses[2]["result"]["content"][0]["text"])
-        self.assertFalse(status["coremail_client_interface_selected"])
-        self.assertFalse(status["coremail_client_interface_used"])
-        self.assertFalse(status["coremail_ui_automation_used"])
+        self.assertFalse(status["mail_client_interface_selected"])
+        self.assertFalse(status["mail_client_interface_used"])
+        self.assertFalse(status["mail_ui_automation_used"])
         self.assertIn("client_interface", status)
 
     def test_windows_stdio_bom_is_tolerated_only_at_stream_start(self) -> None:
@@ -154,7 +156,7 @@ class ProtocolTests(unittest.TestCase):
         responses = [json.loads(line) for line in completed.stdout.splitlines()]
         self.assertEqual(1, responses[0]["id"])
         self.assertEqual(
-            "coremail-headless", responses[0]["result"]["serverInfo"]["name"]
+            "mail-mcp-server", responses[0]["result"]["serverInfo"]["name"]
         )
         self.assertIsNone(responses[1]["id"])
         self.assertEqual(-32700, responses[1]["error"]["code"])

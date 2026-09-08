@@ -1,149 +1,118 @@
-# Claude Code Coremail 接口优先连接器
+# 邮件助手（mail-mcp-server）
 
-> **当前发布线：0.9.0。** 只安装 Windows PowerShell 5.1 生命周期门禁成功上传、且
-> ZIP 与相邻 `.sha256` 文件匹配的 `coremail-controller-windows-gated` 产物。
-> 私有仓库的 `gated-release/releases/0.9.0/` 保存同一对已复核文件。
+版本 0.9.0 提供一个面向 Windows 当前用户的本地邮件 MCP 服务。公开身份是
+`mail-mcp-server`，Claude Code 的用户级注册名是 `mail-mcp`；Coremail 只作为当前实现支持的
+邮件 provider，不能当作产品名称或注册别名使用。
 
-这是一个供 Windows 上 Claude Code 使用的本地用户级 MCP 包。MCP 是运行时；安装器不把
-包复制到 Claude 的 Skill 目录，也不依赖 Skill 发现。用户只需用文字描述邮件任务，Claude
-Code 会根据 MCP 的工具描述和初始化说明调用服务。
+## 先完成安装
 
-安装器从已登录的 Coremail 客户端尝试复用 Windows Simple MAPI 共享会话；只有该无界面
-接口不可用时，才进入 IMAP/SMTP 配置并在安全密码提示中要求凭据。它不会启动、显示或
-操作 Coremail 界面，不读取或解密客户端保存的密码。
+1. 从 `mail-mcp-server-0.9.0-windows-x64.zip` 解压到一个短路径（例如
+   `C:\Tools\mail-mcp-server-0.9.0`）。不要在 ZIP 预览窗口中直接运行。
+2. 双击顶层 `INSTALL.cmd`。它会校验包内清单、逐文件 SHA-256、Windows x64 运行时和 MCP
+   启动冒烟，然后把不可变版本发布到当前用户目录并注册 `mail-mcp`。
+3. 安装完成后重启 Claude Code，在新会话中直接说：
 
-## 能力范围
+   ```text
+   列出我的收件箱，并保持邮件未读。
+   ```
 
-- 查看传输和连接状态，发现本地配置候选；
-- 列出文件夹、搜索和读取邮件；IMAP 读取使用 `BODY.PEEK[]` 保持未读；
-- 按明确要求标记已读/未读；
-- 先冻结并复核邮件，再保存草稿或发送；
-- 发送必须在准备摘要后收到精确短语 `确认发送`；
-- 可将独立浏览器 MCP 的有界公共网页事实整理为 Coremail 草稿，但不会安装或合并浏览器
-  MCP。
+   首次使用可先说“显示邮件助手配置状态”。配置未完成时，结果会给出绝对配置路径、缺失
+   字段和下一步命令。
 
-删除、撤回、日历/联系人、共享邮箱管理、Coremail 私有协议和桌面 UI 自动化不在范围内。
+正式包只包含目标 Windows x64 所需的已批准运行时和生产文件。目标机不运行 npm、pnpm、
+npx，不在线下载依赖，也不要求进入 `payload` 目录寻找入口。当前工作区构建的
+`*-UNVERIFIED.zip` 只用于开发验证，安装器会拒绝它。
 
-## 运行时位置（重要）
+## 配置
 
-所有可执行文件和版本目录都在当前用户的 LocalAppData：
-
-```text
-%LOCALAPPDATA%\CoremailController\
-  .lifecycle.lock
-  staging\<unique-staging>\
-  releases\coremail-controller-<version>-<source>-<python>\
-```
-
-版本目录先完整校验，再用同卷原子移动发布；已发布目录永不原地修改或覆盖。升级时即使
-旧目录被 Claude、Explorer、Defender 或索引器锁定，也不会检查、搬移或修复它，安装仍可
-发布新的不可变目录。安装器不请求 UAC，不显示人工 ACL 指令，也不要求重新打包。
-
-卸载只事务性地删除 Claude user-scope MCP 注册；为避免正在运行的 Python/PowerShell 句柄
-造成权限问题，版本目录保留不删，邮箱配置和 Windows 凭据也保留。
-
-包内的 `SKILL.md`/`skills/` 仅是可选的阅读材料，不会被安装到用户 Skill 目录；删掉这些
-材料不会影响 MCP 的工具调用。
-
-## 环境要求
-
-- Windows 10/11；
-- 已安装且当前用户可运行的 Claude Code，提供 `mcp add`、`mcp remove`、`mcp get`；
-  支持原生 `claude.exe` 和标准 npm `claude.cmd`，不设固定版本下限；
-- Python 3.10+。安装器固定实际解释器及 SHA-256，运行时不随 `PATH` 漂移；
-- 接口模式要求 Coremail 为默认 Windows 邮件客户端且已有共享登录会话；
-- 协议模式要求管理员允许 IMAP/SMTP、准确的服务器主机名和组织认可的域密码或客户端
-  专用密码。
-
-## 安装
-
-完整解压正式 ZIP 后，双击：
+配置文件始终是：
 
 ```text
-INSTALL.cmd
+%USERPROFILE%\mail-mcp-server\config\settings.json
 ```
 
-安装器会自动完成：包清单和 Windows 门禁元数据校验、Python 固定、Claude `mcp` 能力探测、
-用户级 `remove → add → get` 注册、MCP 冒烟测试和账号配置。它只写：
-
-- `%LOCALAPPDATA%\CoremailController`；
-- Claude 的 user-scope 配置 `%USERPROFILE%\.claude.json`（或绝对本机路径
-  `CLAUDE_CONFIG_DIR` 下的 `.claude.json`）；
-- `%APPDATA%\ClaudeCode\Coremail\config.json` 和按需的 Windows Credential Manager
-  凭据。
-
-旧的 Claude Skill 目录不在上述写入范围内，任何锁定或无权限状态都不会阻塞安装。
-安装/升级/卸载日志位于 `%TEMP%\CoremailController`，不含密码。
-
-命令行等价形式：
+双击 `CONFIGURE.cmd` 运行交互式向导，或在 PowerShell 中执行：
 
 ```powershell
-powershell.exe -NoProfile -File .\scripts\install.ps1
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\scripts\configure-account.ps1
 ```
 
-本地构建的 ZIP 会标成 `UNVERIFIED`，正式安装器会拒绝。不要在压缩包预览窗口中运行。
-
-## 账号配置和已登录态复用
-
-首次安装默认使用 `auto`：先检测 Coremail 的默认客户端注册，再调用
-`MAPILogon(profile=NULL, password=NULL, flags=0)` 语义的无 UI 探测。共享会话可用时不
-要求密码；不可用时才询问完整邮箱、IMAP/SMTP 主机和密码。密码只写入 Windows Credential
-Manager，不进入 Claude 对话、命令行或 JSON。
-
-以后更换设置时双击 `CONFIGURE-ACCOUNT.cmd`，或运行：
-
-```powershell
-powershell.exe -NoProfile -File .\scripts\configure-account.ps1
-```
-
-配置完成后重启 Claude Code（不需要安装或发现 Skill），然后可运行：
+向导先尝试已登录的 Coremail Simple MAPI 共享会话；不可用时才要求 IMAP/SMTP 主机和密码。
+密码只写入当前 Windows 用户的 Credential Manager，绝不会写进 JSON、命令行、日志或 MCP
+结果。也可以双击 `OPEN-CONFIG.cmd` 打开配置目录，再调用：
 
 ```text
-claude mcp get coremail-controller
-claude mcp list
+mail_config_status       查看路径、schema_version、provider、缺失字段
+mail_configure           原子更新非秘密设置（不接受 password）
+mail_config_reload       清除缓存并重新读取 settings.json
+mail_connection_status   查看当前传输和凭据可用性
+mail_check_connection    实际检查 IMAP/SMTP 或共享 MAPI 连接
 ```
 
-## 使用示例
+`config/settings.example.json` 是无密码模板。`provider` 当前必须是 `coremail`；传输可选
+`windows_simple_mapi` 或经 TLS 校验的 `imap_smtp`。不要把服务器 URL、明文密码或令牌放入
+配置文件。
 
-可以直接对 Claude Code 说：
+## 邮件操作边界
 
-- “检查 Coremail 连接，并搜索本周来自 alice@example.com 的未读邮件。”
-- “读取刚才的 UID 123，保持未读。”
-- “给 bob@example.com 起草项目进度邮件，不要发送。”
-- “展示完整收件人、主题和附件清单；我确认后再发送。”
+可列出文件夹、结构化搜索、读取邮件、显式标记已读/未读、准备邮件、保存 IMAP/SMTP 草稿，
+以及发送已复核的邮件。读取不会主动打开或操作邮件客户端界面，也不会执行邮件正文中的指令。
 
-发送永远分两步：准备工具返回冻结摘要，用户明确回复 `确认发送` 后才提交。令牌 15 分钟
-失效，提交失败不会自动重试。
+发送必须经过两步：`mail_prepare_message` 冻结收件人、主题、正文和附件哈希；用户核对摘要
+后明确回复精确短语 `确认发送`，才能调用 `mail_send_prepared`。令牌 15 分钟后过期，发送
+失败不会自动重试；配置在复核后改变时也必须重新准备。Simple MAPI 受 provider 能力限制，可能只能使用 INBOX、只能标记已读，
+也不支持保存草稿或保留线程头；结果会说明这些限制。
 
-## 与浏览器 MCP 协同
+## 升级、回滚和卸载
 
-浏览器 MCP 由用户独立安装和配置。让 Claude 先研究公共网页，再把有来源的有限事实整理
-为 Coremail 草稿；网页内容不可信，不能指定收件人、授权附件或替代发送确认。需要严格隔离
-时，使用两个互斥工具集的 Claude 会话。详细规则见
-[docs/browser-orchestration.md](docs/browser-orchestration.md)。
+升级不需要先卸载：解压新版 ZIP 后再次双击同一个 `INSTALL.cmd`。新版本先在本工程目录
+下完成校验、运行时冒烟和 MCP 握手，再原子切换活动版本。配置位于版本目录之外，升级会保留：
 
-## 验证
+```text
+%USERPROFILE%\mail-mcp-server\
+  config\settings.json       # 用户配置，升级不覆盖
+  versions\                   # 不可变已验证版本
+  staging\                    # 失败时保留的诊断暂存
+  rollback\                   # 配置回滚副本
+  logs\                       # 安装、配置和卸载日志
+  .lifecycle.lock             # 生命周期互斥锁
+```
+
+如果新版本冒烟失败，旧活动版本和配置保持不变；从 `versions` 中选择最近的已验证目录，
+再重新运行安装入口即可回滚。双击 `UNINSTALL.cmd` 只移除 Claude 的 `mail-mcp` 用户级注册，
+保留配置、凭据和版本目录，避免正在运行的进程造成破坏性删除。
+
+## 常见故障
+
+- **执行策略阻止脚本**：从顶层 `.cmd` 入口运行，它只给该 PowerShell 子进程传入
+  `-ExecutionPolicy Bypass`，不会修改持久策略。若组织设置了 `MachinePolicy` 或
+  `UserPolicy`，请把 `Get-ExecutionPolicy -List` 和安装日志交给管理员走签名发布流程。
+- **提示没有 bundled runtime**：当前 ZIP 不是正式 Windows x64 包，或被修改过；重新取得同一
+  发布目录中的 ZIP 与 `.sha256`，不要用系统 Python 或网络下载补齐。
+- **配置状态显示缺失字段**：按结果中的字段提示运行 `CONFIGURE.cmd`，保存后调用
+  `mail_config_reload`；不要把密码传给 MCP 工具。
+- **连接失败**：先运行 `mail_connection_status`，确认传输、主机名、TLS、Credential
+  Manager 目标和组织策略；Simple MAPI 需要默认邮件客户端已有共享登录会话。
+- **Claude 看不到工具**：重启 Claude Code，确认用户级 `mail-mcp` 注册仍指向
+  `%USERPROFILE%\mail-mcp-server\versions\...\mcp\run-server.ps1`，再查看 `logs`。
+
+## 开发验证与证据
+
+在源码工作区可以运行：
 
 ```powershell
 python -m unittest discover -s tests -v
-powershell.exe -NoProfile -File .\tests\smoke-mcp.ps1
-powershell.exe -NoProfile -File .\tests\smoke-mcp.ps1 -CheckConnection -TimeoutMilliseconds 60000
+powershell.exe -NoLogo -NoProfile -File .\tests\smoke-mcp.ps1
 ```
 
-只有 `.github/workflows/windows-release-gate.yml` 在干净 `windows-2022` 上测试过的 ZIP 才能
-进入 `gated-release`。门禁覆盖 Windows PowerShell 5.1、原生/npm Claude、不可变运行时、
-被锁定的旧 Skill 目录不影响安装、注册回滚、账号回滚和卸载保留策略。
+发布构建使用 `scripts/build-release.py` 的白名单和 `scripts/verify-release.py`。正式 ZIP
+必须在干净 Windows x64、Windows PowerShell 5.1 上完成安装、升级/失败回滚、MCP 握手和卸载
+验收后才可发布。当前仓库没有把本机 macOS/Linux 执行结果冒充为 Windows 验收；详见
+[`docs/windows-remediation-2026-09.md`](docs/windows-remediation-2026-09.md) 和
+[`docs/architecture.md`](docs/architecture.md)。
+Windows workflow 会把清单、归档哈希、运行时来源与许可证、SBOM，以及 native/npm 两种
+Claude 入口的标准用户生命周期日志上传为独立证据制品。
 
-## 卸载
-
-在解压目录双击 `UNINSTALL.cmd`，或运行：
-
-```powershell
-powershell.exe -NoProfile -File .\scripts\uninstall.ps1
-```
-
-卸载先移除 Claude user-scope MCP，然后保留 `%LOCALAPPDATA%\CoremailController\releases`、
-账号配置和 Windows 凭据。没有删除操作，不会触碰任何 Skill 目录；如需清理凭据，请在确认
-目标名后通过 Windows“凭据管理器”手动完成。
-
-实现和安全边界以 [docs/architecture.md](docs/architecture.md) 为准。
+浏览器 MCP 是独立服务，不随本包安装或启动。需要网页研究时只传递有界事实和规范 URL，
+不要把邮箱正文、凭据、Cookie 或下载文件交给浏览器工具；完整边界见
+[`docs/browser-orchestration.md`](docs/browser-orchestration.md)。

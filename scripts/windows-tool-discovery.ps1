@@ -38,24 +38,98 @@ function Test-CoremailPortableExecutable {
     }
 }
 
+function Test-CoremailPathChainSafe {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    # Checking only the final file is insufficient: a junction in a parent
+    # node_modules directory can redirect an otherwise ordinary-looking Claude
+    # launcher or package. Walk every existing component before Resolve-Path
+    # follows anything. Discovery is Windows-only, so local-drive paths are
+    # required just as they are for the lifecycle scripts.
+    try {
+        $fullPath = [IO.Path]::GetFullPath($Path)
+        if ($fullPath -notmatch '^[A-Za-z]:\\') { return $false }
+        $rootPath = [IO.Path]::GetPathRoot($fullPath)
+        $root = $rootPath.TrimEnd('\')
+        if (Test-Path -LiteralPath $rootPath) {
+            $rootItem = Get-Item -LiteralPath $rootPath -Force -ErrorAction Stop
+            if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                return $false
+            }
+        }
+        $cursor = $fullPath.TrimEnd('\')
+        while ($true) {
+            if (Test-Path -LiteralPath $cursor) {
+                $item = Get-Item -LiteralPath $cursor -Force -ErrorAction Stop
+                if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    return $false
+                }
+            }
+            if ([string]::Equals($cursor, $root, [StringComparison]::OrdinalIgnoreCase)) {
+                break
+            }
+            $parent = Split-Path -Parent $cursor
+            if ([string]::IsNullOrWhiteSpace($parent) -or
+                [string]::Equals($parent, $cursor, [StringComparison]::OrdinalIgnoreCase)) {
+                return $false
+            }
+            $cursor = $parent.TrimEnd('\')
+        }
+        return $true
+    }
+    catch { return $false }
+}
+
+function Test-CoremailNativeCliExecutable {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    try {
+        $fullPath = [IO.Path]::GetFullPath($Path)
+        if ($fullPath -match '(?i)\\Microsoft\\WindowsApps\\') {
+            # Windows app-execution aliases can resolve as claude.exe but may
+            # launch Claude Desktop rather than the Claude Code CLI.
+            return $false
+        }
+        if (-not (Test-CoremailPathChainSafe -Path $fullPath)) { return $false }
+        $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or
+            ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return $false
+        }
+        return (Test-CoremailPortableExecutable -Path $fullPath)
+    }
+    catch { return $false }
+}
+
 function Resolve-NpmClaudeInvocation {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$CommandPath)
 
-    if (-not (Test-Path -LiteralPath $CommandPath -PathType Leaf) -or
+    if (-not (Test-CoremailPathChainSafe -Path $CommandPath) -or
+        -not (Test-Path -LiteralPath $CommandPath -PathType Leaf) -or
         [IO.Path]::GetExtension($CommandPath) -ine '.cmd') {
         return $null
     }
 
     try {
         $resolvedCommand = (Resolve-Path -LiteralPath $CommandPath -ErrorAction Stop).Path
+        if (-not (Test-CoremailPathChainSafe -Path $resolvedCommand)) { return $null }
+        $commandItem = Get-Item -LiteralPath $resolvedCommand -Force -ErrorAction Stop
+        if (($commandItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return $null
+        }
         $commandRoot = Split-Path -Parent $resolvedCommand
         $packageRootCandidate = Join-Path $commandRoot 'node_modules\@anthropic-ai\claude-code'
-        if (-not (Test-Path -LiteralPath $packageRootCandidate -PathType Container)) {
+        if (-not (Test-CoremailPathChainSafe -Path $packageRootCandidate) -or
+            -not (Test-Path -LiteralPath $packageRootCandidate -PathType Container)) {
             return $null
         }
         $packageRoot = (Resolve-Path -LiteralPath $packageRootCandidate -ErrorAction Stop).Path
+        if (-not (Test-CoremailPathChainSafe -Path $packageRoot)) { return $null }
         $packagePath = Join-Path $packageRoot 'package.json'
+        if (-not (Test-CoremailPathChainSafe -Path $packagePath)) { return $null }
         $package = Get-Content -LiteralPath $packagePath -Raw -ErrorAction Stop |
             ConvertFrom-Json -ErrorAction Stop
         if ([string]$package.name -ne '@anthropic-ai/claude-code') {
@@ -81,6 +155,7 @@ function Resolve-NpmClaudeInvocation {
         ) -or -not (Test-Path -LiteralPath $cliPath -PathType Leaf)) {
             return $null
         }
+        if (-not (Test-CoremailPathChainSafe -Path $cliPath)) { return $null }
 
         $cliItem = Get-Item -LiteralPath $cliPath -Force -ErrorAction Stop
         if (($cliItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
@@ -91,7 +166,7 @@ function Resolve-NpmClaudeInvocation {
             # Current npm releases replace their declared bin/claude.exe stub
             # with the platform-native PE during postinstall. Execute that
             # declared binary directly; passing it to node.exe is incorrect.
-            if (-not (Test-CoremailPortableExecutable -Path $cliPath)) { return $null }
+            if (-not (Test-CoremailNativeCliExecutable -Path $cliPath)) { return $null }
             return [pscustomobject]@{
                 CommandPath = $resolvedCommand
                 Executable = $cliPath
@@ -111,7 +186,9 @@ function Resolve-NpmClaudeInvocation {
             if ([string]::IsNullOrWhiteSpace($nodeCandidate) -or
                 -not (Test-Path -LiteralPath $nodeCandidate -PathType Leaf)) { continue }
             $resolvedNode = (Resolve-Path -LiteralPath $nodeCandidate -ErrorAction Stop).Path
-            if ([IO.Path]::GetExtension($resolvedNode) -ine '.exe') { continue }
+            if (-not (Test-CoremailPathChainSafe -Path $resolvedNode)) { continue }
+            if ([IO.Path]::GetExtension($resolvedNode) -ine '.exe' -or
+                -not (Test-CoremailNativeCliExecutable -Path $resolvedNode)) { continue }
             return [pscustomobject]@{
                 CommandPath = $resolvedCommand
                 Executable = $resolvedNode
@@ -151,10 +228,15 @@ function Resolve-ClaudeCodeInvocation {
     foreach ($candidate in $candidates) {
         if ([string]::IsNullOrWhiteSpace($candidate) -or
             -not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        if (-not (Test-CoremailPathChainSafe -Path $candidate)) { continue }
         try { $resolvedCandidate = (Resolve-Path -LiteralPath $candidate -ErrorAction Stop).Path }
         catch { continue }
+        if (-not (Test-CoremailPathChainSafe -Path $resolvedCandidate)) { continue }
         $extension = [IO.Path]::GetExtension($resolvedCandidate)
         if ($extension -ieq '.exe') {
+            if (-not (Test-CoremailNativeCliExecutable -Path $resolvedCandidate)) {
+                continue
+            }
             return [pscustomobject]@{
                 CommandPath = $resolvedCandidate
                 Executable = $resolvedCandidate
@@ -165,37 +247,6 @@ function Resolve-ClaudeCodeInvocation {
         if ($extension -ieq '.cmd') {
             $npmInvocation = Resolve-NpmClaudeInvocation -CommandPath $resolvedCandidate
             if ($null -ne $npmInvocation) { return $npmInvocation }
-        }
-    }
-    return $null
-}
-
-function Resolve-CoremailPythonCandidate {
-    [CmdletBinding()]
-    param([string]$ExplicitPath = '')
-
-    if (-not [string]::IsNullOrWhiteSpace($ExplicitPath)) {
-        $candidate = Get-Command $ExplicitPath -ErrorAction SilentlyContinue
-        if ($null -eq $candidate) { return $null }
-        return [pscustomobject]@{
-            Executable = if ($candidate.Source) { $candidate.Source } else { $candidate.Path }
-            Prefix = [string[]]@()
-        }
-    }
-    $launcher = Get-Command 'py.exe' -CommandType Application -ErrorAction SilentlyContinue
-    if ($null -ne $launcher) {
-        return [pscustomobject]@{
-            Executable = if ($launcher.Source) { $launcher.Source } else { $launcher.Path }
-            Prefix = [string[]]@('-3')
-        }
-    }
-    foreach ($name in @('python.exe', 'python3.exe')) {
-        $candidate = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue
-        if ($null -ne $candidate) {
-            return [pscustomobject]@{
-                Executable = if ($candidate.Source) { $candidate.Source } else { $candidate.Path }
-                Prefix = [string[]]@()
-            }
         }
     }
     return $null
