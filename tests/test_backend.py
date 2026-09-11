@@ -6,6 +6,8 @@ import sys
 import tempfile
 import unittest
 from dataclasses import replace
+from email import policy
+from email.parser import BytesParser
 from pathlib import Path
 from unittest.mock import patch
 
@@ -24,6 +26,11 @@ from coremail_backend import (  # noqa: E402
     Settings,
     StaleMessageError,
     build_email,
+    fetch_raw_chunk_with_client,
+    search_messages_with_client,
+    set_flags_with_client,
+    copy_or_move_with_client,
+    manage_folder_with_client,
     imap_utf7_decode,
     imap_utf7_encode,
     load_settings,
@@ -31,6 +38,7 @@ from coremail_backend import (  # noqa: E402
     parse_message,
     prepare_message,
     select_folder,
+    _smtp_authenticate,
 )
 from local_discovery import discover_local  # noqa: E402
 
@@ -183,6 +191,20 @@ class SettingsTests(unittest.TestCase):
             )
             with self.assertRaises(ConfigError):
                 load_settings(path, environ={})
+
+    def test_loads_oauth_auth_method_and_download_directory_without_secret(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            path = directory / "config.json"
+            path.write_text(json.dumps({
+                "schema_version": 1, "provider": "coremail", "username": "sender@example.com",
+                "auth_method": "xoauth2", "download_directory": "downloads",
+                "imap": {"host": "imap.example.com", "port": 993, "security": "ssl"},
+                "smtp": {"host": "smtp.example.com", "port": 465, "security": "ssl"},
+            }), encoding="utf-8")
+            loaded = load_settings(path, environ={})
+            self.assertEqual(loaded.auth_method, "xoauth2")
+            self.assertEqual(loaded.download_directory, (directory / "downloads").resolve())
 
     def test_rejects_non_integer_json_limits_and_ports(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
@@ -377,8 +399,103 @@ class MailEncodingTests(unittest.TestCase):
         self.assertEqual(parsed["attachments"][0]["filename"], "test.bin")
         self.assertTrue(parsed["content_is_untrusted"])
 
+    def test_parse_exposes_both_mime_body_variants_and_skips_html_attachment(self) -> None:
+        raw = (
+            b"From: sender@example.com\r\n"
+            b"Subject: Formats\r\n"
+            b"MIME-Version: 1.0\r\n"
+            b"Content-Type: multipart/alternative; boundary=x\r\n\r\n"
+            b"--x\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n"
+            b"Plain version\r\n"
+            b"--x\r\nContent-Type: text/html; charset=utf-8\r\n\r\n"
+            b"<p>HTML <strong>version</strong></p>\r\n"
+            b"--x\r\nContent-Type: text/html; charset=utf-8\r\n"
+            b"Content-Disposition: attachment; filename=fragment.html\r\n\r\n"
+            b"<p>Attached fragment</p>\r\n"
+            b"--x--\r\n"
+        )
+        parsed = parse_message(raw, 1000)
+        self.assertIn("Plain version", parsed["body_text"])
+        self.assertIn("<p>HTML <strong>version</strong></p>", parsed["body_html"])
+        self.assertNotIn("Attached fragment", parsed["body_html"])
+        self.assertFalse(parsed["body_html_truncated"])
+
+    def test_parse_body_variants_have_independent_limits(self) -> None:
+        raw = (
+            b"MIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=x\r\n\r\n"
+            b"--x\r\nContent-Type: text/plain\r\n\r\n0123456789\r\n"
+            b"--x\r\nContent-Type: text/html\r\n\r\n<strong>0123456789</strong>\r\n"
+            b"--x--\r\n"
+        )
+        parsed = parse_message(raw, 5)
+        self.assertEqual(parsed["body_text"], "01234")
+        self.assertEqual(parsed["body_html"], "<stro")
+        self.assertTrue(parsed["body_text_truncated"])
+        self.assertTrue(parsed["body_html_truncated"])
+
+    def test_parse_preserves_calendar_body_and_mime_tree(self) -> None:
+        raw = (
+            b"MIME-Version: 1.0\r\nContent-Type: text/calendar; method=REQUEST\r\n\r\n"
+            b"BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nEND:VCALENDAR\r\n"
+        )
+        parsed = parse_message(raw, 1000)
+        self.assertIn("METHOD:REQUEST", parsed["body_calendar"])
+        self.assertTrue(any(part["content_type"] == "text/calendar" for part in parsed["mime_parts"]))
+
 
 class PreparedMessageTests(unittest.TestCase):
+    def test_build_email_preserves_html_only_and_multipart_alternative(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            settings = settings_for(Path(raw_directory))
+            cases = (
+                ({"body_html": "<p>Only HTML</p>"}, ("text/html",)),
+                (
+                    {"body_text": "纯文本", "body_html": "<p>富文本 ✓</p>"},
+                    ("text/plain", "text/html"),
+                ),
+            )
+            for values, expected_formats in cases:
+                with self.subTest(values=values):
+                    prepared = prepare_message(
+                        settings,
+                        {"to": ["recipient@example.com"], **values},
+                    )
+                    self.assertEqual(prepared.body_formats, expected_formats)
+                    parsed = BytesParser(policy=policy.default).parsebytes(
+                        build_email(prepared).as_bytes(policy=policy.SMTP)
+                    )
+                    self.assertEqual(
+                        [part.get_content_type() for part in parsed.walk() if not part.is_multipart()],
+                        list(expected_formats),
+                    )
+                    self.assertEqual(prepared.summary(settings)["body_html"], values.get("body_html"))
+
+    def test_prepare_supports_reply_to_calendar_and_inline_related_part(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            image = directory / "logo.png"
+            image.write_bytes(b"png-data")
+            settings = settings_for(directory)
+            message = prepare_message(settings, {
+                "to": ["recipient@example.com"],
+                "reply_to": ["Replies <reply@example.com>"],
+                "body_text": "Plain",
+                "body_html": '<img src="cid:logo">',
+                "body_calendar": "BEGIN:VCALENDAR\r\nEND:VCALENDAR",
+                "attachments": [{"path": str(image), "disposition": "inline", "content_id": "logo"}],
+            })
+            parsed = BytesParser(policy=policy.default).parsebytes(build_email(message).as_bytes())
+            self.assertEqual(parsed["Reply-To"], "Replies <reply@example.com>")
+            self.assertIn("text/calendar", [part.get_content_type() for part in parsed.walk()])
+            self.assertTrue(any(part.get("Content-ID") == "<logo>" and part.get_content_disposition() == "inline" for part in parsed.walk()))
+    def test_simple_mapi_rejects_html_before_creating_a_prepared_token(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            with self.assertRaisesRegex(CoremailError, "supports text/plain only"):
+                prepare_message(
+                    mapi_settings_for(Path(raw_directory)),
+                    {"to": ["recipient@example.com"], "body_html": "<p>Rich</p>"},
+                )
+
     def test_attachment_outside_authorized_root_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root, tempfile.TemporaryDirectory() as raw_outside:
             root = Path(raw_root)
@@ -559,6 +676,82 @@ class ImapIdentityTests(unittest.TestCase):
     def test_folder_control_characters_are_rejected_before_imap(self) -> None:
         with self.assertRaisesRegex(CoremailError, "control character"):
             select_folder(self.FakeImap(), "INBOX\r\nUID SEARCH ALL", readonly=True)
+
+    class CapabilityImap(FakeImap):
+        capabilities = (b"IMAP4rev1", b"UIDPLUS", b"MOVE")
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        def uid(self, command: str, *args):
+            self.calls.append((command, args))
+            if command == "SEARCH":
+                return "OK", [b"1 2 3"]
+            if command == "FETCH" and "HEADER.FIELDS" in str(args):
+                return "OK", [(b"* 3 FETCH (UID 3 FLAGS (\\Seen) RFC822.SIZE 4)", b"Subject: test\\r\\n\\r\\n")]
+            if command == "FETCH" and "RFC822.SIZE" in str(args):
+                return "OK", [(b"* 3 FETCH (RFC822.SIZE 4)", None)]
+            if command == "FETCH":
+                return "OK", [(b"* 3 FETCH (BODY[]<0> {4})", b"test")]
+            return "OK", [b"done"]
+
+        def store(self, *args):
+            return "OK", [b"done"]
+
+        def create(self, *args):
+            return "OK", [b"done"]
+
+    def test_search_supports_header_or_and_cursor_primitives(self) -> None:
+        client = self.CapabilityImap()
+        result = search_messages_with_client(client, folder="INBOX", query={"or": [{"from": "a"}, {"header": {"name": "X-Test", "value": "v"}}]}, limit=2)
+        self.assertEqual(result["snapshot_uid"], 3)
+        self.assertTrue(any(call[0] == "SEARCH" for call in client.calls))
+
+    def test_search_or_preserves_all_branches(self) -> None:
+        client = self.CapabilityImap()
+        search_messages_with_client(
+            client,
+            folder="INBOX",
+            query={"or": [{"from": "a"}, {"subject": "b"}, {"text": "c"}]},
+            limit=2,
+        )
+        search_call = next(call for call in client.calls if call[0] == "SEARCH")
+        rendered = " ".join(str(item) for item in search_call[1])
+        self.assertGreaterEqual(rendered.count("OR"), 2)
+        self.assertIn('FROM "a"', rendered)
+        self.assertIn('SUBJECT "b"', rendered)
+        self.assertIn('TEXT "c"', rendered)
+
+    def test_smtp_auth_callbacks_support_initial_response_without_challenge(self) -> None:
+        class FakeSmtp:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def auth(self, mechanism, authobject):
+                self.calls.append((mechanism, authobject()))
+                self.calls.append((mechanism, authobject(b"challenge")))
+
+        client = FakeSmtp()
+        _smtp_authenticate(
+            client,
+            replace(settings_for(Path(".")), auth_method="xoauth2"),
+            "access-token",
+        )
+        self.assertEqual(client.calls[0][0], "XOAUTH2")
+        self.assertIn("auth=Bearer access-token", client.calls[0][1])
+        self.assertEqual(client.calls[1][1], "")
+
+    def test_flags_and_raw_chunks_are_bounded(self) -> None:
+        client = self.CapabilityImap()
+        flags = set_flags_with_client(client, folder="INBOX", uid="3", expected_uidvalidity="42", add=["\\Flagged", "Project"], remove=[])
+        self.assertEqual(flags["added"], ["\\Flagged", "Project"])
+        raw = fetch_raw_chunk_with_client(client, folder="INBOX", uid="3", expected_uidvalidity="42", offset=0, length=4)
+        self.assertEqual(raw["data_base64"], "dGVzdA==")
+
+    def test_folder_management_rejects_nonempty_delete_without_override(self) -> None:
+        client = self.CapabilityImap()
+        with self.assertRaisesRegex(CoremailError, "not empty"):
+            manage_folder_with_client(client, action="delete", folder="Archive")
 
 
 class LocalDiscoveryTests(unittest.TestCase):

@@ -111,10 +111,15 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(responses[0]["result"]["serverInfo"]["version"], "0.9.0")
         self.assertIn("确认发送", responses[0]["result"]["instructions"])
         names = {tool["name"] for tool in responses[1]["result"]["tools"]}
-        self.assertEqual(len(names), 13)
+        self.assertEqual(len(names), 22)
         self.assertIn("mail_discover_local", names)
         self.assertIn("mail_send_prepared", names)
         self.assertFalse(any("click" in name or "screenshot" in name or "window" in name for name in names))
+        tools_by_name = {tool["name"]: tool for tool in responses[1]["result"]["tools"]}
+        prepare_schema = tools_by_name["mail_prepare_message"]["inputSchema"]
+        self.assertEqual(prepare_schema["properties"]["body_html"]["type"], "string")
+        self.assertEqual(prepare_schema["properties"]["body_html"]["maxLength"], 500000)
+        self.assertIn("text/html", tools_by_name["mail_get_message"]["description"])
         status = json.loads(responses[2]["result"]["content"][0]["text"])
         self.assertFalse(status["mail_client_interface_selected"])
         self.assertFalse(status["mail_client_interface_used"])

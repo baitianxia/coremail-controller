@@ -1,6 +1,6 @@
 # 邮件助手架构与运行手册
 
-状态：当前规范。版本：0.9.0。最后更新：2026-09-08。
+状态：当前规范。版本：0.9.0（含未发布变更）。最后更新：2026-09-11。
 
 ## 身份和边界
 
@@ -13,8 +13,8 @@
 
 1. `windows_simple_mapi`：识别默认 Windows 邮件 provider，并以空 profile、空密码、零 UI
    标志附着到已有共享会话；
-2. `imap_smtp`：用户配置的 IMAP/SMTP，经证书校验的 TLS 连接，密码保存在 Windows
-   Credential Manager。
+2. `imap_smtp`：用户配置的 IMAP/SMTP，经证书校验的 TLS 连接；凭据（密码或 OAuth
+   access token）保存在 Windows Credential Manager，`auth_method` 选择协议认证机制。
 
 `mcp/windows_mapi.py` 是 Coremail provider 适配器，`mcp/coremail_backend.py` 负责通用邮件
 模型和安全边界。换 provider 不应改变 MCP 工具名称、确认流程或用户目录契约。
@@ -36,8 +36,17 @@ mail_list_folders        文件夹列表
 mail_search              结构化搜索
 mail_get_message         按 folder/UID/UIDVALIDITY 读取
 mail_set_seen            显式已读/未读变更
+mail_set_flags           设置系统标志和关键字
+mail_copy_message        复制邮件
+mail_move_message        移动邮件
+mail_delete_message      可恢复标记删除或 UIDPLUS 永久删除
+mail_manage_folder       创建、重命名、删除、订阅文件夹
+mail_get_raw_message     分段读取原始 RFC 822
+mail_download_attachment 下载 MIME 附件
+mail_update_draft        追加新版本并标记旧草稿删除
+mail_watch_folder        有界文件夹变更等待
 mail_prepare_message     冻结邮件和附件哈希
-mail_save_draft          保存 IMAP/SMTP 草稿
+mail_save_draft          保存 IMAP 草稿或调用 provider 的 MAPISaveMail
 mail_send_prepared       精确确认后发送
 ```
 
@@ -51,6 +60,72 @@ provider 可能忽略 Simple MAPI 的 PEEK 请求，因此结果会带限制说�
 令牌还绑定准备时的非秘密配置指纹；传输、账户、端点或发送策略发生变化时，发送和存草稿
 都会保留令牌并要求重新准备。网络结果不确定时不自动重试。
 
+### 邮件正文格式
+
+MCP 应保留当前传输支持的邮件格式能力。正文格式由显式字段决定，不根据正文中是否出现
+HTML 标签猜测，也不静默把 HTML 降级成纯文本。
+
+- `mail_prepare_message` 接受可选的 `body_text` 和 `body_html` 字符串，每个字段最多
+  500000 字符；显式传入 `null` 或其他非字符串类型会报错。未传 `body_html` 时维持原有
+  纯文本行为（允许空正文）；传入 `body_html` 且 `body_text` 为空或未传时生成 `text/html`；
+  同时提供非空 `body_text` 时生成 `multipart/alternative`，顺序为纯文本、HTML。
+- HTML 原文与纯文本一起冻结到准备令牌中，不清洗、改写或自动生成另一版本。准备摘要包含
+  `body_formats`、完整 `body_text`、`body_html` 和各自字符数，供客户端复核两种正文。
+  原有 `body_character_count` 继续表示纯文本长度，新增 `body_html_character_count` 表示
+  HTML 长度；格式或任一正文变化均必须重新准备。摘要仍是不可信数据。
+- IMAP 草稿、SMTP 发送和 IMAP 已发送副本使用同一 MIME 构造逻辑；普通附件置于外层
+  `multipart/mixed`，inline 资源置于 HTML 的 `multipart/related`，不把 HTML 当作附件或纯文本发送。沿用现有收件人、线程头、附件哈希、
+  精确确认和失败不重试的事务规则。
+- `mail_get_message` 保留原有 `body`、`body_source`、`body_truncated` 纯文本预览语义，
+  并返回 MIME 解码后的 `body_text` 和 `body_html`；不存在的格式为 `null`。非附件的同类
+  正文分段按 MIME 顺序合并，纯文本以两个换行、HTML 以一个换行连接；不剥离 HTML 标记、
+  样式或链接。附件及其嵌套内容不作为当前正文，附件大小无法直接解码时返回 `null`。
+- `max_body_chars` 分别限制预览、原始纯文本和 HTML。新字段截取原文前 N 个字符，不追加
+  省略号或补齐标签；`body_text_truncated`、`body_html_truncated` 分别标明是否截断。
+  原有 `body` 仍可在截断后追加省略号。截断的 HTML 不代表完整文档。
+- HTML 仅作为 JSON 字符串数据传递。服务不渲染或执行 HTML，不加载远程图片、样式或链接，
+  不把邮件内容交给浏览器服务；`content_is_untrusted` 始终为 `true`。
+
+`mail_connection_status` 和 `mail_check_connection` 的 `capabilities.read_body_formats` /
+`send_body_formats` 报告适配器的正文格式能力：IMAP/SMTP 为 `text/plain`、`text/html`、`text/calendar`；
+当前 Simple MAPI 适配器只有 `text/plain`。Simple MAPI 的 `MapiMessage` / `MapiMessageW`
+只提供 note text，没有标准 MIME 正文格式字段，不能据此承诺保留 HTML。其读取结果返回
+`body_html: null` 和 `body_html_unavailable_reason`；带 `body_html` 的准备请求会在创建令牌
+前被拒绝，发送入口也会在消费令牌前检查，提示配置 `imap_smtp`，不自动切换传输。
+
+格式实现依据 Python 的 [EmailMessage MIME 接口](https://docs.python.org/3.13/library/email.message.html)，
+Simple MAPI 边界依据 Microsoft 的 [MapiMessageW 合同](https://learn.microsoft.com/en-us/windows/win32/api/mapi/ns-mapi-mapimessagew)。
+验收需覆盖纯文本兼容、纯 HTML、双版本、中文编码、附件隔离、独立截断、准备快照、确认与
+令牌保护，以及草稿／发送／已发送副本的 MIME 内容一致性。离线替身测试不等同于真实邮箱或
+Windows provider 验收。
+
+### 能力边界与实现来源
+
+以下是 2026-09-11 的源码盘点。IMAP/SMTP 工具已暴露协议允许且本项目能安全约束的能力；
+目标服务器仍可能不支持某个扩展，工具会返回明确错误或降级结果。
+
+| 能力 | 当前行为与证据 | 限制来源 |
+| --- | --- | --- |
+| 收件附件获取 | IMAP 按 MIME part 下载并可安全保存；Simple MAPI 仅在明确请求时临时读取附件 | Simple MAPI provider 可能不返回文件或拒绝附件；所有结果仍按不可信数据处理 |
+| CID 内嵌资源 | `attachments` 对象支持 `inline`、`content_id` 和 `content_type`，HTML 生成 `multipart/related` | Simple MAPI 不支持 MIME 相关结构 |
+| 邮件头和原始内容 | 支持 `Reply-To`、`text/calendar`、MIME 树和分段原始 RFC 822；下载工具返回 base64 | 原始读取仍受单次分段上限和 IMAP 服务器实现约束 |
+| 搜索与分页 | 支持 OR、NOT、HEADER、大小、UID 范围、关键字和签名游标；游标绑定 folder/query/UIDVALIDITY 快照 | 服务器 SEARCH 扩展和复杂表达式语法可能拒绝查询 |
+| 邮件标志 | `mail_set_flags` 设置系统标志和关键字，操作前校验值并保持 UIDVALIDITY | 服务器 `PERMANENTFLAGS` 仍可能拒绝某个关键字 |
+| 邮件与文件夹管理 | 支持复制、MOVE 或可报告的 COPY+Deleted 降级、标记删除、UIDPLUS 永久删除及文件夹管理 | 永久删除要求 UIDPLUS；降级移动会返回清理状态，不自动重试 |
+| 草稿编辑 | 支持 IMAP 追加新草稿后标记旧草稿删除，并可用原文 SHA-256 防止覆盖；Simple MAPI 使用可选 MAPISaveMail | Simple MAPI provider 不保证草稿文件夹；旧草稿清理失败会显式报告 |
+| 持续更新与认证 | 支持 password/PLAIN/XOAUTH2/OAUTHBEARER 配置；`mail_watch_folder` 使用有界 RFC 2177 IDLE，服务器没有 IDLE 时回退 NOOP 轮询 | 这是一次性最多 30 秒等待，不是后台长期订阅；OAuth token 由 Credential Manager 外部维护 |
+
+协议依据：[IMAP 命令、标志与 MIME 分段获取](https://www.rfc-editor.org/rfc/rfc9051.html)、
+[multipart/related](https://www.rfc-editor.org/rfc/rfc2387.html)、
+[Reply-To 邮件头](https://www.rfc-editor.org/rfc/rfc5322.html#section-3.6.2)、
+[MAPIReadMail 附件标志](https://learn.microsoft.com/en-us/windows/win32/api/mapi/nc-mapi-mapireadmail)、
+[MAPISaveMail](https://learn.microsoft.com/en-us/windows/win32/api/mapi/nc-mapi-mapisavemail)。
+
+TLS 校验、授权发件人和附件根、发送复核、UIDVALIDITY、资源上限属于独立的安全和可靠性
+约束；补充协议能力时应保留这些约束。读取截断和每页上限可有边界，但分段／分页接口允许取
+全结果。附件下载和邮箱写操作均有独立工具、UIDVALIDITY/哈希保护及明确的状态结果；技能中的
+“禁止下载附件”旧规则已改为用户明确请求后才允许的受限下载规则。
+
 ## 配置和用户状态
 
 唯一配置文件为：
@@ -62,6 +137,9 @@ provider 可能忽略 Simple MAPI 的 PEEK 请求，因此结果会带限制说�
 配置根必须有 `schema_version: 1` 和 `provider: "coremail"`。`mail_configure` 只接受白名单
 非秘密字段，拒绝 `password`、URL 中的凭据和未知字段；写入前用独立暂存文件调用同一解析器
 校验，再以同卷替换发布，并尽力设置当前用户可读权限。`mail_config_reload` 清除进程缓存。
+`auth_method` 可为 `password`、`plain`、`xoauth2` 或 `oauthbearer`；OAuth token 不进入 MCP
+参数，由用户在 Credential Manager 中维护。`download_directory` 仅定义用户明确下载附件时的
+落盘目录，服务拒绝覆盖既有文件。
 
 所有持久状态都在本工程目录：
 
@@ -72,6 +150,7 @@ provider 可能忽略 Simple MAPI 的 PEEK 请求，因此结果会带限制说�
   staging\<transaction>\
   rollback\<configuration-backup>\
   logs\
+  downloads\              # optional configured download_directory
   .lifecycle.lock
 ```
 

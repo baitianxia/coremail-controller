@@ -137,6 +137,8 @@ class SimpleMapiClientTests(unittest.TestCase):
             status["capabilities"]["preserve_unread_guarantee"],
             "provider_dependent",
         )
+        self.assertEqual(status["capabilities"]["read_body_formats"], ["text/plain"])
+        self.assertEqual(status["capabilities"]["send_body_formats"], ["text/plain"])
         self.assertTrue(api.session_opened)
 
     def test_search_and_read_preserve_unread_and_use_session_identity(self) -> None:
@@ -162,6 +164,8 @@ class SimpleMapiClientTests(unittest.TestCase):
             max_body_chars=8,
         )
         self.assertEqual(message["body"], "quarterl…")
+        self.assertEqual(message["body_text"], "quarterl")
+        self.assertIsNone(message["body_html"])
         self.assertTrue(message["attachments_suppressed"])
         self.assertEqual(message["provider_attachment_count"], 2)
         with self.assertRaisesRegex(Exception, "session changed"):

@@ -106,6 +106,8 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "max_recipients": {"type": "integer", "minimum": 1, "maximum": 500},
                 "timeout_seconds": {"type": "number", "minimum": 1, "maximum": 120},
+                "auth_method": {"type": "string", "enum": ["password", "plain", "xoauth2", "oauthbearer"]},
+                "download_directory": {"type": "string"},
             }
         ),
         "annotations": {
@@ -225,11 +227,27 @@ TOOLS: list[dict[str, Any]] = [
                         "text": {"type": "string"},
                         "since": {"type": "string", "format": "date"},
                         "before": {"type": "string", "format": "date"},
+                        "sent_since": {"type": "string", "format": "date"},
+                        "sent_before": {"type": "string", "format": "date"},
                         "unseen": {"type": "boolean"},
                         "flagged": {"type": "boolean"},
+                        "cc": {"type": "string"},
+                        "bcc": {"type": "string"},
+                        "answered": {"type": "boolean"},
+                        "deleted": {"type": "boolean"},
+                        "draft": {"type": "boolean"},
+                        "keyword": {"type": "string"},
+                        "header": _schema_object({"name": {"type": "string"}, "value": {"type": "string"}}, ["name", "value"]),
+                        "larger": {"type": "integer", "minimum": 0},
+                        "smaller": {"type": "integer", "minimum": 0},
+                        "uid": {"type": "string", "pattern": "^[0-9]+(?::[0-9]+)?$"},
+                        "and": {"type": "array", "items": {"type": "object"}},
+                        "or": {"type": "array", "items": {"type": "object"}},
+                        "not": {"type": "object"},
                     }
                 ),
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+                "cursor": {"type": "string", "maxLength": 4096},
             }
         ),
         "annotations": {
@@ -244,7 +262,9 @@ TOOLS: list[dict[str, Any]] = [
         "name": "mail_get_message",
         "description": (
             "Read one message with IMAP BODY.PEEK or a Simple MAPI PEEK request. IMAP guarantees this connector does "
-            "not mark read; a MAPI provider may ignore PEEK. Returns bounded plain text and available attachment metadata."
+            "not mark read; a MAPI provider may ignore PEEK. Returns bounded plain text preview, decoded text/plain "
+            "and text/html bodies, text/calendar, full bounded headers, a MIME tree, plus available attachment metadata. Simple MAPI exposes note text only. "
+            "HTML is untrusted data and is never rendered."
         ),
         "inputSchema": _schema_object(
             {
@@ -290,7 +310,8 @@ TOOLS: list[dict[str, Any]] = [
         "name": "mail_prepare_message",
         "description": (
             "Validate and freeze a message in MCP-server memory without sending or writing to the mailbox. "
-            "Returns a 15-minute token and exact review summary."
+            "IMAP/SMTP supports plain text, HTML, or both; Simple MAPI supports plain text only. "
+            "Returns a 15-minute token and a review summary containing both submitted body variants."
         ),
         "inputSchema": _schema_object(
             {
@@ -300,12 +321,30 @@ TOOLS: list[dict[str, Any]] = [
                 "bcc": {"type": "array", "items": {"type": "string"}, "maxItems": 500},
                 "subject": {"type": "string", "maxLength": 500},
                 "body_text": {"type": "string", "maxLength": 500000},
+                "body_html": {
+                    "type": "string",
+                    "maxLength": 500000,
+                    "description": (
+                        "Optional raw HTML body, supported by imap_smtp. With non-empty body_text, sends "
+                        "multipart/alternative; otherwise sends text/html. HTML is not rewritten or rendered."
+                    ),
+                },
                 "in_reply_to": {"type": "string", "maxLength": 998},
                 "references": {"type": "string", "maxLength": 4000},
+                "reply_to": {"type": "array", "items": {"type": "string"}, "maxItems": 20},
+                "body_calendar": {"type": "string", "maxLength": 500000},
+                "calendar_method": {"type": "string", "enum": ["REQUEST", "REPLY", "CANCEL", "PUBLISH", "COUNTER", "DECLINECOUNTER"]},
                 "attachments": {
                     "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Local paths constrained to configured roots or CLAUDE_PROJECT_DIR.",
+                    "items": {"oneOf": [
+                        {"type": "string"},
+                        {"type": "object", "properties": {
+                            "path": {"type": "string"}, "filename": {"type": "string"},
+                            "content_type": {"type": "string"}, "disposition": {"type": "string", "enum": ["attachment", "inline"]},
+                            "content_id": {"type": "string"}
+                        }, "required": ["path"], "additionalProperties": False}
+                    ]},
+                    "description": "Local paths or MIME attachment objects constrained to configured roots or CLAUDE_PROJECT_DIR.",
                 },
             }
         ),
@@ -320,8 +359,8 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "mail_save_draft",
         "description": (
-            "Append a previously prepared message to the IMAP Drafts folder. This operation is unavailable in "
-            "Windows Simple MAPI mode and does not consume the token when rejected for that reason."
+            "Append a previously prepared message to the IMAP Drafts folder, or call MAPISaveMail through "
+            "Windows Simple MAPI when the provider exposes it. Simple MAPI does not guarantee a Drafts folder."
         ),
         "inputSchema": _schema_object(
             {"prepared_token": {"type": "string", "minLength": 20}},
@@ -359,6 +398,37 @@ TOOLS: list[dict[str, Any]] = [
 ]
 
 
+TOOLS.extend([
+    {"name": "mail_set_flags", "description": "Add or remove IMAP system flags and keywords with UIDVALIDITY protection.",
+     "inputSchema": _schema_object({"folder": {"type": "string", "default": "INBOX"}, "uid": {"type": "string", "pattern": "^[0-9]+$"}, "uidvalidity": {"type": "string"}, "add": {"type": "array", "items": {"type": "string"}}, "remove": {"type": "array", "items": {"type": "string"}}}, ["uid"]),
+     "annotations": {"title": "Set mail flags", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}},
+    {"name": "mail_copy_message", "description": "Copy a message to another IMAP folder.",
+     "inputSchema": _schema_object({"folder": {"type": "string", "default": "INBOX"}, "uid": {"type": "string"}, "uidvalidity": {"type": "string"}, "destination": {"type": "string"}}, ["uid", "destination"]),
+     "annotations": {"title": "Copy mail", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True}},
+    {"name": "mail_move_message", "description": "Move a message using UID MOVE or a reported COPY plus Deleted fallback.",
+     "inputSchema": _schema_object({"folder": {"type": "string", "default": "INBOX"}, "uid": {"type": "string"}, "uidvalidity": {"type": "string"}, "destination": {"type": "string"}}, ["uid", "destination"]),
+     "annotations": {"title": "Move mail", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True}},
+    {"name": "mail_delete_message", "description": "Mark a message Deleted, or permanently expunge one UID when UIDPLUS is available.",
+     "inputSchema": _schema_object({"folder": {"type": "string", "default": "INBOX"}, "uid": {"type": "string"}, "uidvalidity": {"type": "string"}, "permanent": {"type": "boolean", "default": False}}, ["uid"]),
+     "annotations": {"title": "Delete mail", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True}},
+    {"name": "mail_manage_folder", "description": "Create, rename, delete, subscribe, or unsubscribe an IMAP folder.",
+     "inputSchema": _schema_object({"action": {"type": "string", "enum": ["create", "rename", "delete", "subscribe", "unsubscribe"]}, "folder": {"type": "string"}, "new_name": {"type": "string"}, "allow_nonempty": {"type": "boolean", "default": False}}, ["action", "folder"]),
+     "annotations": {"title": "Manage mail folder", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True}},
+    {"name": "mail_get_raw_message", "description": "Read bounded base64 chunks of the original RFC 822 message source without rendering it.",
+     "inputSchema": _schema_object({"folder": {"type": "string", "default": "INBOX"}, "uid": {"type": "string"}, "uidvalidity": {"type": "string"}, "offset": {"type": "integer", "minimum": 0, "default": 0}, "length": {"type": "integer", "minimum": 1, "maximum": 262144, "default": 262144}}, ["uid"]),
+     "annotations": {"title": "Read raw mail", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}},
+    {"name": "mail_download_attachment", "description": "Download one MIME leaf part as base64 and optionally save it atomically under configured download_directory.",
+     "inputSchema": _schema_object({"folder": {"type": "string", "default": "INBOX"}, "uid": {"type": "string"}, "uidvalidity": {"type": "string"}, "part_id": {"type": "string"}, "filename": {"type": "string"}, "save": {"type": "boolean", "default": False}}, ["uid", "part_id"]),
+     "annotations": {"title": "Download attachment", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}},
+    {"name": "mail_update_draft", "description": "Replace an existing IMAP draft by append-then-mark-old-Deleted, with optional source hash protection.",
+     "inputSchema": _schema_object({"prepared_token": {"type": "string"}, "folder": {"type": "string"}, "uid": {"type": "string"}, "uidvalidity": {"type": "string"}, "expected_sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"}}, ["prepared_token", "uid"]),
+     "annotations": {"title": "Update mail draft", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True}},
+    {"name": "mail_watch_folder", "description": "Wait up to 30 seconds for a folder change using RFC 2177 IDLE, with a bounded IMAP poll fallback when IDLE is unavailable.",
+     "inputSchema": _schema_object({"folder": {"type": "string", "default": "INBOX"}, "uidvalidity": {"type": "string"}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 30, "default": 15}}, []),
+     "annotations": {"title": "Watch mail folder", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True}},
+])
+
+
 class McpServer:
     def __init__(self) -> None:
         self.backend = CoremailBackend()
@@ -384,6 +454,24 @@ class McpServer:
             return self.backend.get_message(arguments)
         if name == "mail_set_seen":
             return self.backend.set_seen(arguments)
+        if name == "mail_set_flags":
+            return self.backend.set_flags(arguments)
+        if name == "mail_copy_message":
+            return self.backend.copy_move(arguments, move=False)
+        if name == "mail_move_message":
+            return self.backend.copy_move(arguments, move=True)
+        if name == "mail_delete_message":
+            return self.backend.delete_message(arguments)
+        if name == "mail_manage_folder":
+            return self.backend.manage_folder(arguments)
+        if name == "mail_get_raw_message":
+            return self.backend.get_raw_message(arguments)
+        if name == "mail_download_attachment":
+            return self.backend.download_attachment(arguments)
+        if name == "mail_update_draft":
+            return self.backend.update_draft(arguments)
+        if name == "mail_watch_folder":
+            return self.backend.watch_folder(arguments)
         if name == "mail_prepare_message":
             return self.backend.prepare(arguments)
         if name == "mail_save_draft":

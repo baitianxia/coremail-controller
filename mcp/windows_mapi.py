@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import ctypes
 import datetime as dt
+import base64
 import json
 import os
 import secrets
+import tempfile
 from dataclasses import dataclass
 from email.utils import formataddr
 from pathlib import Path
@@ -25,6 +27,7 @@ MAPI_PEEK = 0x00000080
 MAPI_GUARANTEE_FIFO = 0x00000100
 MAPI_SUPPRESS_ATTACH = 0x00000800
 MAPI_FORCE_UNICODE = 0x00040000
+MAPI_LONG_MSGID = 0x00004000
 MAPI_TO = 1
 MAPI_CC = 2
 MAPI_BCC = 3
@@ -194,6 +197,14 @@ class MapiMessageData:
     originator: MapiRecipient | None
     recipients: tuple[MapiRecipient, ...]
     attachment_count: int
+    attachments: tuple["MapiAttachmentData", ...] = ()
+
+
+@dataclass(frozen=True)
+class MapiAttachmentData:
+    filename: str
+    content_type: str | None
+    data: bytes
 
 
 class _MapiRecipDescA(ctypes.Structure):
@@ -377,10 +388,30 @@ class CtypesSimpleMapiApi:
                 ctypes.c_uint32,
             ]
             self._send_mail_w.restype = ctypes.c_uint32
+        try:
+            self._save_mail = self.library.MAPISaveMail
+            self._save_mail.argtypes = [ctypes.c_size_t, ctypes.c_size_t, ctypes.POINTER(_MapiMessageA), ctypes.c_uint32, ctypes.c_uint32, ctypes.c_char_p]
+            self._save_mail.restype = ctypes.c_uint32
+        except AttributeError:
+            self._save_mail = None
+        try:
+            self._delete_mail = self.library.MAPIDeleteMail
+            self._delete_mail.argtypes = [ctypes.c_size_t, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32]
+            self._delete_mail.restype = ctypes.c_uint32
+        except AttributeError:
+            self._delete_mail = None
 
     @property
     def unicode_send_available(self) -> bool:
         return self._send_mail_w is not None
+
+    @property
+    def draft_save_available(self) -> bool:
+        return self._save_mail is not None
+
+    @property
+    def delete_available(self) -> bool:
+        return self._delete_mail is not None
 
     def open_shared_session(self) -> int:
         session = ctypes.c_size_t()
@@ -425,9 +456,10 @@ class CtypesSimpleMapiApi:
         *,
         peek: bool,
         envelope_only: bool = False,
+        include_attachments: bool = False,
     ) -> MapiMessageData:
         pointer = ctypes.POINTER(_MapiMessageA)()
-        flags = MAPI_SUPPRESS_ATTACH
+        flags = 0 if include_attachments else MAPI_SUPPRESS_ATTACH
         if peek:
             flags |= MAPI_PEEK
         if envelope_only:
@@ -455,6 +487,36 @@ class CtypesSimpleMapiApi:
             recipients = tuple(_copy_recipient(value.lpRecips[index]) for index in range(int(value.nRecipCount)))
             originator = _copy_recipient(value.lpOriginator.contents) if value.lpOriginator else None
             utf8_message = int(value.ulReserved) == 65001
+            attachments: list[MapiAttachmentData] = []
+            if include_attachments:
+                if int(value.nFileCount) > 100:
+                    raise WindowsMapiError("Windows Simple MAPI returned too many attachments")
+                if int(value.nFileCount) and not value.lpFiles:
+                    raise WindowsMapiError("Windows Simple MAPI returned an invalid attachment array")
+                for index in range(int(value.nFileCount)):
+                    descriptor = value.lpFiles[index]
+                    path = _decode_ansi(descriptor.lpszPathName, utf8_first=utf8_message)
+                    filename = _decode_ansi(descriptor.lpszFileName, utf8_first=utf8_message) or Path(path).name
+                    if not path:
+                        raise WindowsMapiError("Windows Simple MAPI returned an attachment without a path")
+                    try:
+                        temporary_root = Path(tempfile.gettempdir()).resolve()
+                        resolved_path = Path(path).resolve()
+                        if resolved_path == temporary_root or temporary_root not in resolved_path.parents:
+                            raise WindowsMapiError("Windows Simple MAPI returned an attachment outside its temporary directory")
+                    except OSError as exc:
+                        raise WindowsMapiError("Windows Simple MAPI returned an invalid attachment path") from exc
+                    try:
+                        data = resolved_path.read_bytes()
+                    except OSError as exc:
+                        raise WindowsMapiError("Windows Simple MAPI attachment could not be read") from exc
+                    if len(data) > 100 * 1024 * 1024:
+                        raise WindowsMapiError("Windows Simple MAPI attachment exceeds the 100 MiB safety limit")
+                    attachments.append(MapiAttachmentData(filename=filename, content_type=None, data=data))
+                    try:
+                        resolved_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
             return MapiMessageData(
                 subject=_decode_ansi(value.lpszSubject, utf8_first=utf8_message),
                 body=_decode_ansi(value.lpszNoteText, utf8_first=utf8_message),
@@ -463,6 +525,7 @@ class CtypesSimpleMapiApi:
                 originator=originator,
                 recipients=recipients,
                 attachment_count=int(value.nFileCount),
+                attachments=tuple(attachments),
             )
         finally:
             self._free_buffer(pointer)
@@ -528,6 +591,50 @@ class CtypesSimpleMapiApi:
         result = int(self._send_mail_w(session, 0, ctypes.byref(message), MAPI_FORCE_UNICODE, 0))
         if result != 0:
             raise _mapi_error("message submission", result)
+
+    def save_draft(
+        self,
+        session: int,
+        *,
+        sender_address: str,
+        recipients: Sequence[tuple[int, str, str]],
+        subject: str,
+        body: str,
+        attachments: Sequence[tuple[str, str]],
+    ) -> str:
+        if self._save_mail is None:
+            raise WindowsMapiUnsupported("The registered Simple MAPI provider does not expose MAPISaveMail")
+        recipient_array_type = _MapiRecipDescA * len(recipients)
+        recipient_buffers: list[tuple[bytes, bytes]] = []
+        recipient_array = recipient_array_type()
+        for index, (recipient_class, name, address) in enumerate(recipients):
+            name_bytes, address_bytes = _encode_ansi(name), _encode_ansi(f"SMTP:{address}")
+            recipient_buffers.append((name_bytes, address_bytes))
+            recipient_array[index] = _MapiRecipDescA(0, recipient_class, name_bytes, address_bytes, 0, None)
+        file_array_type = _MapiFileDescA * len(attachments)
+        file_buffers: list[tuple[bytes, bytes]] = []
+        file_array = file_array_type()
+        for index, (path, filename) in enumerate(attachments):
+            path_bytes, filename_bytes = _encode_ansi(path), _encode_ansi(filename)
+            file_buffers.append((path_bytes, filename_bytes))
+            file_array[index] = _MapiFileDescA(0, 0, 0xFFFFFFFF, path_bytes, filename_bytes, None)
+        subject_bytes, body_bytes, sender_bytes = _encode_ansi(subject), _encode_ansi(body), _encode_ansi(sender_address)
+        originator = _MapiRecipDescA(0, 0, sender_bytes, sender_bytes, 0, None)
+        message = _MapiMessageA(0, subject_bytes, body_bytes, None, None, None, 0, ctypes.pointer(originator),
+                                 len(recipients), recipient_array if recipients else None, len(attachments),
+                                 file_array if attachments else None)
+        output = ctypes.create_string_buffer(MAPI_MESSAGE_ID_LENGTH)
+        result = int(self._save_mail(session, 0, ctypes.byref(message), MAPI_LONG_MSGID, 0, output))
+        if result != 0:
+            raise _mapi_error("draft save", result)
+        return _decode_ansi(output.value)
+
+    def delete_message(self, session: int, message_id: str) -> None:
+        if self._delete_mail is None:
+            raise WindowsMapiUnsupported("The registered Simple MAPI provider does not expose MAPIDeleteMail")
+        result = int(self._delete_mail(session, 0, _encode_ansi(message_id), 0, 0))
+        if result != 0:
+            raise _mapi_error("message deletion", result)
 
 
 def probe_coremail_shared_session(api: Any | None = None) -> dict[str, Any]:
@@ -668,13 +775,20 @@ class SimpleMapiClient:
             "ui_requested": False,
             "capabilities": {
                 "folders": ["INBOX"],
+                "read_body_formats": ["text/plain"],
+                "send_body_formats": ["text/plain"],
                 "preserve_unread_requested": True,
                 "preserve_unread_guarantee": "provider_dependent",
                 "mark_read": True,
                 "mark_unread": False,
-                "save_draft": False,
+                "save_draft": bool(getattr(self._api, "draft_save_available", False)),
+                "save_draft_folder_guarantee": False,
+                "delete_message": bool(getattr(self._api, "delete_available", False)),
                 "send": bool(self._api.unicode_send_available),
-                "incoming_attachments_materialized": False,
+                "incoming_attachments_materialized": True,
+                "incoming_attachments_note": "Attachments are copied to bounded in-memory bytes only when explicitly downloaded",
+                "raw_rfc822": False,
+                "mime_tree": False,
                 "threading_headers": False,
             },
         }
@@ -820,9 +934,19 @@ class SimpleMapiClient:
             **header,
             "bcc": _display_group(message.recipients, MAPI_BCC),
             "reply_to": "",
+            "headers": {"Subject": [message.subject]} if message.subject else {},
             "body": body,
             "body_source": "Windows Simple MAPI note text",
             "body_truncated": truncated,
+            "body_text": message.body[:max_body_chars],
+            "body_text_truncated": truncated,
+            "body_html": None,
+            "body_html_truncated": False,
+            "body_calendar": None,
+            "body_calendar_truncated": False,
+            "body_html_unavailable_reason": (
+                "Windows Simple MAPI exposes only MapiMessage note text; HTML MIME content is unavailable"
+            ),
             "attachments": [],
             "attachments_suppressed": True,
             "provider_attachment_count": message.attachment_count,
@@ -831,6 +955,33 @@ class SimpleMapiClient:
             "unread_state_note": (
                 "MAPI_PEEK was requested. A provider that does not implement this flag can still mark this message read."
             ),
+        }
+
+    def download_attachment(
+        self,
+        *,
+        folder: str,
+        uid: str,
+        expected_uidvalidity: str | None,
+        index: int,
+    ) -> dict[str, Any]:
+        _folder_inbox(folder)
+        if not isinstance(index, int) or index < 0 or index >= 100:
+            raise WindowsMapiError("attachment index must be between 0 and 99")
+        message_id = self._message_id_for(uid, expected_uidvalidity)
+        try:
+            message = self._api.read_message(self._require_session(), message_id, peek=True, include_attachments=True)
+        except TypeError as exc:
+            raise WindowsMapiUnsupported("The active Simple MAPI provider adapter cannot materialize attachments") from exc
+        attachments = getattr(message, "attachments", ())
+        if index >= len(attachments):
+            raise WindowsMapiError("Attachment index is not present in this message")
+        attachment = attachments[index]
+        return {
+            "folder": "INBOX", "uidvalidity": self._uidvalidity, "uid": uid, "part_id": str(index + 1),
+            "filename": attachment.filename, "content_type": attachment.content_type,
+            "size": len(attachment.data), "data_base64": base64.b64encode(attachment.data).decode("ascii"),
+            "transport": INTERFACE_NAME, "content_is_untrusted": True,
         }
 
     def set_seen(
@@ -843,7 +994,7 @@ class SimpleMapiClient:
     ) -> dict[str, Any]:
         _folder_inbox(folder)
         if not seen:
-            raise WindowsMapiUnsupported("Windows Simple MAPI cannot mark a message unread; use IMAP/SMTP mode")
+            raise WindowsMapiUnsupported("This Windows Simple MAPI adapter cannot mark a message unread; use IMAP/SMTP mode")
         message_id = self._message_id_for(uid, expected_uidvalidity)
         self._api.read_message(self._require_session(), message_id, peek=False)
         return {
@@ -890,6 +1041,37 @@ class SimpleMapiClient:
             "sent_copy": {"appended": False, "reason": "Sent-folder behavior is owned by the MAPI provider"},
             "sender_identity_note": "The active Simple MAPI provider controls the final submitting account.",
         }
+
+    def save_draft(
+        self,
+        *,
+        sender_address: str,
+        recipients: Sequence[tuple[int, str, str]],
+        subject: str,
+        body: str,
+        attachments: Sequence[tuple[str, str]],
+        message_id: str,
+    ) -> dict[str, Any]:
+        session = self._require_session()
+        if not bool(getattr(self._api, "draft_save_available", False)) or not hasattr(self._api, "save_draft"):
+            raise WindowsMapiUnsupported("The registered Simple MAPI provider does not expose draft saving")
+        provider_id = self._api.save_draft(session, sender_address=sender_address,
+                                           recipients=recipients, subject=subject, body=body, attachments=attachments)
+        return {"saved": True, "transport": INTERFACE_NAME, "message_id": message_id,
+                "provider_message_id": provider_id, "folder": None,
+                "folder_note": "MAPISaveMail does not guarantee which provider folder stores the draft"}
+
+    def delete_message(self, *, folder: str, uid: str, expected_uidvalidity: str | None, permanent: bool) -> dict[str, Any]:
+        _folder_inbox(folder)
+        if not permanent:
+            raise WindowsMapiUnsupported("Simple MAPI has no reversible Deleted flag; use permanent=true only when explicitly authorized")
+        message_id = self._message_id_for(uid, expected_uidvalidity)
+        session = self._require_session()
+        if not bool(getattr(self._api, "delete_available", False)) or not hasattr(self._api, "delete_message"):
+            raise WindowsMapiUnsupported("The registered Simple MAPI provider does not expose MAPIDeleteMail")
+        self._api.delete_message(session, message_id)
+        return {"deleted": True, "permanent": True, "transport": INTERFACE_NAME,
+                "uid": uid, "folder": "INBOX", "provider_note": "Simple MAPI deletion has no Trash guarantee"}
 
 
 def main() -> int:

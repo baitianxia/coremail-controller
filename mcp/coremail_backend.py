@@ -4,6 +4,7 @@ import base64
 import ctypes
 import datetime as dt
 import hashlib
+import hmac
 import html
 import imaplib
 import ipaddress
@@ -13,6 +14,7 @@ import mimetypes
 import os
 import re
 import secrets
+import socket
 import smtplib
 import ssl
 import tempfile
@@ -46,6 +48,7 @@ DISPLAY_NAME = "邮件助手"
 MCP_SERVER_NAME = "mail-mcp"
 CONFIG_SCHEMA_VERSION = 1
 CONFIG_PROVIDER = "coremail"
+AUTH_METHODS = {"password", "plain", "xoauth2", "oauthbearer"}
 DEFAULT_TOKEN_TTL_SECONDS = 15 * 60
 DEFAULT_MAX_MESSAGE_BYTES = 10 * 1024 * 1024
 DEFAULT_MAX_BODY_CHARS = 50_000
@@ -70,6 +73,8 @@ ROOT_CONFIG_FIELDS = {
     "max_attachment_bytes",
     "max_recipients",
     "timeout_seconds",
+    "auth_method",
+    "download_directory",
 }
 ENDPOINT_CONFIG_FIELDS = {"host", "port", "security"}
 _MISSING = object()
@@ -134,6 +139,8 @@ class Settings:
     # parsing still requires these fields explicitly.
     schema_version: int = CONFIG_SCHEMA_VERSION
     provider: str = CONFIG_PROVIDER
+    auth_method: str = "password"
+    download_directory: Path | None = None
 
     def public_summary(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -147,6 +154,9 @@ class Settings:
             "drafts_folder": self.drafts_folder,
             "sent_folder": self.sent_folder,
             "sent_copy_mode": self.sent_copy_mode,
+            "download_directory": str(self.download_directory) if self.download_directory else None,
+            "body_formats": list(self.body_formats),
+            "body_capabilities": self.body_capabilities(),
             "ca_file": str(self.ca_file) if self.ca_file else None,
             "attachment_roots": [str(path) for path in self.attachment_roots],
             "limits": {
@@ -157,6 +167,8 @@ class Settings:
                 "timeout_seconds": self.timeout_seconds,
             },
         }
+        if self.auth_method != "password":
+            result["auth_method"] = self.auth_method
         result["imap"] = (
             {"host": self.imap.host, "port": self.imap.port, "security": self.imap.security}
             if self.imap
@@ -168,6 +180,19 @@ class Settings:
             else None
         )
         return result
+
+    @property
+    def body_formats(self) -> tuple[str, ...]:
+        """MIME body formats this transport can preserve and submit."""
+        if self.transport == WINDOWS_MAPI_TRANSPORT:
+            return ("text/plain",)
+        return ("text/plain", "text/html")
+
+    def body_capabilities(self) -> dict[str, list[str]]:
+        formats = list(self.body_formats)
+        if self.transport != WINDOWS_MAPI_TRANSPORT:
+            formats.append("text/calendar")
+        return {"read_body_formats": formats, "send_body_formats": list(formats)}
 
 
 def _settings_fingerprint(settings: Settings) -> str:
@@ -204,6 +229,8 @@ def _settings_fingerprint(settings: Settings) -> str:
         "max_attachment_bytes": settings.max_attachment_bytes,
         "max_recipients": settings.max_recipients,
         "timeout_seconds": settings.timeout_seconds,
+        "auth_method": settings.auth_method,
+        "download_directory": str(settings.download_directory) if settings.download_directory else None,
     }
     encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("ascii")).hexdigest()
@@ -484,6 +511,26 @@ def load_settings(
     if transport == WINDOWS_MAPI_TRANSPORT and (drafts_folder is not None or sent_folder is not None):
         raise ConfigError(f"drafts_folder and sent_folder are not permitted for {WINDOWS_MAPI_TRANSPORT}")
 
+    auth_method = raw.get("auth_method", "password")
+    if not isinstance(auth_method, str) or auth_method.strip().lower() not in AUTH_METHODS:
+        raise ConfigError("auth_method must be one of password, plain, xoauth2, oauthbearer")
+    auth_method = auth_method.strip().lower()
+    if transport == WINDOWS_MAPI_TRANSPORT and auth_method != "password":
+        raise ConfigError(f"auth_method is not permitted for {WINDOWS_MAPI_TRANSPORT}")
+
+    download_directory_raw = raw.get("download_directory")
+    if download_directory_raw is not None and not isinstance(download_directory_raw, str):
+        raise ConfigError("download_directory must be a string path")
+    if transport == WINDOWS_MAPI_TRANSPORT and download_directory_raw is not None:
+        raise ConfigError(f"download_directory is not permitted for {WINDOWS_MAPI_TRANSPORT}")
+    download_directory = (
+        _expand_path(download_directory_raw, config_path.parent)
+        if isinstance(download_directory_raw, str) and download_directory_raw.strip()
+        else None
+    )
+    if download_directory is not None and download_directory.exists() and not download_directory.is_dir():
+        raise ConfigError(f"Configured download directory is not a directory: {download_directory}")
+
     timeout_raw = raw.get("timeout_seconds", _MISSING)
     if timeout_raw is _MISSING:
         timeout_seconds = 20.0
@@ -526,6 +573,8 @@ def load_settings(
         ),
         max_recipients=_positive_int(raw.get("max_recipients", _MISSING), "max_recipients", DEFAULT_MAX_RECIPIENTS, 500),
         timeout_seconds=timeout_seconds,
+        auth_method=auth_method,
+        download_directory=download_directory,
     )
 
 
@@ -597,6 +646,80 @@ def credential_available(settings: Settings) -> bool:
         return False
 
 
+def _imap_authenticate(client: imaplib.IMAP4, settings: Settings, secret: str) -> None:
+    """Authenticate without ever replaying a secret after a failed challenge."""
+    if settings.auth_method == "password":
+        status, _ = client.login(settings.username, secret)
+    elif settings.auth_method == "plain":
+        sent = False
+        def plain(_: bytes | None = None) -> bytes:
+            nonlocal sent
+            if sent:
+                return b""
+            sent = True
+            return f"\x00{settings.username}\x00{secret}".encode("utf-8")
+        status, _ = client.authenticate("PLAIN", plain)
+    elif settings.auth_method == "xoauth2":
+        sent = False
+        def xoauth(_: bytes | None = None) -> bytes:
+            nonlocal sent
+            if sent:
+                return b""
+            sent = True
+            return f"user={settings.username}\x01auth=Bearer {secret}\x01\x01".encode("utf-8")
+        status, _ = client.authenticate("XOAUTH2", xoauth)
+    elif settings.auth_method == "oauthbearer":
+        sent = False
+        def bearer(_: bytes | None = None) -> bytes:
+            nonlocal sent
+            if sent:
+                return b""
+            sent = True
+            return f"n,a={settings.username},\x01auth=Bearer {secret}\x01\x01".encode("utf-8")
+        status, _ = client.authenticate("OAUTHBEARER", bearer)
+    else:  # parser prevents this; keep the boundary defensive for in-memory Settings.
+        raise ConfigError(f"Unsupported auth_method: {settings.auth_method}")
+    if status != "OK":
+        raise MailProtocolError("IMAP authentication was not accepted")
+
+
+def _smtp_authenticate(client: smtplib.SMTP, settings: Settings, secret: str) -> None:
+    if settings.auth_method == "password":
+        client.login(settings.username, secret)
+        return
+    if settings.auth_method == "plain":
+        sent = False
+        def plain(_: bytes | None = None) -> str:
+            nonlocal sent
+            if sent:
+                return ""
+            sent = True
+            return f"\x00{settings.username}\x00{secret}"
+        client.auth("PLAIN", plain)
+        return
+    if settings.auth_method == "xoauth2":
+        sent = False
+        def xoauth(_: bytes | None = None) -> str:
+            nonlocal sent
+            if sent:
+                return ""
+            sent = True
+            return f"user={settings.username}\x01auth=Bearer {secret}\x01\x01"
+        client.auth("XOAUTH2", xoauth)
+        return
+    if settings.auth_method == "oauthbearer":
+        sent = False
+        def bearer(_: bytes | None = None) -> str:
+            nonlocal sent
+            if sent:
+                return ""
+            sent = True
+            return f"n,a={settings.username},\x01auth=Bearer {secret}\x01\x01"
+        client.auth("OAUTHBEARER", bearer)
+        return
+    raise ConfigError(f"Unsupported auth_method: {settings.auth_method}")
+
+
 def tls_context(settings: Settings) -> ssl.SSLContext:
     context = ssl.create_default_context()
     if settings.ca_file:
@@ -626,9 +749,7 @@ def imap_session(settings: Settings) -> Iterator[imaplib.IMAP4]:
         else:
             client = imaplib.IMAP4(settings.imap.host, settings.imap.port, timeout=settings.timeout_seconds)
             client.starttls(ssl_context=context)
-        status, _ = client.login(settings.username, password)
-        if status != "OK":
-            raise MailProtocolError("IMAP authentication was not accepted")
+        _imap_authenticate(client, settings, password)
         yield client
     except (CredentialError, ConfigError, MailProtocolError):
         raise
@@ -664,7 +785,7 @@ def smtp_session(settings: Settings) -> Iterator[smtplib.SMTP]:
             client.ehlo()
             client.starttls(context=context)
             client.ehlo()
-        client.login(settings.username, password)
+        _smtp_authenticate(client, settings, password)
     except (CredentialError, ConfigError):
         raise
     except smtplib.SMTPAuthenticationError as exc:
@@ -691,7 +812,8 @@ def smtp_session(settings: Settings) -> Iterator[smtplib.SMTP]:
 
 def _safe_protocol_text(value: Any, limit: int = 300) -> str:
     text = str(value).replace("\r", " ").replace("\n", " ")
-    text = re.sub(r"(?i)(password|passwd|pwd|authorization)\s*[:=]\s*\S+", r"\1=<redacted>", text)
+    text = re.sub(r"(?i)(password|passwd|pwd|authorization|token|bearer)\s*[:=]\s*\S+", r"\1=<redacted>", text)
+    text = re.sub(r"(?i)\bBearer\s+\S+", "Bearer=<redacted>", text)
     return text[:limit]
 
 
@@ -959,52 +1081,108 @@ def search_messages_with_client(
     folder: str,
     query: Mapping[str, Any],
     limit: int,
+    uid_after: int | None = None,
+    snapshot_uid: int | None = None,
+    expected_uidvalidity: str | None = None,
 ) -> dict[str, Any]:
     if limit < 1 or limit > 100:
         raise CoremailError("limit must be between 1 and 100")
-    allowed_query_fields = {"from", "to", "subject", "text", "since", "before", "unseen", "flagged"}
-    unknown_query_fields = sorted(str(field) for field in query if field not in allowed_query_fields)
-    if unknown_query_fields:
-        raise CoremailError(f"Unknown search query field(s): {', '.join(unknown_query_fields)}")
-    selected = select_folder(client, folder, readonly=True)
-    criteria: list[str] = []
-    mapping = (
-        ("from", "FROM"),
-        ("to", "TO"),
-        ("subject", "SUBJECT"),
-        ("text", "TEXT"),
-    )
-    for field, atom in mapping:
-        value = query.get(field)
-        if value is not None:
-            if not isinstance(value, str):
-                raise CoremailError(f"Search field must be a string: {field}")
-            if value.strip():
-                criteria.extend((atom, _search_quoted(value.strip(), field)))
-    if query.get("since"):
-        if not isinstance(query["since"], str):
-            raise CoremailError("Search field must be a string: since")
-        criteria.extend(("SINCE", _imap_date(str(query["since"]), "since")))
-    if query.get("before"):
-        if not isinstance(query["before"], str):
-            raise CoremailError("Search field must be a string: before")
-        criteria.extend(("BEFORE", _imap_date(str(query["before"]), "before")))
-    for boolean_field in ("unseen", "flagged"):
-        if boolean_field in query and not isinstance(query[boolean_field], bool):
-            raise CoremailError(f"Search field must be true or false: {boolean_field}")
-    if query.get("unseen") is True:
-        criteria.append("UNSEEN")
-    elif query.get("unseen") is False:
-        criteria.append("SEEN")
-    if query.get("flagged") is True:
-        criteria.append("FLAGGED")
-    elif query.get("flagged") is False:
-        criteria.append("UNFLAGGED")
+    allowed_query_fields = {"from", "to", "cc", "bcc", "subject", "text", "since", "before", "sent_since", "sent_before",
+                            "unseen", "flagged", "answered", "deleted", "draft", "keyword", "header", "larger", "smaller", "uid", "and", "or", "not"}
+
+    def build(node: Mapping[str, Any], depth: int = 0) -> list[str]:
+        if depth > 5:
+            raise CoremailError("Search expression is nested too deeply")
+        unknown = sorted(str(field) for field in node if field not in allowed_query_fields)
+        if unknown:
+            raise CoremailError(f"Unknown search query field(s): {', '.join(unknown)}")
+        result: list[str] = []
+        mapping = (("from", "FROM"), ("to", "TO"), ("cc", "CC"), ("bcc", "BCC"), ("subject", "SUBJECT"), ("text", "TEXT"))
+        for field, atom in mapping:
+            value = node.get(field)
+            if value is not None:
+                if not isinstance(value, str):
+                    raise CoremailError(f"Search field must be a string: {field}")
+                if value.strip():
+                    result.extend((atom, _search_quoted(value.strip(), field)))
+        for field, atom in (("since", "SINCE"), ("before", "BEFORE"), ("sent_since", "SENTSINCE"), ("sent_before", "SENTBEFORE")):
+            if node.get(field) is not None:
+                if not isinstance(node[field], str):
+                    raise CoremailError(f"Search field must be a string: {field}")
+                result.extend((atom, _imap_date(node[field], field)))
+        for field, atom in (("unseen", ("UNSEEN", "SEEN")), ("flagged", ("FLAGGED", "UNFLAGGED")),
+                            ("answered", ("ANSWERED", "UNANSWERED")), ("deleted", ("DELETED", "UNDELETED")),
+                            ("draft", ("DRAFT", "UNDRAFT"))):
+            if field in node:
+                if not isinstance(node[field], bool):
+                    raise CoremailError(f"Search field must be true or false: {field}")
+                result.append(atom[0] if node[field] else atom[1])
+        if node.get("keyword") is not None:
+            keyword = node["keyword"]
+            if not isinstance(keyword, str) or not _KEYWORD_RE.fullmatch(keyword):
+                raise CoremailError("keyword must be a valid IMAP keyword")
+            result.extend(("KEYWORD", keyword))
+        if node.get("header") is not None:
+            header = node["header"]
+            if not isinstance(header, dict) or set(header) != {"name", "value"}:
+                raise CoremailError("header must contain name and value")
+            name, value = header["name"], header["value"]
+            if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,64}", name) or not isinstance(value, str):
+                raise CoremailError("Invalid header search")
+            result.extend(("HEADER", name, _search_quoted(value, "header.value")))
+        for field, atom in (("larger", "LARGER"), ("smaller", "SMALLER")):
+            if field in node:
+                value = node[field]
+                if type(value) is not int or value < 0 or value > 100 * 1024 * 1024:
+                    raise CoremailError(f"{field} must be an integer between 0 and 104857600")
+                result.extend((atom, str(value)))
+        if node.get("uid") is not None:
+            uid = node["uid"]
+            if not isinstance(uid, str) or not re.fullmatch(r"[0-9]+(?::[0-9]+)?", uid):
+                raise CoremailError("uid search must be a decimal UID or range")
+            result.extend(("UID", uid))
+        for combinator in ("and", "or"):
+            if combinator in node:
+                children = node[combinator]
+                if not isinstance(children, list) or not children or len(children) > 20 or not all(isinstance(item, dict) for item in children):
+                    raise CoremailError(f"{combinator} must be a non-empty array of search objects")
+                child_criteria = [build(item, depth + 1) for item in children]
+                if any(not child for child in child_criteria):
+                    raise CoremailError(f"{combinator} cannot contain an empty search object")
+                if combinator == "and":
+                    for child in child_criteria:
+                        result.extend(child)
+                else:
+                    # IMAP OR is binary.  Fold all children into a nested
+                    # expression so an OR with three or more branches keeps
+                    # every branch instead of overwriting the accumulator.
+                    expression = "(" + " ".join(child_criteria[0]) + ")"
+                    for child in child_criteria[1:]:
+                        expression = "OR " + expression + " (" + " ".join(child) + ")"
+                    result.append(expression)
+        if "not" in node:
+            if not isinstance(node["not"], dict):
+                raise CoremailError("not must be a search object")
+            child = build(node["not"], depth + 1)
+            if not child:
+                raise CoremailError("not cannot wrap an empty search object")
+            result.extend(["NOT", "(" + " ".join(child) + ")"])
+        return result
+
+    criteria = build(query)
+    selected = select_folder(client, folder, readonly=True, expected_uidvalidity=expected_uidvalidity)
     if not criteria:
         criteria.append("ALL")
 
     uids = _uid_search(client, criteria)
-    selected_uids = sorted(uids, key=int, reverse=True)[:limit]
+    if snapshot_uid is None and uids:
+        snapshot_uid = max(int(item) for item in uids)
+    if snapshot_uid is not None:
+        uids = [item for item in uids if int(item) <= snapshot_uid]
+    if uid_after is not None:
+        uids = [item for item in uids if int(item) < uid_after]
+    uids = sorted(uids, key=int, reverse=True)
+    selected_uids = uids[:limit]
     messages = [_fetch_header(client, uid) for uid in selected_uids]
     return {
         **selected,
@@ -1012,6 +1190,9 @@ def search_messages_with_client(
         "matched_count": len(uids),
         "returned_count": len(messages),
         "messages": messages,
+        "snapshot_uid": snapshot_uid,
+        "last_uid": int(selected_uids[-1]) if selected_uids else None,
+        "has_more": len(uids) > len(messages),
     }
 
 
@@ -1065,34 +1246,74 @@ def _part_text(part: Message) -> str:
         return payload.decode("utf-8", errors="replace")
 
 
+def _mime_tree(part: Message, part_id: str = "1", *, limit: int = 1000) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    pending: list[tuple[Message, str]] = [(part, part_id)]
+    while pending and len(result) < limit:
+        current, current_id = pending.pop(0)
+        payload = current.get_payload(decode=True)
+        item: dict[str, Any] = {
+            "part_id": current_id,
+            "content_type": current.get_content_type(),
+            "charset": current.get_content_charset(),
+            "content_disposition": current.get_content_disposition(),
+            "filename": _decode_header_value(current.get_filename()),
+            "content_id": current.get("Content-ID"),
+            "transfer_encoding": current.get("Content-Transfer-Encoding"),
+            "size": len(payload) if payload is not None else None,
+        }
+        result.append(item)
+        if current.is_multipart():
+            children = current.get_payload()
+            if isinstance(children, list):
+                pending.extend((child, f"{current_id}.{index}") for index, child in enumerate(children, 1))
+    if pending:
+        result.append({"truncated": True, "reason": f"MIME tree exceeded {limit} parts"})
+    return result
+
+
 def parse_message(raw: bytes, max_body_chars: int) -> dict[str, Any]:
     message = BytesParser(policy=policy.default).parsebytes(raw)
+    headers: dict[str, list[str]] = {}
+    for name, value in list(message.items())[:200]:
+        decoded = _decode_header_value(str(value))
+        headers.setdefault(name, []).append(decoded[:4096])
     plain_parts: list[str] = []
     html_parts: list[str] = []
+    calendar_parts: list[str] = []
     attachments: list[dict[str, Any]] = []
 
-    parts: Sequence[Message] = list(message.walk()) if message.is_multipart() else [message]
-    for part in parts:
-        if part.is_multipart():
-            continue
+    # Do not treat text nested inside an attached message as this message's
+    # body.  The previous flat walk could leak a forwarded .eml's HTML into
+    # the parent message.
+    pending: list[Message] = [message]
+    while pending:
+        part = pending.pop()
         disposition = part.get_content_disposition()
         filename = part.get_filename()
         content_type = part.get_content_type()
         if disposition == "attachment" or filename:
-            payload = part.get_payload(decode=True) or b""
+            payload = part.get_payload(decode=True)
             attachments.append(
                 {
                     "filename": _decode_header_value(filename),
                     "content_type": content_type,
-                    "size": len(payload),
+                    "size": len(payload) if payload is not None else None,
                     "content_id": part.get("Content-ID"),
                 }
             )
+            continue
+        if part.is_multipart():
+            children = part.get_payload()
+            if isinstance(children, list):
+                pending.extend(reversed(children))
             continue
         if content_type == "text/plain":
             plain_parts.append(_part_text(part))
         elif content_type == "text/html":
             html_parts.append(_part_text(part))
+        elif content_type == "text/calendar":
+            calendar_parts.append(_part_text(part))
 
     body = "\n\n".join(part.strip() for part in plain_parts if part.strip())
     body_source = "text/plain"
@@ -1102,9 +1323,22 @@ def parse_message(raw: bytes, max_body_chars: int) -> dict[str, Any]:
     truncated = len(body) > max_body_chars
     if truncated:
         body = body[:max_body_chars] + "…"
+    body_text = "\n\n".join(plain_parts) if plain_parts else None
+    body_html = "\n".join(html_parts) if html_parts else None
+    body_text_truncated = body_text is not None and len(body_text) > max_body_chars
+    body_html_truncated = body_html is not None and len(body_html) > max_body_chars
+    body_calendar = "\n".join(calendar_parts) if calendar_parts else None
+    body_calendar_truncated = body_calendar is not None and len(body_calendar) > max_body_chars
+    if body_text_truncated:
+        body_text = body_text[:max_body_chars]
+    if body_html_truncated:
+        body_html = body_html[:max_body_chars]
+    if body_calendar_truncated:
+        body_calendar = body_calendar[:max_body_chars]
 
     return {
         "subject": _decode_header_value(message.get("Subject")),
+        "headers": headers,
         "from": _decode_header_value(message.get("From")),
         "to": _decode_header_value(message.get("To")),
         "cc": _decode_header_value(message.get("Cc")),
@@ -1117,9 +1351,128 @@ def parse_message(raw: bytes, max_body_chars: int) -> dict[str, Any]:
         "body": body,
         "body_source": body_source,
         "body_truncated": truncated,
+        "body_text": body_text,
+        "body_text_truncated": body_text_truncated,
+        "body_html": body_html,
+        "body_html_truncated": body_html_truncated,
+        "body_calendar": body_calendar,
+        "body_calendar_truncated": body_calendar_truncated,
         "attachments": attachments,
+        "mime_parts": _mime_tree(message),
         "content_is_untrusted": True,
     }
+
+
+def _fetch_rfc822_size(client: imaplib.IMAP4, uid: str) -> int | None:
+    status, rows = client.uid("FETCH", str(uid), "(RFC822.SIZE)")
+    if status != "OK" or not rows:
+        raise MailProtocolError(f"Cannot fetch metadata for message UID {uid}")
+    metadata, _ = _fetch_payload(rows)
+    match = _SIZE_RE.search(metadata)
+    return int(match.group(1)) if match else None
+
+
+def fetch_raw_chunk_with_client(
+    client: imaplib.IMAP4,
+    *, folder: str, uid: str, expected_uidvalidity: str | None, offset: int, length: int,
+    max_chunk_bytes: int = 256 * 1024,
+) -> dict[str, Any]:
+    if not str(uid).isdigit():
+        raise CoremailError("uid must contain decimal digits only")
+    if type(offset) is not int or offset < 0:
+        raise CoremailError("offset must be a non-negative integer")
+    if type(length) is not int or length < 1 or length > max_chunk_bytes:
+        raise CoremailError(f"length must be between 1 and {max_chunk_bytes}")
+    selected = select_folder(client, folder, readonly=True, expected_uidvalidity=expected_uidvalidity)
+    total = _fetch_rfc822_size(client, uid)
+    status, rows = client.uid("FETCH", str(uid), f"(BODY.PEEK[]<{offset}.{length}>)")
+    if status != "OK" or rows is None:
+        raise MailProtocolError(f"Cannot fetch raw message UID {uid}")
+    _, raw = _fetch_payload(rows)
+    if total is not None:
+        raw = raw[:max(0, min(length, total - offset))]
+    return {**selected, "uid": str(uid), "offset": offset, "length": len(raw), "total_size": total,
+            "eof": total is not None and offset + len(raw) >= total,
+            "data_base64": base64.b64encode(raw).decode("ascii"), "content_type": "message/rfc822"}
+
+
+def _fetch_full_raw_with_client(client: imaplib.IMAP4, *, folder: str, uid: str,
+                                expected_uidvalidity: str | None, max_message_bytes: int,
+                                readonly: bool = True) -> tuple[dict[str, Any], bytes, list[str]]:
+    selected = select_folder(client, folder, readonly=readonly, expected_uidvalidity=expected_uidvalidity)
+    size = _fetch_rfc822_size(client, uid)
+    if size is not None and size > max_message_bytes:
+        raise CoremailError(f"Message size {size} exceeds the configured read limit {max_message_bytes}")
+    status, rows = client.uid("FETCH", str(uid), "(BODY.PEEK[] FLAGS)")
+    if status != "OK" or rows is None:
+        raise MailProtocolError(f"Cannot fetch message UID {uid}")
+    metadata, raw = _fetch_payload(rows)
+    if not raw:
+        raise MailProtocolError(f"Message UID {uid} was not found")
+    if len(raw) > max_message_bytes:
+        raise CoremailError(f"Fetched message exceeds the configured read limit {max_message_bytes}")
+    match = _FLAGS_RE.search(metadata)
+    flags = [item.decode("ascii", errors="replace") for item in match.group(1).split()] if match else []
+    return selected, raw, flags
+
+
+def download_attachment_with_client(client: imaplib.IMAP4, *, folder: str, uid: str, part_id: str,
+                                    expected_uidvalidity: str | None, max_message_bytes: int) -> dict[str, Any]:
+    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", part_id):
+        raise CoremailError("part_id must be a MIME part path such as 2 or 1.2")
+    selected, raw, _ = _fetch_full_raw_with_client(client, folder=folder, uid=uid,
+                                                    expected_uidvalidity=expected_uidvalidity,
+                                                    max_message_bytes=max_message_bytes)
+    message = BytesParser(policy=policy.default).parsebytes(raw)
+    part: Message = message
+    segments = part_id.split(".")
+    # `_mime_tree` uses the root as part 1 and children as 1.1, 1.2, ... .
+    # Accept the common IMAP shorthand 1, 2, ... for top-level children too;
+    # a leading root segment is skipped only for dotted canonical paths.
+    if len(segments) > 1 and segments[0] == "1":
+        segments = segments[1:]
+    for segment in segments:
+        if not part.is_multipart() or not isinstance(part.get_payload(), list):
+            raise CoremailError(f"MIME part {part_id} does not exist")
+        index = int(segment) - 1
+        children = part.get_payload()
+        if index < 0 or index >= len(children):
+            raise CoremailError(f"MIME part {part_id} does not exist")
+        part = children[index]
+    if part.is_multipart():
+        raise CoremailError("The requested MIME part is a container, not downloadable content")
+    if part.get_content_disposition() not in {"attachment", "inline"} and not part.get_filename() and not part.get("Content-ID"):
+        raise CoremailError("The requested MIME part is message body content, not an attachment")
+    data = part.get_payload(decode=True)
+    if data is None:
+        data = _part_text(part).encode("utf-8")
+    return {**selected, "uid": str(uid), "part_id": part_id,
+            "filename": _decode_header_value(part.get_filename()),
+            "content_type": part.get_content_type(), "content_id": part.get("Content-ID"),
+            "size": len(data), "data_base64": base64.b64encode(data).decode("ascii")}
+
+
+def update_draft_with_client(client: imaplib.IMAP4, *, settings: Settings, message: PreparedMessage,
+                             folder: str, uid: str, expected_uidvalidity: str | None,
+                             expected_sha256: str | None = None) -> dict[str, Any]:
+    if not str(uid).isdigit():
+        raise CoremailError("uid must contain decimal digits only")
+    selected, old_raw, old_flags = _fetch_full_raw_with_client(client, folder=folder, uid=uid,
+                                                                expected_uidvalidity=expected_uidvalidity,
+                                                                max_message_bytes=settings.max_message_bytes,
+                                                                readonly=False)
+    if "\\draft" not in {flag.casefold() for flag in old_flags}:
+        raise CoremailError("The target message is not marked as a draft")
+    if expected_sha256 and hashlib.sha256(old_raw).hexdigest().lower() != expected_sha256.lower():
+        raise StaleMessageError("Draft changed since it was read; prepare again before updating")
+    raw = build_email(message).as_bytes(policy=policy.SMTP)
+    status, data = client.append(_imap_quoted(folder), "\\Draft", None, raw)
+    if status != "OK":
+        raise MailProtocolError("IMAP APPEND for draft update failed; existing draft was left unchanged")
+    status, _ = client.uid("STORE", str(uid), "+FLAGS.SILENT", "(\\Deleted)")
+    return {**selected, "old_uid": str(uid), "new_message_id": message.message_id, "replaced": status == "OK",
+            "cleanup_required": status != "OK", "appended": True,
+            "server_response": _safe_protocol_text(data[0]) if data else None}
 
 
 def get_message_with_client(
@@ -1183,6 +1536,171 @@ def set_seen_with_client(
     return {**selected, "uid": str(uid), "seen": seen, "updated": True}
 
 
+_FLAG_NAMES = {"\\Seen", "\\Answered", "\\Flagged", "\\Deleted", "\\Draft"}
+_KEYWORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}")
+
+
+def _validate_flags(values: Any, field: str) -> list[str]:
+    if values is None:
+        return []
+    if not isinstance(values, list) or len(values) > 50:
+        raise CoremailError(f"{field} must be an array with at most 50 flags")
+    result: list[str] = []
+    for raw in values:
+        if not isinstance(raw, str) or not raw:
+            raise CoremailError(f"Invalid IMAP flag in {field}")
+        flag = raw if raw.startswith("\\") else raw
+        if flag.startswith("\\"):
+            if flag not in _FLAG_NAMES:
+                raise CoremailError(f"Unsupported system flag: {flag}")
+        elif not _KEYWORD_RE.fullmatch(flag):
+            raise CoremailError(f"Invalid IMAP keyword: {flag}")
+        if flag not in result:
+            result.append(flag)
+    return result
+
+
+def set_flags_with_client(client: imaplib.IMAP4, *, folder: str, uid: str, expected_uidvalidity: str | None,
+                          add: Any = None, remove: Any = None) -> dict[str, Any]:
+    if not str(uid).isdigit():
+        raise CoremailError("uid must contain decimal digits only")
+    added, removed = _validate_flags(add, "add"), _validate_flags(remove, "remove")
+    overlap = set(added) & set(removed)
+    if overlap:
+        raise CoremailError("The same flag cannot be added and removed in one operation")
+    selected = select_folder(client, folder, readonly=False, expected_uidvalidity=expected_uidvalidity)
+    results: list[dict[str, Any]] = []
+    for operation, flags in (("+FLAGS.SILENT", added), ("-FLAGS.SILENT", removed)):
+        if not flags:
+            continue
+        status, _ = client.uid("STORE", str(uid), operation, "(" + " ".join(flags) + ")")
+        if status != "OK":
+            raise MailProtocolError(f"Cannot update flags for message UID {uid}")
+        results.append({"operation": operation, "flags": flags})
+    return {**selected, "uid": str(uid), "added": added, "removed": removed, "updated": True, "operations": results}
+
+
+def copy_or_move_with_client(client: imaplib.IMAP4, *, folder: str, uid: str, destination: str,
+                             expected_uidvalidity: str | None, move: bool) -> dict[str, Any]:
+    if not str(uid).isdigit():
+        raise CoremailError("uid must contain decimal digits only")
+    if not isinstance(destination, str) or not destination.strip():
+        raise CoremailError("destination must be a non-empty folder name")
+    selected = select_folder(client, folder, readonly=False, expected_uidvalidity=expected_uidvalidity)
+    destination = destination.strip()
+    if move and "MOVE" in {item.decode(errors="ignore").upper() if isinstance(item, bytes) else str(item).upper() for item in getattr(client, "capabilities", ())}:
+        status, data = client.uid("MOVE", str(uid), _imap_quoted(destination))
+        if status != "OK":
+            raise MailProtocolError(f"Cannot move message UID {uid}")
+        return {**selected, "uid": str(uid), "destination": destination, "moved": True,
+                "method": "UID MOVE", "server_response": _safe_protocol_text(data[0]) if data else None}
+    status, data = client.uid("COPY", str(uid), _imap_quoted(destination))
+    if status != "OK":
+        raise MailProtocolError(f"Cannot copy message UID {uid} to {destination}")
+    if not move:
+        return {**selected, "uid": str(uid), "destination": destination, "copied": True, "method": "UID COPY",
+                "server_response": _safe_protocol_text(data[0]) if data else None}
+    status, _ = client.uid("STORE", str(uid), "+FLAGS.SILENT", "(\\Deleted)")
+    if status != "OK":
+        return {**selected, "uid": str(uid), "destination": destination, "copied": True, "moved": False,
+                "cleanup_required": True, "method": "UID COPY + \\Deleted"}
+    return {**selected, "uid": str(uid), "destination": destination, "copied": True, "moved": True,
+            "cleanup_required": True, "method": "UID COPY + \\Deleted"}
+
+
+def delete_with_client(client: imaplib.IMAP4, *, folder: str, uid: str, expected_uidvalidity: str | None,
+                       permanent: bool = False) -> dict[str, Any]:
+    if not str(uid).isdigit():
+        raise CoremailError("uid must contain decimal digits only")
+    selected = select_folder(client, folder, readonly=False, expected_uidvalidity=expected_uidvalidity)
+    if not permanent:
+        status, _ = client.uid("STORE", str(uid), "+FLAGS.SILENT", "(\\Deleted)")
+        if status != "OK":
+            raise MailProtocolError(f"Cannot mark message UID {uid} deleted")
+        return {**selected, "uid": str(uid), "deleted": True, "permanent": False, "method": "\\Deleted"}
+    caps = {item.decode(errors="ignore").upper() if isinstance(item, bytes) else str(item).upper() for item in getattr(client, "capabilities", ())}
+    if "UIDPLUS" not in caps:
+        raise CoremailError("Permanent deletion requires IMAP UIDPLUS support")
+    status, _ = client.uid("STORE", str(uid), "+FLAGS.SILENT", "(\\Deleted)")
+    if status != "OK":
+        raise MailProtocolError(f"Cannot mark message UID {uid} deleted")
+    status, _ = client.uid("EXPUNGE", str(uid))
+    if status != "OK":
+        raise MailProtocolError(f"Message UID {uid} was marked deleted but could not be expunged")
+    return {**selected, "uid": str(uid), "deleted": True, "permanent": True, "method": "UID EXPUNGE"}
+
+
+def manage_folder_with_client(client: imaplib.IMAP4, *, action: str, folder: str, new_name: str | None = None,
+                              allow_nonempty: bool = False) -> dict[str, Any]:
+    if not isinstance(folder, str) or not folder.strip():
+        raise CoremailError("folder must be a non-empty string")
+    folder = folder.strip()
+    if folder.casefold() == "inbox" and action in {"delete", "rename"}:
+        raise CoremailError("The INBOX folder cannot be deleted or renamed")
+    if action == "create":
+        status, _ = client.create(_imap_quoted(folder))
+    elif action == "delete":
+        if not allow_nonempty:
+            status, data = client.select(_imap_quoted(folder), readonly=True)
+            if status != "OK":
+                raise MailProtocolError(f"Cannot inspect folder {folder}")
+            count = int((data[0] or b"0").decode(errors="ignore") or 0)
+            if count:
+                raise CoremailError("Folder is not empty; pass allow_nonempty=true to delete it")
+        status, _ = client.delete(_imap_quoted(folder))
+    elif action == "rename":
+        if not new_name or not isinstance(new_name, str):
+            raise CoremailError("new_name is required for rename")
+        status, _ = client.rename(_imap_quoted(folder), _imap_quoted(new_name.strip()))
+    elif action in {"subscribe", "unsubscribe"}:
+        status, _ = getattr(client, action)(_imap_quoted(folder))
+    else:
+        raise CoremailError("action must be create, rename, delete, subscribe, or unsubscribe")
+    if status != "OK":
+        raise MailProtocolError(f"IMAP folder operation failed: {action}")
+    return {"action": action, "folder": folder, "new_name": new_name, "updated": True}
+
+
+def _imap_idle_wait(client: imaplib.IMAP4, timeout_seconds: int) -> bool | None:
+    """Run one bounded RFC 2177 IDLE cycle on Python 3.13's public socket primitives."""
+    sock = getattr(client, "sock", None)
+    new_tag = getattr(client, "_new_tag", None)
+    if (sock is None or not callable(new_tag) or not hasattr(client, "send") or not hasattr(client, "readline")
+            or not hasattr(sock, "gettimeout") or not hasattr(sock, "settimeout")):
+        return None
+    previous_timeout = sock.gettimeout()
+    changed = False
+    try:
+        tag = new_tag()
+        client.send(tag + b" IDLE\r\n")
+        sock.settimeout(1.0)
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            try:
+                line = client.readline()
+            except socket.timeout:
+                continue
+            if not line:
+                raise MailConnectionError("IMAP IDLE connection closed")
+            upper = line.upper()
+            if b" EXISTS" in upper or b" EXPUNGE" in upper or b" FETCH" in upper:
+                changed = True
+                break
+        client.send(b"DONE\r\n")
+        sock.settimeout(max(1.0, min(10.0, float(timeout_seconds))))
+        # Consume the tagged completion response. The line itself is not exposed
+        # because it may contain server-specific text.
+        client.readline()
+        return changed
+    except (OSError, imaplib.IMAP4.error) as exc:
+        raise MailConnectionError("IMAP IDLE failed") from exc
+    finally:
+        try:
+            sock.settimeout(previous_timeout)
+        except OSError:
+            pass
+
+
 def _extract_addr_spec(value: str, field: str) -> str:
     parsed = getaddresses([value])
     if len(parsed) != 1 or not parsed[0][1]:
@@ -1244,9 +1762,15 @@ class AttachmentSpec:
     filename: str
     size: int
     sha256: str
+    content_type: str | None = None
+    disposition: str = "attachment"
+    content_id: str | None = None
 
     def summary(self) -> dict[str, Any]:
-        return {"path": str(self.path), "filename": self.filename, "size": self.size, "sha256": self.sha256}
+        return {
+            "path": str(self.path), "filename": self.filename, "size": self.size, "sha256": self.sha256,
+            "content_type": self.content_type, "disposition": self.disposition, "content_id": self.content_id,
+        }
 
 
 def _hash_file(path: Path) -> str:
@@ -1261,7 +1785,7 @@ def _prepare_attachments(settings: Settings, values: Any) -> tuple[AttachmentSpe
     if values is None:
         return ()
     if not isinstance(values, list):
-        raise CoremailError("attachments must be an array of file paths")
+        raise CoremailError("attachments must be an array of file paths or objects")
     if values and not settings.attachment_roots:
         raise CoremailError(
             "No outgoing attachment roots are authorized. Configure attachment_roots or run Claude Code from a project directory."
@@ -1271,6 +1795,13 @@ def _prepare_attachments(settings: Settings, values: Any) -> tuple[AttachmentSpe
     attachments: list[AttachmentSpec] = []
     total = 0
     for raw_path in values:
+        attachment_options: Mapping[str, Any] = {}
+        if isinstance(raw_path, dict):
+            attachment_options = raw_path
+            raw_path = raw_path.get("path")
+            unknown = sorted(str(key) for key in attachment_options if key not in {"path", "filename", "content_type", "disposition", "content_id"})
+            if unknown:
+                raise CoremailError(f"Unknown attachment field(s): {', '.join(unknown)}")
         if not isinstance(raw_path, str) or not raw_path.strip():
             raise CoremailError("Each attachment must be a non-empty file path")
         candidate = Path(os.path.expandvars(os.path.expanduser(raw_path.strip())))
@@ -1290,9 +1821,30 @@ def _prepare_attachments(settings: Settings, values: Any) -> tuple[AttachmentSpe
             raise CoremailError(
                 f"Total attachment size exceeds the configured limit {settings.max_attachment_bytes} bytes"
             )
+        filename = attachment_options.get("filename", resolved.name)
+        if not isinstance(filename, str) or not filename.strip() or Path(filename).name != filename or any(char in filename for char in "/\\") or filename in {".", ".."}:
+            raise CoremailError("attachment filename must be a single safe file name")
+        disposition = attachment_options.get("disposition", "attachment")
+        if disposition not in {"attachment", "inline"}:
+            raise CoremailError("attachment disposition must be attachment or inline")
+        content_type = attachment_options.get("content_type")
+        if content_type is not None:
+            if not isinstance(content_type, str) or not re.fullmatch(r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+", content_type):
+                raise CoremailError("attachment content_type must be a MIME type")
+        content_id = attachment_options.get("content_id")
+        if content_id is not None:
+            if not isinstance(content_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,127}", content_id.strip("<>")):
+                raise CoremailError("attachment content_id must be a simple CID")
+            content_id = content_id.strip("<>")
+        if disposition == "inline" and not content_id:
+            content_id = secrets.token_hex(12)
         attachments.append(
-            AttachmentSpec(path=resolved, filename=resolved.name, size=size, sha256=_hash_file(resolved))
+            AttachmentSpec(path=resolved, filename=filename.strip(), size=size, sha256=_hash_file(resolved),
+                            content_type=content_type, disposition=disposition, content_id=content_id)
         )
+    content_ids = [item.content_id.casefold() for item in attachments if item.content_id]
+    if len(content_ids) != len(set(content_ids)):
+        raise CoremailError("Inline attachment content_id values must be unique")
     return tuple(attachments)
 
 
@@ -1313,10 +1865,27 @@ class PreparedMessage:
     attachments: tuple[AttachmentSpec, ...]
     message_id: str
     date: dt.datetime
+    body_html: str | None = None
+    reply_to_headers: tuple[str, ...] = ()
+    reply_to_addresses: tuple[str, ...] = ()
+    body_calendar: str | None = None
+    calendar_method: str = "REQUEST"
 
     @property
     def all_recipients(self) -> tuple[str, ...]:
         return self.to_addresses + self.cc_addresses + self.bcc_addresses
+
+    @property
+    def body_formats(self) -> tuple[str, ...]:
+        if self.body_html is None:
+            formats = ["text/plain"]
+        elif self.body_text:
+            formats = ["text/plain", "text/html"]
+        else:
+            formats = ["text/html"]
+        if self.body_calendar is not None:
+            formats.append("text/calendar")
+        return tuple(formats)
 
     def summary(self, settings: Settings) -> dict[str, Any]:
         return {
@@ -1325,15 +1894,22 @@ class PreparedMessage:
             "to": list(self.to_headers),
             "cc": list(self.cc_headers),
             "bcc": list(self.bcc_headers),
+            "reply_to": list(self.reply_to_headers),
             "subject": self.subject,
+            "body_formats": list(self.body_formats),
+            "body_text": self.body_text,
+            "body_html": self.body_html,
             "body_character_count": len(self.body_text),
+            "body_html_character_count": len(self.body_html or ""),
             "in_reply_to": self.in_reply_to or None,
             "references": self.references or None,
+            "calendar": {"method": self.calendar_method, "character_count": len(self.body_calendar or "")} if self.body_calendar is not None else None,
             "attachments": [attachment.summary() for attachment in self.attachments],
             "message_id": self.message_id,
             "date": self.date.isoformat(),
             "sent_copy_mode": settings.sent_copy_mode,
             "prepared_only": True,
+            "content_is_untrusted": True,
         }
 
 
@@ -1363,8 +1939,28 @@ def prepare_message(settings: Settings, arguments: Mapping[str, Any]) -> Prepare
         raise CoremailError("body_text must be a string")
     if len(body_text) > 500_000:
         raise CoremailError("body_text exceeds the 500000-character limit")
+    body_html = arguments.get("body_html", None)
+    if "body_html" in arguments and not isinstance(body_html, str):
+        raise CoremailError("body_html must be a string")
+    if isinstance(body_html, str) and len(body_html) > 500_000:
+        raise CoremailError("body_html exceeds the 500000-character limit")
+    if body_html is not None and settings.transport == WINDOWS_MAPI_TRANSPORT:
+        raise CoremailError(
+            "Windows Simple MAPI supports text/plain only; configure imap_smtp to send HTML"
+        )
     in_reply_to = _safe_header(arguments.get("in_reply_to", ""), "in_reply_to")
     references = _safe_header(arguments.get("references", ""), "references", 4000)
+    reply_to_headers, reply_to_addresses = _normalize_addresses(arguments.get("reply_to"), "reply_to")
+    body_calendar = arguments.get("body_calendar")
+    if body_calendar is not None:
+        if not isinstance(body_calendar, str) or len(body_calendar) > 500_000:
+            raise CoremailError("body_calendar must be a string of at most 500000 characters")
+        if settings.transport == WINDOWS_MAPI_TRANSPORT:
+            raise CoremailError("Windows Simple MAPI cannot preserve text/calendar")
+    calendar_method = arguments.get("calendar_method", "REQUEST")
+    if not isinstance(calendar_method, str) or calendar_method.upper() not in {"REQUEST", "REPLY", "CANCEL", "PUBLISH", "COUNTER", "DECLINECOUNTER"}:
+        raise CoremailError("calendar_method is not supported")
+    calendar_method = calendar_method.upper()
     attachments = _prepare_attachments(settings, arguments.get("attachments"))
 
     domain = from_address.rsplit("@", 1)[1]
@@ -1379,11 +1975,16 @@ def prepare_message(settings: Settings, arguments: Mapping[str, Any]) -> Prepare
         bcc_addresses=bcc_addresses,
         subject=subject,
         body_text=body_text,
+        body_html=body_html,
         in_reply_to=in_reply_to,
         references=references,
         attachments=attachments,
         message_id=make_msgid(domain=domain),
         date=dt.datetime.now(dt.timezone.utc),
+        reply_to_headers=reply_to_headers,
+        reply_to_addresses=reply_to_addresses,
+        body_calendar=body_calendar,
+        calendar_method=calendar_method,
     )
 
 
@@ -1476,12 +2077,44 @@ def build_email(message: PreparedMessage) -> EmailMessage:
         mail["In-Reply-To"] = message.in_reply_to
     if message.references:
         mail["References"] = message.references
-    mail.set_content(message.body_text)
+    if message.reply_to_headers:
+        mail["Reply-To"] = ", ".join(message.reply_to_headers)
+    inline = [item for item in message.attachments if item.disposition == "inline"]
+    if inline and not message.body_html:
+        raise PreparedMessageError("Inline attachments require body_html so their Content-ID can be referenced")
+    if message.body_html is None:
+        mail.set_content(message.body_text)
+    elif message.body_text:
+        mail.set_content(message.body_text)
+        mail.add_alternative(message.body_html, subtype="html")
+        if inline:
+            html_part = mail.get_payload()[-1]
+            for attachment in inline:
+                attachment_bytes = _verified_attachment_bytes(attachment)
+                guessed, encoding = mimetypes.guess_type(attachment.filename)
+                mime_type = attachment.content_type or (guessed if guessed and not encoding else None) or "application/octet-stream"
+                maintype, subtype = mime_type.split("/", 1)
+                html_part.add_related(attachment_bytes, maintype=maintype, subtype=subtype,
+                                      filename=attachment.filename, cid=f"<{attachment.content_id}>", disposition="inline")
+    else:
+        mail.set_content(message.body_html, subtype="html")
+        if inline:
+            mail.make_related()
+            for attachment in inline:
+                attachment_bytes = _verified_attachment_bytes(attachment)
+                guessed, encoding = mimetypes.guess_type(attachment.filename)
+                mime_type = attachment.content_type or (guessed if guessed and not encoding else None) or "application/octet-stream"
+                maintype, subtype = mime_type.split("/", 1)
+                mail.add_related(attachment_bytes, maintype=maintype, subtype=subtype,
+                                 filename=attachment.filename, cid=f"<{attachment.content_id}>", disposition="inline")
     for attachment in message.attachments:
+        if attachment.disposition == "inline":
+            continue
         attachment_bytes = _verified_attachment_bytes(attachment)
         guessed, encoding = mimetypes.guess_type(attachment.filename)
-        if guessed and not encoding and "/" in guessed:
-            maintype, subtype = guessed.split("/", 1)
+        mime_type = attachment.content_type or (guessed if guessed and not encoding else None)
+        if mime_type and "/" in mime_type:
+            maintype, subtype = mime_type.split("/", 1)
         else:
             maintype, subtype = "application", "octet-stream"
         mail.add_attachment(
@@ -1490,6 +2123,9 @@ def build_email(message: PreparedMessage) -> EmailMessage:
             subtype=subtype,
             filename=attachment.filename,
         )
+    if message.body_calendar is not None:
+        mail.add_attachment(message.body_calendar.encode("utf-8"), maintype="text", subtype="calendar",
+                            params={"method": message.calendar_method, "charset": "utf-8"}, filename=None)
     return mail
 
 
@@ -1614,6 +2250,7 @@ class CoremailBackend:
         self.store = store or PreparedStore()
         self._mapi_client = mapi_client
         self._settings_cache: tuple[Path, tuple[int, int, int], Settings] | None = None
+        self._cursor_secret = secrets.token_bytes(32)
 
     def _mapi(self) -> SimpleMapiClient:
         if self._mapi_client is None:
@@ -1863,6 +2500,7 @@ class CoremailBackend:
                 credential_available(settings) if settings.transport == "imap_smtp" else None
             ),
             "settings": settings.public_summary(),
+            "capabilities": settings.body_capabilities(),
             "client_interface": interface,
             "mail_client_interface_selected": settings.transport == WINDOWS_MAPI_TRANSPORT,
             "mail_client_interface_used": False,
@@ -1880,6 +2518,7 @@ class CoremailBackend:
             "sent_folder", "sent_copy_mode", "ca_file", "attachment_roots",
             "max_message_bytes", "max_body_chars", "max_attachment_bytes",
             "max_recipients", "timeout_seconds",
+            "auth_method", "download_directory",
         }
         unknown = sorted(str(key) for key in arguments if key not in allowed_keys)
         if unknown:
@@ -1928,6 +2567,8 @@ class CoremailBackend:
             "max_attachment_bytes",
             "max_recipients",
             "timeout_seconds",
+            "auth_method",
+            "download_directory",
         ):
             if key in arguments and arguments[key] is not None:
                 current[key] = arguments[key]
@@ -1948,6 +2589,8 @@ class CoremailBackend:
                 "ca_file",
                 "drafts_folder",
                 "sent_folder",
+                "auth_method",
+                "download_directory",
             ):
                 if key not in arguments or arguments[key] is None:
                     current.pop(key, None)
@@ -2006,6 +2649,7 @@ class CoremailBackend:
             "provider": settings.provider,
             "missing_fields": [],
             "active_transport": settings.transport,
+            "capabilities": settings.body_capabilities(),
             "credential_available": (
                 credential_available(settings) if settings.transport == "imap_smtp" else None
             ),
@@ -2042,6 +2686,7 @@ class CoremailBackend:
             "transport": "imap_smtp",
             "imap": {"connected": True, "capabilities": imap_capabilities},
             "smtp": {"connected": True, "features": smtp_features},
+            "capabilities": settings.body_capabilities(),
             "username": settings.username,
             "tls_verification": True,
             "mail_client_interface_used": False,
@@ -2073,13 +2718,43 @@ class CoremailBackend:
         if not isinstance(query, dict):
             raise CoremailError("query must be an object")
         limit = _bounded_tool_int(arguments.get("limit", _MISSING), "limit", 20, 1, 100)
+        cursor_payload: dict[str, Any] | None = None
+        cursor = arguments.get("cursor")
+        if cursor is not None:
+            if not isinstance(cursor, str) or len(cursor) > 4096:
+                raise CoremailError("cursor is invalid")
+            try:
+                encoded, signature = cursor.rsplit(".", 1)
+                expected = hmac.new(self._cursor_secret, encoded.encode("ascii"), hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(expected, signature):
+                    raise ValueError
+                cursor_payload = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8"))
+                if not isinstance(cursor_payload, dict) or float(cursor_payload.get("expires_at", 0)) < time.time():
+                    raise ValueError
+            except (ValueError, TypeError, KeyError, json.JSONDecodeError, UnicodeError):
+                raise CoremailError("cursor is invalid or expired")
+            if cursor_payload.get("folder") != folder or cursor_payload.get("query") != query:
+                raise CoremailError("cursor does not belong to this folder and query")
         if settings.transport == WINDOWS_MAPI_TRANSPORT:
+            if cursor is not None:
+                raise CoremailError("Pagination cursors are available only in imap_smtp mode; Simple MAPI search is session-bounded")
             try:
                 return self._mapi().search(folder=folder, query=query, limit=limit)
             except WindowsMapiError as exc:
                 self._raise_mapi(exc)
         with imap_session(settings) as client:
-            result = search_messages_with_client(client, folder=folder, query=query, limit=limit)
+            result = search_messages_with_client(client, folder=folder, query=query, limit=limit,
+                                                 uid_after=int(cursor_payload["last_uid"]) if cursor_payload and cursor_payload.get("last_uid") is not None else None,
+                                                 snapshot_uid=int(cursor_payload["snapshot_uid"]) if cursor_payload and cursor_payload.get("snapshot_uid") is not None else None,
+                                                 expected_uidvalidity=str(cursor_payload["uidvalidity"]) if cursor_payload and cursor_payload.get("uidvalidity") is not None else None)
+        if result.get("has_more") and result.get("last_uid") is not None:
+            payload = {"folder": folder, "query": query, "snapshot_uid": result.get("snapshot_uid"),
+                       "last_uid": result.get("last_uid"), "uidvalidity": result.get("uidvalidity"),
+                       "expires_at": time.time() + 15 * 60}
+            encoded = base64.urlsafe_b64encode(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).decode("ascii").rstrip("=")
+            result["next_cursor"] = encoded + "." + hmac.new(self._cursor_secret, encoded.encode("ascii"), hashlib.sha256).hexdigest()
+        else:
+            result["next_cursor"] = None
         return {**result, "transport": "imap_smtp"}
 
     def get_message(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
@@ -2147,6 +2822,203 @@ class CoremailBackend:
             )
         return {**result, "transport": "imap_smtp"}
 
+    def set_flags(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        settings = self._load_settings()
+        folder = arguments.get("folder", "INBOX")
+        uid = str(arguments.get("uid", ""))
+        uidvalidity = arguments.get("uidvalidity")
+        if not isinstance(folder, str):
+            raise CoremailError("folder must be a string")
+        if settings.transport == WINDOWS_MAPI_TRANSPORT:
+            raise CoremailError("Windows Simple MAPI does not expose IMAP flags or keywords")
+        with imap_session(settings) as client:
+            result = set_flags_with_client(client, folder=folder, uid=uid,
+                                           expected_uidvalidity=str(uidvalidity) if uidvalidity is not None else None,
+                                           add=arguments.get("add"), remove=arguments.get("remove"))
+        return {**result, "transport": "imap_smtp"}
+
+    def copy_move(self, arguments: Mapping[str, Any], *, move: bool) -> dict[str, Any]:
+        settings = self._load_settings()
+        if settings.transport == WINDOWS_MAPI_TRANSPORT:
+            raise CoremailError("Windows Simple MAPI does not expose mailbox copy or move")
+        folder = arguments.get("folder", "INBOX")
+        destination = arguments.get("destination")
+        if not isinstance(folder, str) or not isinstance(destination, str):
+            raise CoremailError("folder and destination must be strings")
+        with imap_session(settings) as client:
+            result = copy_or_move_with_client(client, folder=folder, uid=str(arguments.get("uid", "")),
+                                              destination=destination,
+                                              expected_uidvalidity=str(arguments["uidvalidity"]) if arguments.get("uidvalidity") is not None else None,
+                                              move=move)
+        return {**result, "transport": "imap_smtp"}
+
+    def delete_message(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        settings = self._load_settings()
+        if settings.transport == WINDOWS_MAPI_TRANSPORT:
+            try:
+                return self._mapi().delete_message(folder=str(arguments.get("folder", "INBOX")), uid=str(arguments.get("uid", "")),
+                                                   expected_uidvalidity=str(arguments["uidvalidity"]) if arguments.get("uidvalidity") is not None else None,
+                                                   permanent=bool(arguments.get("permanent", False)))
+            except WindowsMapiError as exc:
+                self._raise_mapi(exc)
+        folder = arguments.get("folder", "INBOX")
+        if not isinstance(folder, str):
+            raise CoremailError("folder must be a string")
+        with imap_session(settings) as client:
+            result = delete_with_client(client, folder=folder, uid=str(arguments.get("uid", "")),
+                                        expected_uidvalidity=str(arguments["uidvalidity"]) if arguments.get("uidvalidity") is not None else None,
+                                        permanent=bool(arguments.get("permanent", False)))
+        return {**result, "transport": "imap_smtp"}
+
+    def manage_folder(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        settings = self._load_settings()
+        if settings.transport == WINDOWS_MAPI_TRANSPORT:
+            raise CoremailError("Windows Simple MAPI exposes only the INBOX folder")
+        action = arguments.get("action")
+        folder = arguments.get("folder")
+        if not isinstance(action, str) or not isinstance(folder, str):
+            raise CoremailError("action and folder are required strings")
+        with imap_session(settings) as client:
+            result = manage_folder_with_client(client, action=action, folder=folder,
+                                               new_name=arguments.get("new_name"),
+                                               allow_nonempty=bool(arguments.get("allow_nonempty", False)))
+        return {**result, "transport": "imap_smtp"}
+
+    def get_raw_message(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        settings = self._load_settings()
+        if settings.transport == WINDOWS_MAPI_TRANSPORT:
+            raise CoremailError("Windows Simple MAPI does not expose the original RFC 822 source")
+        folder = arguments.get("folder", "INBOX")
+        offset = _bounded_tool_int(arguments.get("offset", _MISSING), "offset", 0, 0, 2**31 - 1)
+        length = _bounded_tool_int(arguments.get("length", _MISSING), "length", 256 * 1024, 1, 256 * 1024)
+        with imap_session(settings) as client:
+            result = fetch_raw_chunk_with_client(client, folder=folder, uid=str(arguments.get("uid", "")),
+                                                 expected_uidvalidity=str(arguments["uidvalidity"]) if arguments.get("uidvalidity") is not None else None,
+                                                 offset=offset, length=length)
+        return {**result, "transport": "imap_smtp"}
+
+    def download_attachment(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        settings = self._load_settings()
+        if "save" in arguments and not isinstance(arguments.get("save"), bool):
+            raise CoremailError("save must be true or false")
+        folder = arguments.get("folder", "INBOX")
+        part_id = arguments.get("part_id")
+        if not isinstance(folder, str) or not isinstance(part_id, str):
+            raise CoremailError("folder and part_id are required strings")
+        if settings.transport == WINDOWS_MAPI_TRANSPORT:
+            if folder.casefold() != "inbox" or not part_id.isdigit() or int(part_id) < 1:
+                raise CoremailError("Simple MAPI attachments use one-based numeric part_id values in INBOX")
+            try:
+                result = self._mapi().download_attachment(
+                    folder=folder, uid=str(arguments.get("uid", "")),
+                    expected_uidvalidity=str(arguments["uidvalidity"]) if arguments.get("uidvalidity") is not None else None,
+                    index=int(part_id) - 1,
+                )
+            except WindowsMapiError as exc:
+                self._raise_mapi(exc)
+            provider_filename = result.get("filename") or f"attachment-{part_id}.bin"
+            filename = arguments.get("filename") or Path(str(provider_filename)).name
+            if not isinstance(filename, str) or not filename or Path(filename).name != filename or any(char in filename for char in "/\\") or filename in {".", ".."}:
+                raise CoremailError("filename must be a safe file name")
+            if arguments.get("save", False):
+                directory = settings.download_directory
+                if directory is None:
+                    raise CoremailError("Saving downloads requires download_directory in mail configuration")
+                directory.mkdir(parents=True, exist_ok=True)
+                destination = directory / filename
+                if destination.exists():
+                    raise CoremailError(f"Refusing to overwrite existing download: {destination}")
+                data = base64.b64decode(result["data_base64"])
+                temporary = destination.with_name(f".{destination.name}.tmp-{secrets.token_hex(8)}")
+                try:
+                    with temporary.open("xb") as handle:
+                        handle.write(data)
+                    os.replace(temporary, destination)
+                finally:
+                    temporary.unlink(missing_ok=True)
+                result["saved_path"] = str(destination)
+            return {**result, "filename": filename}
+        with imap_session(settings) as client:
+            result = download_attachment_with_client(client, folder=folder, uid=str(arguments.get("uid", "")),
+                                                     part_id=part_id,
+                                                     expected_uidvalidity=str(arguments["uidvalidity"]) if arguments.get("uidvalidity") is not None else None,
+                                                     max_message_bytes=settings.max_message_bytes)
+        filename = arguments.get("filename") or result.get("filename") or f"attachment-{part_id.replace('.', '-')}.bin"
+        if not isinstance(filename, str) or Path(filename).name != filename or any(char in filename for char in "/\\") or filename in {".", ".."}:
+            raise CoremailError("filename must be a safe file name")
+        if arguments.get("save", False):
+            directory = settings.download_directory
+            if directory is None:
+                raise CoremailError("Saving downloads requires download_directory in mail configuration")
+            directory.mkdir(parents=True, exist_ok=True)
+            destination = directory / filename
+            if destination.exists():
+                raise CoremailError(f"Refusing to overwrite existing download: {destination}")
+            data = base64.b64decode(result["data_base64"])
+            temporary = destination.with_name(f".{destination.name}.tmp-{secrets.token_hex(8)}")
+            try:
+                with temporary.open("xb") as handle:
+                    handle.write(data)
+                os.replace(temporary, destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+            result["saved_path"] = str(destination)
+        return {**result, "filename": filename, "transport": "imap_smtp"}
+
+    def update_draft(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        token = str(arguments.get("prepared_token", ""))
+        settings = self._load_settings()
+        if settings.transport == WINDOWS_MAPI_TRANSPORT:
+            raise CoremailError("Draft replacement is unavailable through Windows Simple MAPI")
+        entry = self.store.get_entry(token)
+        self._assert_prepared_settings(entry, settings)
+        folder = arguments.get("folder") or settings.drafts_folder
+        if folder is not None and not isinstance(folder, str):
+            raise CoremailError("folder must be a string")
+        message = self.store.take_entry(token).message
+        with imap_session(settings) as client:
+            if not folder:
+                folder = _find_special_folder(client, "\\Drafts", ("Drafts", "Draft", "草稿箱", "草稿"))
+            if not folder:
+                raise ConfigError("Cannot locate the IMAP Drafts folder; configure it explicitly")
+            result = update_draft_with_client(client, settings=settings, message=message, folder=folder,
+                                              uid=str(arguments.get("uid", "")),
+                                              expected_uidvalidity=str(arguments["uidvalidity"]) if arguments.get("uidvalidity") is not None else None,
+                                              expected_sha256=arguments.get("expected_sha256"))
+        return {**result, "transport": "imap_smtp"}
+
+    def watch_folder(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        settings = self._load_settings()
+        if settings.transport == WINDOWS_MAPI_TRANSPORT:
+            raise CoremailError("Windows Simple MAPI does not expose IMAP IDLE or mailbox change events")
+        folder = arguments.get("folder", "INBOX")
+        timeout = _bounded_tool_int(arguments.get("timeout_seconds", _MISSING), "timeout_seconds", 15, 1, 30)
+        with imap_session(settings) as client:
+            selected = select_folder(client, folder, readonly=True, expected_uidvalidity=str(arguments["uidvalidity"]) if arguments.get("uidvalidity") is not None else None)
+            idle_supported = any((item.decode(errors="ignore") if isinstance(item, bytes) else str(item)).upper() == "IDLE" for item in getattr(client, "capabilities", ()))
+            used_idle = False
+            changed = False
+            if idle_supported:
+                idle_result = _imap_idle_wait(client, timeout)
+                if idle_result is not None:
+                    changed = idle_result
+                    used_idle = True
+            if not used_idle:
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    try:
+                        client.noop()
+                    except (imaplib.IMAP4.error, OSError) as exc:
+                        raise MailConnectionError("IMAP watch connection failed") from exc
+                    time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+            refreshed = select_folder(client, folder, readonly=True,
+                                      expected_uidvalidity=str(arguments["uidvalidity"]) if arguments.get("uidvalidity") is not None else None)
+        return {"folder": folder, "uidvalidity": refreshed.get("uidvalidity"),
+                "message_count_before": selected.get("message_count"), "message_count_after": refreshed.get("message_count"),
+                "changed": changed or selected.get("message_count") != refreshed.get("message_count"),
+                "waited_seconds": timeout, "mode": "idle" if used_idle else "poll",
+                "idle_available": idle_supported, "transport": "imap_smtp"}
+
     def prepare(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         settings = self._load_settings()
         message = prepare_message(settings, arguments)
@@ -2167,19 +3039,33 @@ class CoremailBackend:
         entry = self.store.get_entry(token)
         self._assert_prepared_settings(entry, settings)
         if settings.transport == WINDOWS_MAPI_TRANSPORT:
-            # Reject before consuming the prepared token because no write attempt
-            # can be made through this limited interface.
-            raise CoremailError(
-                "Saving drafts is not supported by Windows Simple MAPI; reconfigure imap_smtp to use Drafts"
-            )
+            self._assert_mapi_message_supported(entry.message)
+            if not hasattr(self._mapi(), "save_draft"):
+                raise CoremailError("Saving drafts is not supported by the registered Windows Simple MAPI provider")
+            message = entry.message
+            sender_name = getaddresses([message.from_header])[0][0]
+            verified = [(item, _verified_attachment_bytes(item)) for item in message.attachments]
+            with tempfile.TemporaryDirectory(prefix="coremail-mapi-draft-") as temporary:
+                snapshots: list[tuple[str, str]] = []
+                for index, (attachment, content) in enumerate(verified, start=1):
+                    snapshot = Path(temporary) / f"attachment-{index:03d}.bin"
+                    with snapshot.open("xb") as handle:
+                        handle.write(content)
+                    snapshots.append((str(snapshot), attachment.filename))
+                try:
+                    result = self._mapi().save_draft(sender_address=message.from_address,
+                                                     recipients=_mapi_recipient_rows(message), subject=message.subject,
+                                                     body=message.body_text, attachments=snapshots,
+                                                     message_id=message.message_id)
+                except WindowsMapiError as exc:
+                    raise CoremailError(f"Saving drafts failed: {exc}") from exc
+            self.store.take_entry(token)
+            return result
         message = self.store.take_entry(token).message
         return append_message(settings, message, kind="draft")
 
     def _send_mapi(self, settings: Settings, message: PreparedMessage) -> dict[str, Any]:
-        if message.in_reply_to or message.references:
-            raise PreparedMessageError(
-                "Windows Simple MAPI cannot preserve In-Reply-To or References; use imap_smtp for this reply"
-            )
+        self._assert_mapi_message_supported(message)
         sender_name = getaddresses([message.from_header])[0][0]
         verified = [(item, _verified_attachment_bytes(item)) for item in message.attachments]
         # Simple MAPI accepts attachment paths rather than bytes. Pass random-name,
@@ -2209,6 +3095,22 @@ class CoremailBackend:
             except WindowsMapiError as exc:
                 self._raise_mapi(exc)
 
+    @staticmethod
+    def _assert_mapi_message_supported(message: PreparedMessage) -> None:
+        if message.body_html is not None:
+            raise PreparedMessageError(
+                "Windows Simple MAPI supports text/plain only; configure imap_smtp to send HTML"
+            )
+        if message.in_reply_to or message.references:
+            raise PreparedMessageError(
+                "Windows Simple MAPI cannot preserve In-Reply-To or References; use imap_smtp for this reply"
+            )
+        if (message.reply_to_headers or message.body_calendar is not None
+                or any(item.disposition == "inline" or item.content_type is not None for item in message.attachments)):
+            raise PreparedMessageError(
+                "Windows Simple MAPI cannot preserve Reply-To, calendar, or custom MIME attachment parts; use imap_smtp"
+            )
+
     def send_prepared(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         token = str(arguments.get("prepared_token", ""))
         confirmation = arguments.get("confirmation")
@@ -2218,10 +3120,8 @@ class CoremailBackend:
         entry = self.store.get_entry(token)
         self._assert_prepared_settings(entry, settings)
         preview = entry.message
-        if settings.transport == WINDOWS_MAPI_TRANSPORT and (preview.in_reply_to or preview.references):
-            raise PreparedMessageError(
-                "Windows Simple MAPI cannot preserve In-Reply-To or References; use imap_smtp for this reply"
-            )
+        if settings.transport == WINDOWS_MAPI_TRANSPORT:
+            self._assert_mapi_message_supported(preview)
         message = self.store.take_entry(token).message
         if settings.transport == WINDOWS_MAPI_TRANSPORT:
             return self._send_mapi(settings, message)

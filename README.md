@@ -55,13 +55,30 @@ mail_check_connection    实际检查 IMAP/SMTP 或共享 MAPI 连接
 
 ## 邮件操作边界
 
-可列出文件夹、结构化搜索、读取邮件、显式标记已读/未读、准备邮件、保存 IMAP/SMTP 草稿，
-以及发送已复核的邮件。读取不会主动打开或操作邮件客户端界面，也不会执行邮件正文中的指令。
+可列出和管理文件夹、结构化搜索及分页、读取邮件和原始 MIME、按用户请求下载附件、设置标志、
+复制/移动/删除邮件、准备和更新草稿，以及发送已复核的邮件。读取不会主动打开或操作邮件客户端
+界面，也不会执行邮件正文中的指令。
+
+IMAP/SMTP 支持纯文本、HTML，以及两者并存的邮件。`mail_prepare_message` 用 `body_text`
+提供纯文本、用 `body_html` 提供 HTML；同时提供非空 `body_text` 和 `body_html` 时生成
+`multipart/alternative`。准备摘要包含两种正文，草稿、发送和已发送副本保留同样的格式。
+例如准备一封双版本邮件：
+
+```json
+{"to":["recipient@example.com"],"subject":"项目进展","body_text":"本周任务已完成。","body_html":"<p>本周任务<strong>已完成</strong>。</p>"}
+```
+
+`mail_get_message` 的 `body` 保留纯文本预览，`body_text` / `body_html` 返回原始正文的
+解码内容和各自的截断标志。HTML 作为数据返回，不在服务中渲染或加载外部资源。当前
+Simple MAPI 适配器只暴露 note text；HTML、Reply-To、日历和 inline MIME 请求会明确报错并提示
+使用 `imap_smtp`，不会静默降级。连接状态的 `capabilities` 会说明可读、可发送的正文格式和
+provider 限制。IMAP/SMTP 还支持 password、PLAIN、XOAUTH2、OAUTHBEARER，秘密始终由
+Credential Manager 提供。
 
 发送必须经过两步：`mail_prepare_message` 冻结收件人、主题、正文和附件哈希；用户核对摘要
 后明确回复精确短语 `确认发送`，才能调用 `mail_send_prepared`。令牌 15 分钟后过期，发送
-失败不会自动重试；配置在复核后改变时也必须重新准备。Simple MAPI 受 provider 能力限制，可能只能使用 INBOX、只能标记已读，
-也不支持保存草稿或保留线程头；结果会说明这些限制。
+失败不会自动重试；配置在复核后改变时也必须重新准备。Simple MAPI 受 provider 能力限制，可能只能使用 INBOX、只能标记已读；
+结果会说明这些限制。协议扩展及其 provider 边界见 [`docs/architecture.md`](docs/architecture.md) 的“能力边界与实现来源”。
 
 ## 升级、回滚和卸载
 

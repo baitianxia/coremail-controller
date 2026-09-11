@@ -18,6 +18,9 @@ param(
     [string[]]$AttachmentRoots,
     [string]$CaFile,
     [string]$CredentialTarget,
+    [ValidateSet('password', 'plain', 'xoauth2', 'oauthbearer')]
+    [string]$AuthMethod = 'password',
+    [string]$DownloadDirectory,
     [Security.SecureString]$Password,
     [switch]$NonInteractive,
     [switch]$LifecycleLockAlreadyHeld,
@@ -292,8 +295,8 @@ try {
         if (-not [string]::IsNullOrWhiteSpace($CaFile) -or
             -not [string]::IsNullOrWhiteSpace($DraftsFolder) -or
             -not [string]::IsNullOrWhiteSpace($SentFolder) -or
-            $SentCopyMode -ne 'none') {
-            throw 'CA, Drafts/Sent folder, and sent-copy settings apply only to imap_smtp.'
+            $SentCopyMode -ne 'none' -or $AuthMethod -ne 'password') {
+            throw 'CA, Drafts/Sent folder, sent-copy, and protocol authentication settings apply only to imap_smtp.'
         }
     }
 
@@ -328,6 +331,16 @@ try {
             throw "Credential target '$CredentialTarget' already exists. Omit -CredentialTarget to create a new transactional credential."
         }
     }
+    if (-not [string]::IsNullOrWhiteSpace($DownloadDirectory)) {
+        if ($Transport -ne 'imap_smtp') { throw 'DownloadDirectory is available only with imap_smtp.' }
+        $resolvedDownloadDirectory = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($DownloadDirectory))
+        [void](Assert-CoremailSafeDescendantPath -Root $userProfile -Path $resolvedDownloadDirectory -Label 'attachment download directory')
+        if (-not (Test-Path -LiteralPath $resolvedDownloadDirectory -PathType Container)) {
+            [void](New-Item -ItemType Directory -Path $resolvedDownloadDirectory -Force)
+        }
+    } else {
+        $resolvedDownloadDirectory = $null
+    }
 
     $configDirectory = Join-Path $mailRoot 'config'
     $configPath = Join-Path $configDirectory 'settings.json'
@@ -354,8 +367,10 @@ try {
         max_attachment_bytes = 26214400
         max_recipients = 100
         timeout_seconds = 20
+        download_directory = $resolvedDownloadDirectory
     }
     if ($Transport -eq 'imap_smtp') {
+        $config['auth_method'] = $AuthMethod
         $config['credential_target'] = $CredentialTarget
         $config['imap'] = [ordered]@{ host = $ImapHost; port = $ImapPort; security = $ImapSecurity }
         $config['smtp'] = [ordered]@{ host = $SmtpHost; port = $SmtpPort; security = $SmtpSecurity }
@@ -386,11 +401,12 @@ try {
 
     if ($Transport -eq 'imap_smtp') {
         if ($null -eq $Password) {
-            if ($NonInteractive) { throw 'Password is required in non-interactive IMAP/SMTP setup.' }
-            $Password = Read-Host '邮箱或域密码（仅存入 Windows Credential Manager）' -AsSecureString
+            if ($NonInteractive) { throw 'Password or access token is required in non-interactive IMAP/SMTP setup.' }
+            $credentialPrompt = if ($AuthMethod -eq 'password') { '邮箱或域密码' } else { 'OAuth access token' }
+            $Password = Read-Host ($credentialPrompt + '（仅存入 Windows Credential Manager）') -AsSecureString
             $ownsPassword = $true
         }
-        if ($Password.Length -eq 0) { throw 'The password must not be empty.' }
+        if ($Password.Length -eq 0) { throw 'The password or access token must not be empty.' }
         Write-CoremailCredential -Target $CredentialTarget -Username $Username -Password $Password
         $newCredentialWritten = $true
         Write-CoremailLifecycleLog "ACCOUNT CREDENTIAL WRITTEN target=$CredentialTarget"
@@ -415,7 +431,7 @@ try {
         Write-Host 'Authentication: existing provider shared Simple MAPI session (no password copied or stored).'
     }
     else {
-        Write-Host "Password location: Windows Credential Manager target '$CredentialTarget'"
+        Write-Host "Credential location ($AuthMethod): Windows Credential Manager target '$CredentialTarget'"
     }
     Write-Host "Diagnostic log: $LogPath"
     Write-Host 'Restart Claude Code, then call mail_config_reload and mail_check_connection.'
