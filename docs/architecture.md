@@ -141,6 +141,10 @@ TLS 校验、授权发件人和附件根、发送复核、UIDVALIDITY、资源�
 参数，由用户在 Credential Manager 中维护。`download_directory` 仅定义用户明确下载附件时的
 落盘目录，服务拒绝覆盖既有文件。
 
+密码或 OAuth token 失效时，用户通过 `CONFIGURE.cmd` 重新配置。向导先原子发布新配置，再
+移除不再引用的旧 Credential Manager 条目；连接验证失败会返回失败并要求重新配置，不保留
+旧配置作为自动回滚路径。`mail_configure` 始终不接受密码或 token。
+
 所有持久状态都在本工程目录：
 
 ```text

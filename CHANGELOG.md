@@ -11,6 +11,8 @@
 - 补齐 IMAP 搜索逻辑组合和签名分页、标志与关键字、复制/移动/删除、文件夹管理、原始 MIME
   分段读取、MIME 附件下载、Reply-To、日历正文、CID 内嵌资源和草稿替换；增加 PLAIN、XOAUTH2、
   OAUTHBEARER 认证配置，并在 provider 支持时接入 Simple MAPI 附件、草稿保存和永久删除。
+- 重新配置 IMAP/SMTP 密码或 OAuth token 时，配置向导在发布新配置后移除旧 Credential Manager
+  条目；连接验证失败会以失败退出，要求使用修正后的秘密重新配置。
 
 ## 0.9.0 — 2026-09-07
 

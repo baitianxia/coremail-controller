@@ -19,6 +19,7 @@ if (-not (Test-Path -LiteralPath $commonScript -PathType Leaf)) {
 $userProfile = [Environment]::GetFolderPath('UserProfile')
 if ([string]::IsNullOrWhiteSpace($userProfile)) { throw 'The current Windows user profile directory could not be resolved.' }
 $mailRoot = Join-Path $userProfile 'mail-mcp-server'
+$configPath = Join-Path $mailRoot 'config\settings.json'
 if ([string]::IsNullOrWhiteSpace($LogPath)) {
     $logDirectory = Join-Path $mailRoot 'logs'
     $LogPath = Join-Path $logDirectory (
@@ -53,6 +54,24 @@ function Get-RegisteredMailRuntime {
     catch { return $null }
     return $null
 }
+
+function Get-CoremailConfigCredentialTarget {
+    param([Parameter(Mandatory = $true)][string]$ConfigPath)
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { return $null }
+    try {
+        $payload = Get-Content -LiteralPath $ConfigPath -Raw -ErrorAction Stop | ConvertFrom-Json
+        $property = $payload.PSObject.Properties['credential_target']
+        if ($null -eq $property -or [string]::IsNullOrWhiteSpace([string]$property.Value)) { return $null }
+        return [string]$property.Value
+    }
+    catch {
+        # The account setup script will report a malformed configuration. Do
+        # not guess at a credential target while preparing the replacement.
+        return $null
+    }
+}
+
+$previousCredentialTarget = Get-CoremailConfigCredentialTarget -ConfigPath $configPath
 
 try {
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
@@ -89,24 +108,39 @@ try {
 
     $setupScript = Join-Path $pluginRoot 'scripts\setup-account.ps1'
     $smokeTest = Join-Path $pluginRoot 'tests\smoke-mcp.ps1'
+    $credentialScript = Join-Path $pluginRoot 'scripts\windows-credential.ps1'
     if (-not (Test-Path -LiteralPath $setupScript -PathType Leaf)) {
         throw "Account setup script not found: $setupScript. Run INSTALL.cmd first."
+    }
+    if (-not (Test-Path -LiteralPath $credentialScript -PathType Leaf)) {
+        throw "Credential helper not found: $credentialScript. Run INSTALL.cmd first."
+    }
+    if (-not (Test-Path -LiteralPath $smokeTest -PathType Leaf)) {
+        throw "Installed MCP smoke test not found: $smokeTest. Run INSTALL.cmd first."
     }
 
     & $setupScript -LogPath $LogPath
     if (-not $?) { throw 'Account setup failed.' }
-    if (Test-Path -LiteralPath $smokeTest -PathType Leaf) {
-        & $smokeTest
-        if (-not $?) { throw 'Installed MCP smoke test failed.' }
-        if (-not $SkipConnectionCheck) {
-            try {
-                & $smokeTest -TimeoutMilliseconds 60000 -CheckConnection
-                if (-not $?) { throw 'Live mail connection smoke test failed.' }
-            }
-            catch {
-                Write-Warning "Settings were saved, but the live connection check did not pass: $($_.Exception.Message)"
-                Write-Warning 'Review the selected provider, server addresses, credential availability, network access, and organization policy.'
-            }
+    $publishedCredentialTarget = Get-CoremailConfigCredentialTarget -ConfigPath $configPath
+    if (-not $SkipConnectionCheck -and $previousCredentialTarget -and $publishedCredentialTarget -and
+        -not [string]::Equals($previousCredentialTarget, $publishedCredentialTarget, [StringComparison]::Ordinal)) {
+        # The replacement configuration is already published. Once the
+        # account transaction has succeeded, retire the no-longer-referenced
+        # target rather than retaining a stale password for rollback.
+        . $credentialScript
+        Remove-CoremailCredential -Target $previousCredentialTarget
+        Write-CoremailLifecycleLog "RETIRED previous mail credential target=$previousCredentialTarget"
+    }
+    & $smokeTest
+    if (-not $?) { throw 'Installed MCP smoke test failed.' }
+    if (-not $SkipConnectionCheck) {
+        try {
+            & $smokeTest -TimeoutMilliseconds 60000 -CheckConnection
+            if (-not $?) { throw 'Live mail connection smoke test failed.' }
+        }
+        catch {
+            Write-CoremailLifecycleFailure -ErrorRecord $_ -Context 'mail connection verification'
+            throw "Live mail connection verification failed. Run CONFIGURE.cmd again with the corrected password or access token. Details: $($_.Exception.Message)"
         }
     }
 

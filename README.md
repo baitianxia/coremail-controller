@@ -49,6 +49,11 @@ mail_connection_status   查看当前传输和凭据可用性
 mail_check_connection    实际检查 IMAP/SMTP 或共享 MAPI 连接
 ```
 
+如果 IMAP/SMTP 密码或 OAuth 令牌失效，重新运行 `CONFIGURE.cmd` 并输入新的秘密。配置向导会
+发布新凭据后移除不再使用的旧 Credential Manager 条目；连接验证失败会以失败退出，并要求
+使用修正后的秘密重新配置。密码或令牌失效时不要调用 `mail_configure`，也不要把秘密粘贴到
+聊天中。Simple MAPI 的密码仍由 Coremail/Windows 邮件客户端管理。
+
 `config/settings.example.json` 是无密码模板。`provider` 当前必须是 `coremail`；传输可选
 `windows_simple_mapi` 或经 TLS 校验的 `imap_smtp`。不要把服务器 URL、明文密码或令牌放入
 配置文件。

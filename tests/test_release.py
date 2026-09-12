@@ -267,9 +267,15 @@ class ReleaseTests(unittest.TestCase):
 
     def test_account_configuration_order_and_secret_boundary(self) -> None:
         setup = (ROOT / "scripts" / "setup-account.ps1").read_text(encoding="utf-8")
+        configure = (ROOT / "scripts" / "configure-account.ps1").read_text(encoding="utf-8")
         self.assertLess(setup.index("Staged account configuration validation"), setup.index("Write-CoremailCredential"))
         self.assertLess(setup.index("Write-CoremailCredential"), setup.index("Publish-CoremailFileAtomically"))
         self.assertIn("Remove-CoremailCredential", setup)
+        self.assertIn("RETIRED previous mail credential", configure)
+        self.assertIn("Live mail connection verification failed", configure)
+        self.assertIn("Run CONFIGURE.cmd again", configure)
+        self.assertLess(configure.index("RETIRED previous mail credential"), configure.index("-CheckConnection"))
+        self.assertIn("-not $SkipConnectionCheck -and $previousCredentialTarget", configure)
         self.assertIn("MAIL_RELEASE_GATE_TESTING", setup)
         self.assertNotIn("COREMAIL_PASSWORD", setup)
 
