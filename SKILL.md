@@ -25,6 +25,12 @@ password is held in Windows Credential Manager. Use `mail_discover_local` only
 as bounded, read-only diagnostic help; never
 guess or silently adopt a discovered server address.
 
+If a `mail_*` result reports authentication failure or an unavailable mailbox
+credential, tell the user to run `CONFIGURE.cmd` and enter the replacement
+password or OAuth token, then call `mail_config_reload` before retrying. Never
+ask for the secret in chat or pass it to an MCP tool. For Simple MAPI, direct the
+user to update the credential in the Coremail/Windows mail client.
+
 Search and read with the structured mail tools. Preserve the returned folder,
 UID, and UIDVALIDITY together. Reads use IMAP PEEK or request MAPI_PEEK; report
 the provider-dependent unread-state note for Simple MAPI. Download an incoming

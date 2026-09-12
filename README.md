@@ -115,6 +115,9 @@ Credential Manager 提供。
   `mail_config_reload`；不要把密码传给 MCP 工具。
 - **连接失败**：先运行 `mail_connection_status`，确认传输、主机名、TLS、Credential
   Manager 目标和组织策略；Simple MAPI 需要默认邮件客户端已有共享登录会话。
+- **MCP 操作提示认证失败**：工具结果会提示密码或 OAuth token 可能失效；重新运行
+  `CONFIGURE.cmd` 输入新秘密，随后调用 `mail_config_reload`，再重试原操作。不要把秘密
+  传给 MCP 工具。
 - **Claude 看不到工具**：重启 Claude Code，确认用户级 `mail-mcp` 注册仍指向
   `%USERPROFILE%\mail-mcp-server\versions\...\mcp\run-server.ps1`，再查看 `logs`。
 

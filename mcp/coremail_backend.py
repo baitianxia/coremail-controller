@@ -609,19 +609,25 @@ def read_windows_credential(target: str) -> str:
         error_code = ctypes.get_last_error()
         raise CredentialError(
             f"Windows credential '{target}' is unavailable (error {error_code}). "
-            "Run scripts/setup-account.ps1 to create or update it."
+            "Run CONFIGURE.cmd to create or update it, then call mail_config_reload."
         )
     try:
         credential = credential_pointer.contents
         blob = ctypes.string_at(credential.CredentialBlob, credential.CredentialBlobSize)
         if not blob:
-            raise CredentialError(f"Windows credential '{target}' contains an empty password")
+            raise CredentialError(
+                f"Windows credential '{target}' contains an empty password. "
+                "Run CONFIGURE.cmd to enter a new credential, then call mail_config_reload."
+            )
         try:
             password = blob.decode("utf-16-le").rstrip("\x00")
         except UnicodeDecodeError:
             password = blob.decode("utf-8")
         if not password:
-            raise CredentialError(f"Windows credential '{target}' contains an empty password")
+            raise CredentialError(
+                f"Windows credential '{target}' contains an empty password. "
+                "Run CONFIGURE.cmd to enter a new credential, then call mail_config_reload."
+            )
         return password
     finally:
         advapi32.CredFree(credential_pointer)
@@ -644,6 +650,22 @@ def credential_available(settings: Settings) -> bool:
         # specific exceptions (including loader and argument errors) that do
         # not share one stable base class across Python/Windows versions.
         return False
+
+
+def _authentication_guidance(settings: Settings, protocol: str, detail: Any = None) -> str:
+    """Return a secret-free recovery instruction for authentication failures."""
+    credential_kind = "mailbox password" if settings.auth_method == "password" else "OAuth access token"
+    suffix = f" Server response: {_safe_protocol_text(detail)}." if detail is not None else ""
+    return (
+        f"{protocol} authentication failed; the configured {credential_kind} may be expired or invalid."
+        f"{suffix} {_credential_update_instruction(settings)}"
+        " Never send the password or token to an MCP tool."
+    )
+
+
+def _credential_update_instruction(settings: Settings) -> str:
+    credential_kind = "password" if settings.auth_method == "password" else "OAuth access token"
+    return f"Run CONFIGURE.cmd to enter a new {credential_kind}, then call mail_config_reload before retrying."
 
 
 def _imap_authenticate(client: imaplib.IMAP4, settings: Settings, secret: str) -> None:
@@ -735,7 +757,10 @@ def tls_context(settings: Settings) -> ssl.SSLContext:
 def imap_session(settings: Settings) -> Iterator[imaplib.IMAP4]:
     if settings.transport != "imap_smtp" or settings.imap is None:
         raise ConfigError("IMAP is unavailable for the selected transport")
-    password = get_password(settings)
+    try:
+        password = get_password(settings)
+    except CredentialError as exc:
+        raise CredentialError(_authentication_guidance(settings, "IMAP", exc)) from exc
     client: imaplib.IMAP4 | None = None
     try:
         context = tls_context(settings)
@@ -749,7 +774,10 @@ def imap_session(settings: Settings) -> Iterator[imaplib.IMAP4]:
         else:
             client = imaplib.IMAP4(settings.imap.host, settings.imap.port, timeout=settings.timeout_seconds)
             client.starttls(ssl_context=context)
-        _imap_authenticate(client, settings, password)
+        try:
+            _imap_authenticate(client, settings, password)
+        except (imaplib.IMAP4.error, MailProtocolError) as exc:
+            raise MailProtocolError(_authentication_guidance(settings, "IMAP", exc)) from exc
         yield client
     except (CredentialError, ConfigError, MailProtocolError):
         raise
@@ -769,7 +797,10 @@ def imap_session(settings: Settings) -> Iterator[imaplib.IMAP4]:
 def smtp_session(settings: Settings) -> Iterator[smtplib.SMTP]:
     if settings.transport != "imap_smtp" or settings.smtp is None:
         raise ConfigError("SMTP is unavailable for the selected transport")
-    password = get_password(settings)
+    try:
+        password = get_password(settings)
+    except CredentialError as exc:
+        raise CredentialError(_authentication_guidance(settings, "SMTP", exc)) from exc
     client: smtplib.SMTP | None = None
     try:
         context = tls_context(settings)
@@ -785,7 +816,10 @@ def smtp_session(settings: Settings) -> Iterator[smtplib.SMTP]:
             client.ehlo()
             client.starttls(context=context)
             client.ehlo()
-        _smtp_authenticate(client, settings, password)
+        try:
+            _smtp_authenticate(client, settings, password)
+        except smtplib.SMTPException as exc:
+            raise MailProtocolError(_authentication_guidance(settings, "SMTP", exc)) from exc
     except (CredentialError, ConfigError):
         raise
     except smtplib.SMTPAuthenticationError as exc:
@@ -2295,7 +2329,14 @@ class CoremailBackend:
 
     @staticmethod
     def _raise_mapi(exc: WindowsMapiError) -> None:
-        raise MailProtocolError(str(exc)) from exc
+        message = str(exc)
+        lowered = message.casefold()
+        if "no existing shared login session" in lowered or "invalid or expired session" in lowered:
+            message += (
+                " Open the Coremail/Windows mail client, sign in again or update the expired "
+                "password/token there, then retry mail_check_connection."
+            )
+        raise MailProtocolError(message) from exc
 
     def close(self) -> None:
         if self._mapi_client is not None:
@@ -2642,6 +2683,16 @@ class CoremailBackend:
             return status
         settings = self._load_settings()
         interface = status.get("client_interface")
+        credential_is_available = (
+            credential_available(settings) if settings.transport == "imap_smtp" else None
+        )
+        next_step = "Run mail_check_connection to verify the active mail transport."
+        if settings.transport == "imap_smtp" and not credential_is_available:
+            next_step = (
+                "The configured mailbox credential is unavailable or empty. "
+                + _credential_update_instruction(settings)
+                + " Never send the password or token to an MCP tool."
+            )
         return {
             "configured": True,
             "config_path": str(settings.config_path),
@@ -2650,14 +2701,13 @@ class CoremailBackend:
             "missing_fields": [],
             "active_transport": settings.transport,
             "capabilities": settings.body_capabilities(),
-            "credential_available": (
-                credential_available(settings) if settings.transport == "imap_smtp" else None
-            ),
+            "credential_available": credential_is_available,
             "settings": settings.public_summary(),
             "client_interface": interface,
             "mail_client_interface_selected": settings.transport == WINDOWS_MAPI_TRANSPORT,
             "mail_client_interface_used": False,
             "mail_ui_automation_used": False,
+            "next_step": next_step,
         }
 
     def check_connection(self) -> dict[str, Any]:

@@ -36,6 +36,11 @@ service and must never be used to access Coremail.
    user to paste a password or token into chat or pass one to an MCP tool.
 6. After setup, use `mail_check_connection` before mailbox work when connection
    health is uncertain.
+7. If any `mail_*` result reports authentication failure or an unavailable
+   credential, tell the user to run `CONFIGURE.cmd`, enter the replacement
+   password or OAuth token, then call `mail_config_reload` before retrying. Never
+   ask for the secret in chat or pass it to an MCP tool. For Simple MAPI, direct
+   the user to update the credential in the Coremail/Windows mail client.
 
 Do not bypass MFA, CAPTCHA, TLS errors, organization policy, disabled protocols, or
 client-specific-password requirements.

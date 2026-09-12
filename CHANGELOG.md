@@ -13,6 +13,8 @@
   OAUTHBEARER 认证配置，并在 provider 支持时接入 Simple MAPI 附件、草稿保存和永久删除。
 - 重新配置 IMAP/SMTP 密码或 OAuth token 时，配置向导在发布新配置后移除旧 Credential Manager
   条目；连接验证失败会以失败退出，要求使用修正后的秘密重新配置。
+- MCP 运行时的 IMAP/SMTP 认证失败、缺失凭据和空凭据现在返回 `CONFIGURE.cmd`、
+  `mail_config_reload` 的恢复指引；`mail_connection_status` 也会报告离线发现的凭据缺失。
 
 ## 0.9.0 — 2026-09-07
 

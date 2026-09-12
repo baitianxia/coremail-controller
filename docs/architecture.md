@@ -145,6 +145,12 @@ TLS 校验、授权发件人和附件根、发送复核、UIDVALIDITY、资源�
 移除不再引用的旧 Credential Manager 条目；连接验证失败会返回失败并要求重新配置，不保留
 旧配置作为自动回滚路径。`mail_configure` 始终不接受密码或 token。
 
+IMAP/SMTP 会话在认证失败、Credential Manager 条目缺失或凭据为空时，所有依赖该会话的
+`mail_*` 工具都会返回不含秘密的恢复指引，包括 `CONFIGURE.cmd` 和 `mail_config_reload`。
+`mail_connection_status` 在离线检测到凭据缺失时也返回同一方向；它不能判断服务端尚未发生的
+密码过期，实际认证失败会在 `mail_check_connection` 或具体邮件操作中报告。Simple MAPI 的
+认证仍由 Coremail/Windows 邮件客户端负责。
+
 所有持久状态都在本工程目录：
 
 ```text

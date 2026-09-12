@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import imaplib
 import sqlite3
+import smtplib
 import sys
 import tempfile
 import unittest
@@ -33,12 +35,16 @@ from coremail_backend import (  # noqa: E402
     manage_folder_with_client,
     imap_utf7_decode,
     imap_utf7_encode,
+    imap_session,
     load_settings,
     default_config_path,
     parse_message,
     prepare_message,
     select_folder,
     _smtp_authenticate,
+    smtp_session,
+    MailProtocolError,
+    WindowsMapiError,
 )
 from local_discovery import discover_local  # noqa: E402
 
@@ -752,6 +758,73 @@ class ImapIdentityTests(unittest.TestCase):
         client = self.CapabilityImap()
         with self.assertRaisesRegex(CoremailError, "not empty"):
             manage_folder_with_client(client, action="delete", folder="Archive")
+
+
+class AuthenticationGuidanceTests(unittest.TestCase):
+    def test_imap_authentication_failure_includes_mcp_reconfiguration_guidance(self) -> None:
+        class FakeImap:
+            def login(self, username, secret):
+                raise imaplib.IMAP4.error("[AUTHENTICATIONFAILED] invalid credentials")
+
+            def logout(self):
+                return "BYE", [b"logout"]
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            settings = settings_for(Path(raw_directory))
+            with patch("coremail_backend.get_password", return_value="expired-password"), patch(
+                "coremail_backend.imaplib.IMAP4_SSL", return_value=FakeImap()
+            ):
+                with self.assertRaises(MailProtocolError) as raised:
+                    with imap_session(settings):
+                        pass
+        message = str(raised.exception)
+        self.assertIn("CONFIGURE.cmd", message)
+        self.assertIn("mail_config_reload", message)
+        self.assertNotIn("expired-password", message)
+
+    def test_smtp_authentication_failure_includes_mcp_reconfiguration_guidance(self) -> None:
+        class FakeSmtp:
+            def login(self, username, secret):
+                raise smtplib.SMTPAuthenticationError(535, b"5.7.8 authentication failed")
+
+            def quit(self):
+                return 221, b"bye"
+
+            def close(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            settings = settings_for(Path(raw_directory))
+            with patch("coremail_backend.get_password", return_value="expired-password"), patch(
+                "coremail_backend.smtplib.SMTP_SSL", return_value=FakeSmtp()
+            ):
+                with self.assertRaises(MailProtocolError) as raised:
+                    with smtp_session(settings):
+                        pass
+        message = str(raised.exception)
+        self.assertIn("CONFIGURE.cmd", message)
+        self.assertIn("mail_config_reload", message)
+        self.assertNotIn("expired-password", message)
+
+    def test_connection_status_guides_missing_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            settings = settings_for(Path(raw_directory))
+            backend = CoremailBackend()
+            with patch.object(backend, "config_status", return_value={"configured": True, "client_interface": {}}), patch.object(
+                backend, "_load_settings", return_value=settings
+            ), patch("coremail_backend.credential_available", return_value=False):
+                result = backend.mail_connection_status()
+        self.assertIn("CONFIGURE.cmd", result["next_step"])
+        self.assertIn("mail_config_reload", result["next_step"])
+
+    def test_simple_mapi_session_failure_guides_client_reauthentication(self) -> None:
+        with self.assertRaises(MailProtocolError) as raised:
+            CoremailBackend._raise_mapi(
+                WindowsMapiError("Windows Simple MAPI status failed (code 19: invalid or expired session)")
+            )
+        message = str(raised.exception)
+        self.assertIn("Coremail/Windows mail client", message)
+        self.assertIn("update the expired password/token", message)
 
 
 class LocalDiscoveryTests(unittest.TestCase):
